@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""STT VRAM supervisor: exactly one speech engine loaded at a time, and none
+while a fullscreen app (game) is on screen.
+
+- Polls KWin every 5 s for fullscreen state (read-only D-Bus call).
+- want = None when gaming, else the engine in ~/.config/squelch/engine.
+- Starts/stops the parakeet-server / whisper-server user units to match.
+- Writes ~/.config/squelch/state.json for the tray + daemon.
+- Notifies on game start/end. Fail-safe: any detection error -> not gaming
+  (models stay loaded, dictation keeps working).
+"""
+import json
+import os
+import subprocess
+import time
+
+ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
+STATE_FILE = os.path.expanduser("~/.config/squelch/state.json")
+SERVICES = {"parakeet": "squelch-parakeet.service",
+            "whisper": "squelch-whisper.service"}
+POLL_S = 5
+
+
+def log(*a):
+    print("[squelch-vram]", *a, flush=True)
+
+
+def notify(summary, body=""):
+    try:
+        subprocess.run(["notify-send", "-a", "Squelch", "-u", "low",
+                        summary, body],
+                       timeout=5, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def current_engine():
+    try:
+        with open(ENGINE_FILE) as f:
+            e = f.read().strip().lower()
+        return "whisper" if e == "whisper" else "parakeet"
+    except OSError:
+        return "parakeet"
+
+
+def fullscreen_active():
+    """True if KWin's fullscreen effect is active (a window is fullscreen)."""
+    try:
+        r = subprocess.run(
+            ["/usr/bin/qdbus6", "--session", "org.kde.KWin", "/KWin",
+             "supportInformation"],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return False
+        lines = r.stdout.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() == "fullscreen:":
+                for nxt in lines[i + 1:i + 8]:
+                    if not nxt.strip():
+                        break
+                    if "isActiveFullScreenEffect" in nxt:
+                        return "true" in nxt.split(":")[-1].lower()
+                return False
+        return False
+    except Exception as e:
+        log("fullscreen check failed (assuming windowed):", e)
+        return False
+
+
+def is_active(svc):
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", svc],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def set_service(svc, want_active):
+    action = "start" if want_active else "stop"
+    try:
+        subprocess.run(["systemctl", "--user", action, svc],
+                       timeout=30, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"failed to {action} {svc}:", e)
+
+
+def write_state(gaming, want):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump({"gaming": gaming, "want": want,
+                       "updated": time.time()}, f)
+    except OSError as e:
+        log("state write failed:", e)
+
+
+def main():
+    log("supervisor starting")
+    last_gaming = None
+    consec = 0  # hysteresis: 2 agreeing polls before switching
+    while True:
+        try:
+            fs = fullscreen_active()
+            if fs == last_gaming or (last_gaming is None and not fs):
+                consec = 0
+                gaming = last_gaming if last_gaming is not None else False
+            else:
+                consec += 1
+                if consec >= 2:
+                    gaming = fs
+                    last_gaming = fs
+                    consec = 0
+                else:
+                    gaming = last_gaming if last_gaming is not None else False
+            if last_gaming is None:
+                last_gaming = gaming
+
+            want = None if gaming else current_engine()
+            for eng, svc in SERVICES.items():
+                should = (eng == want)
+                if is_active(svc) != should:
+                    set_service(svc, should)
+                    log(f"{svc} -> {'started' if should else 'stopped'}"
+                        f" (gaming={gaming}, want={want})")
+            write_state(gaming, want)
+            if gaming != getattr(main, "_prev", gaming):
+                if gaming:
+                    notify("STT paused — fullscreen app",
+                           "Speech models unloaded from VRAM.")
+                else:
+                    notify("STT resumed",
+                           f"{want or 'engine'} model reloaded.")
+            main._prev = gaming
+        except Exception as e:
+            log("loop error:", e)
+        time.sleep(POLL_S)
+
+
+if __name__ == "__main__":
+    main()

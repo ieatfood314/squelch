@@ -1,0 +1,18 @@
+# Squelch kanata snippet — hold Menu to dictate, tap Menu for the popup.
+#
+# Merge into your kanata config:
+#   1. add `menu` to your (defsrc ...) list
+#   2. put `(tap-hold 200 250 f23 f24)` in the matching slot of your base
+#      (deflayer ...): tap (<200 ms) emits F23 which opens the Squelch popup,
+#      hold emits F24 while held, which the squelch-ptt daemon records.
+#   3. kanata --check --cfg <your file>, then restart kanata
+#
+# Example (appending one key at the end of defsrc/deflayer):
+#
+# (defsrc
+#   d    f    g    h    j    k    l    ;    spc  bspc lsft rsft menu
+# )
+#
+# (deflayer base
+#   d    f    g    h    j    k    l    ;    spc  del  @oss rsft (tap-hold 200 250 f23 f24)
+# )

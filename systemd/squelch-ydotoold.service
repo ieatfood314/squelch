@@ -1,0 +1,11 @@
+[Unit]
+Description=ydotoold (uinput typing daemon for ydotool/Wayland)
+ConditionPathExists=!/run/user/1000/.ydotool_socket
+
+[Service]
+ExecStart=/usr/bin/ydotoold
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

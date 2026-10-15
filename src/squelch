@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""squelch — manage the Squelch dictionary from the terminal.
+
+  squelch WORD [MISHEARING ...]  add a term. With no mishearings given and an
+                                 OpenRouter key configured, AI suggests what
+                                 it sounds like automatically.
+  squelch --no-ai WORD [...]     plain add, never call the AI
+  squelch --suggest WORD         add a term with AI-suggested mishearings
+                                 (fails if no OpenRouter key is configured)
+  squelch --list                 show all entries
+  squelch --remove WORD          delete an entry (case-insensitive)
+
+No restarts needed: the daemon picks up dictionary changes immediately.
+"""
+import json
+import os
+import sys
+
+DICT_FILE = os.path.expanduser("~/.config/squelch/dictionary.json")
+TRAY_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                         "squelch-tray")
+
+
+def load():
+    try:
+        with open(DICT_FILE) as f:
+            return json.load(f).get("entries", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def save(entries):
+    os.makedirs(os.path.dirname(DICT_FILE), exist_ok=True)
+    with open(DICT_FILE, "w") as f:
+        json.dump({"_help": "Your words.", "entries": entries},
+                  f, indent=2, ensure_ascii=False)
+
+
+def find(entries, term):
+    for e in entries:
+        if str(e.get("term", "")).strip().lower() == term.lower():
+            return e
+    return None
+
+
+def merge_heard(entry, heard):
+    have = {h.lower() for h in entry.get("also_match", [])}
+    added = 0
+    for h in heard:
+        h = h.strip()
+        if h and h.lower() not in have and h.lower() != entry["term"].lower():
+            entry.setdefault("also_match", []).append(h)
+            have.add(h.lower())
+            added += 1
+    return added
+
+
+def has_key():
+    try:
+        with open(os.path.expanduser("~/.config/squelch/openrouter.key")) as f:
+            return bool(f.read().strip())
+    except OSError:
+        return False
+
+
+def ai_suggest(term):
+    import importlib.util as _iu
+    from importlib.machinery import SourceFileLoader
+    loader = SourceFileLoader("squelch_tray", TRAY_FILE)
+    spec = _iu.spec_from_loader("squelch_tray", loader)
+    tray = _iu.module_from_spec(spec)
+    loader.exec_module(tray)
+    return tray.fetch_mishearings(term)
+
+
+def cmd_add(term, heard, use_ai):
+    entries = load()
+    e = find(entries, term)
+    if e is None:
+        e = {"term": term, "also_match": []}
+        entries.append(e)
+    if use_ai and not heard:
+        if not has_key():
+            print("(no OpenRouter key — adding without suggestions)")
+        else:
+            print(f"Asking OpenRouter what {term!r} sounds like…")
+            try:
+                heard = ai_suggest(term)
+                print("suggested:", ", ".join(heard) if heard
+                      else "(nothing usable)")
+            except Exception as ex:
+                print(f"suggestion failed ({ex}) — adding term only")
+                heard = []
+    added = merge_heard(e, heard)
+    save(entries)
+    print(f"{e['term']}: {len(e.get('also_match', []))} mishearing(s)"
+          + (f" (+{added} new)" if added else " (nothing new)"))
+
+
+def cmd_list():
+    entries = load()
+    if not entries:
+        print("(dictionary empty)")
+        return
+    for e in entries:
+        heard = ", ".join(e.get("also_match", []) or [])
+        print(f"- {e.get('term')}" + (f"  [{heard}]" if heard else ""))
+
+
+def cmd_remove(term):
+    entries = load()
+    e = find(entries, term)
+    if e is None:
+        print(f"not in dictionary: {term}")
+        return 1
+    entries.remove(e)
+    save(entries)
+    print(f"removed: {e.get('term')}")
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "--list":
+        cmd_list()
+    elif len(argv) >= 3 and argv[1] == "--remove":
+        return cmd_remove(argv[2])
+    elif len(argv) >= 3 and argv[1] == "--suggest":
+        term = argv[2].strip()
+        if not has_key():
+            print("no OpenRouter key configured — cannot suggest")
+            return 1
+        cmd_add(term, [], use_ai=True)
+    elif len(argv) >= 3 and argv[1] == "--no-ai":
+        cmd_add(argv[2].strip(),
+                [a.strip() for a in argv[3:] if a.strip()], use_ai=False)
+    elif len(argv) >= 2 and not argv[1].startswith("-"):
+        cmd_add(argv[1].strip(),
+                [a.strip() for a in argv[2:] if a.strip()], use_ai=True)
+    else:
+        print(__doc__.strip())
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,15 @@
+[Unit]
+Description=STT engine tray applet (switch Parakeet/Whisper)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/squelch-tray
+Restart=always
+RestartSec=3
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=QT_QPA_PLATFORM=wayland
+
+[Install]
+WantedBy=default.target

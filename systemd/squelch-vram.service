@@ -1,0 +1,12 @@
+[Unit]
+Description=STT VRAM supervisor (one engine at a time, unload when gaming)
+After=default.target
+
+[Service]
+ExecStart=/usr/bin/squelch-vram
+Restart=always
+RestartSec=3
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+[Install]
+WantedBy=default.target

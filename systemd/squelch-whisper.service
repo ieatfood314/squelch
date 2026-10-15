@@ -1,0 +1,13 @@
+[Unit]
+Description=whisper.cpp server (Vulkan GPU, large-v3-turbo-q5_0, auto language)
+After=pipewire.service
+Wants=pipewire.service
+
+[Service]
+ExecStart=/usr/bin/whisper-server -m %h/.local/share/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin --host 127.0.0.1 --port 1893 --convert
+Restart=always
+RestartSec=3
+Nice=-5
+
+[Install]
+WantedBy=default.target

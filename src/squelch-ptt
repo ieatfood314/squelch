@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+"""STT push-to-talk daemon: hold F24 (from kanata Menu tap-hold) to record
+from the 4-mic Sony Playstation Eye array, beamform + clean, transcribe with
+the local whisper-server (Vulkan GPU), and paste the result via clipboard +
+Shift+Insert (layout-proof: raw keycode typing gets mangled by Colemak).
+
+Usage:
+  squelch-ptt                run the daemon (systemd user service does this)
+  squelch-ptt --process F    DSP + transcribe file F, print result (no typing)
+"""
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import wave
+
+import evdev
+import numpy as np
+
+SERVER_URL = "http://127.0.0.1:1893/inference"      # whisper (multilingual/FR)
+PARAKEET_URL = "http://127.0.0.1:1894/inference"    # parakeet (English default)
+ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
+FILTERS_FILE = os.path.expanduser("~/.config/squelch/filters.json")
+DICT_FILE = os.path.expanduser("~/.config/squelch/dictionary.json")
+STATS_FILE = os.path.expanduser("~/.config/squelch/stats.jsonl")
+
+
+def log_stats(entry):
+    """Append one JSON line per utterance (disabled with STT_NO_STATS=1)."""
+    if os.environ.get("STT_NO_STATS"):
+        return
+    try:
+        os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
+        entry["ts"] = time.time()
+        with open(STATS_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        log("stats write failed:", e)
+ENGINE_PORTS = {"parakeet": 1894, "whisper": 1893}
+_last_notify = 0.0
+
+
+def notify_stt(summary, body=""):
+    """Best-effort desktop notification, rate-limited to one per minute."""
+    global _last_notify
+    now = time.time()
+    if now - _last_notify < 60:
+        return
+    _last_notify = now
+    try:
+        subprocess.run(["notify-send", "-a", "Squelch", "-u", "low",
+                        summary, body],
+                       timeout=5, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def engine_available():
+    port = ENGINE_PORTS.get(current_engine(), 1894)
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=0.4)
+        s.close()
+        return True
+    except OSError:
+        return False
+SR = 16000
+MIN_HOLD_S = 0.20
+MAX_HOLD_S = 30.0
+F24 = evdev.ecodes.KEY_F24  # 194, emitted by kanata while Menu is held
+
+
+def log(*a):
+    print("[squelch-ptt]", *a, flush=True)
+
+
+# ---------------- mic discovery ----------------
+
+def find_mic_target():
+    """Resolve the PS Eye PipeWire node name dynamically."""
+    try:
+        out = subprocess.run(
+            ["pw-dump"], capture_output=True, timeout=10).stdout
+        for node in json.loads(out):
+            try:
+                props = node.get("info", {}).get("props", {})
+            except AttributeError:
+                continue
+            name = str(props.get("node.name", ""))
+            desc = str(props.get("node.description", ""))
+            if ("OmniVision" in name or "Playstation Eye" in desc
+                    or "PlayStation Eye" in desc):
+                if props.get("media.class") == "Audio/Source":
+                    return name
+    except Exception as e:
+        log("mic discovery failed:", e)
+    return None
+
+
+# ---------------- DSP: 4-mic beamform + monitor-diffraction comp ----------------
+
+def gcc_phat_lag(sig, ref, max_shift=8):
+    n = len(sig)
+    S = np.fft.rfft(sig - sig.mean())
+    R = np.fft.rfft(ref - ref.mean())
+    cross = S * np.conj(R)
+    cross /= (np.abs(cross) + 1e-9)  # phase transform: robust to mic gain mismatch
+    corr = np.fft.irfft(cross, n)
+    # check lags in [-max_shift, +max_shift] (wraparound indexing)
+    best_lag, best_val = 0, float("-inf")
+    for lag in range(-max_shift, max_shift + 1):
+        v = corr[lag % n]
+        if v > best_val:
+            best_val, best_lag = v, lag
+    return best_lag
+
+
+def beamform_and_clean(path_in, path_out, sr=SR):
+    """Delay-and-sum the 4 raw capsules, HP filter, HF shelf to compensate
+    monitor-edge diffraction loss, gate room noise, normalize, trim."""
+    with wave.open(path_in, "rb") as w:
+        nch, rate, nframes = (w.getnchannels(), w.getframerate(),
+                              w.getnframes())
+        raw = w.readframes(nframes)
+    if nframes < sr // 4:  # < 250 ms of audio: nothing useful
+        return None
+    a = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    if rate != sr:
+        raise ValueError(f"unexpected rate {rate}")
+    a = a.reshape(-1, nch)
+    a -= a.mean(axis=0, keepdims=True)
+
+    if nch == 4:
+        ref = a[:, 0]
+        aligned = [ref]
+        lags = [0]
+        for k in range(1, 4):
+            lag = gcc_phat_lag(a[:, k], ref)
+            lags.append(lag)
+            aligned.append(np.roll(a[:, k], -lag))
+        m = np.mean(np.stack(aligned), axis=0)
+    else:  # unexpected layout: fall back to plain average
+        lags = [0] * nch
+        m = a.mean(axis=1)
+    log(f"align lags (samples @16k): {lags}")
+
+    n = len(m)
+    X = np.fft.rfft(m)
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    # 2nd-order Butterworth high-pass @80 Hz: desk/monitor rumble + handling noise
+    f0 = 80.0
+    hp = 1.0 / np.sqrt(1.0 + (f0 / np.maximum(freqs, 1e-6)) ** 4)
+    hp[0] = 0.0
+    # High shelf +5 dB from ~2.5 kHz: restores consonants lost to diffraction
+    # over the monitor top edge when the mouth sits below the camera plane.
+    g = 10 ** (5.0 / 20.0) - 1.0
+    t = np.clip(np.log2(np.maximum(freqs, 1.0) / 2500.0), 0, 1)
+    t = t * t * (3 - 2 * t)
+    shelf = 1.0 + g * t
+    y = np.fft.irfft(X * hp * shelf, n).astype(np.float32)
+
+    # Noise gate, 20 ms frames, 120 ms hangover, 10 ms smoothing
+    F = 320
+    nf = len(y) // F
+    if nf < 2:
+        return None
+    yf = y[:nf * F].reshape(nf, F)
+    e = np.sqrt((yf * yf).mean(axis=1) + 1e-12)
+    peak_e = float(e.max())
+    thr = max(peak_e * 0.01, 25.0)
+    mask = (e > thr).astype(np.float32)
+    keep = np.zeros_like(mask)
+    for i in np.where(mask > 0)[0]:
+        keep[i:min(nf, i + 7)] = 1.0
+    gain = np.repeat(keep, F)
+    k = 160
+    gain = np.convolve(gain, np.ones(k) / k, mode="same")
+    y = y[:len(gain)] * gain
+
+    peak = float(np.abs(y).max())
+    if peak < 1e-6:
+        return None
+    rms_pre = float(np.sqrt((y * y).mean()))
+    if peak < 600.0 or rms_pre < 120.0:
+        # Room-noise floor (PS Eye idle: peak ~300, rms ~70). Real speech at
+        # the desk is far louder. Gate BEFORE normalization, since the gain
+        # below would amplify silence into something whisper hallucinates on.
+        log(f"utterance too quiet (peak={peak:.0f} rms={rms_pre:.0f}), skipping")
+        try:
+            os.unlink(path_out)
+        except OSError:
+            pass
+        return None
+    y *= min(12000.0 / peak, 8.0)  # normalize, cap gain so silence isn't blasted
+
+    # Trim leading/trailing gated silence, keep 100 ms margin
+    idx = np.where(np.abs(y) > thr)[0]
+    if len(idx) == 0:
+        return None
+    s = max(0, idx[0] - sr // 10)
+    t_ = min(len(y), idx[-1] + sr // 10)
+    y = y[s:t_]
+    if len(y) < sr // 4:
+        return None
+
+    with wave.open(path_out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(np.clip(y, -32768, 32767).astype(np.int16).tobytes())
+    rms = float(np.sqrt((y * y).mean()))
+    return {"seconds": len(y) / sr, "lags": lags, "rms": rms}
+
+
+# ---------------- transcribe + paste ----------------
+
+def current_engine():
+    """parakeet (default) or whisper. Read per utterance so the tray applet
+    can switch engines live without signalling the daemon."""
+    try:
+        with open(ENGINE_FILE) as f:
+            e = f.read().strip().lower()
+        return "whisper" if e == "whisper" else "parakeet"
+    except OSError:
+        return "parakeet"
+
+
+def text_filters():
+    """Which post-processing steps are enabled (toggled in the tap popup)."""
+    try:
+        with open(FILTERS_FILE) as f:
+            d = json.load(f)
+        return (bool(d.get("defiller", True)), bool(d.get("numbers", True)),
+                bool(d.get("numbers_all", False)))
+    except (OSError, ValueError):
+        return True, True, False
+
+
+_dict_cache = {"mtime": 0, "terms": [], "subs": []}
+
+
+def load_dictionary():
+    """Your words: returns (terms for whisper prompt, [(regex, term)] fixes).
+    Cached by file mtime; missing/invalid file -> empty."""
+    try:
+        mt = os.path.getmtime(DICT_FILE)
+    except OSError:
+        return [], []
+    if mt == _dict_cache["mtime"]:
+        return _dict_cache["terms"], _dict_cache["subs"]
+    terms, subs = [], []
+    try:
+        with open(DICT_FILE) as f:
+            entries = json.load(f).get("entries", [])
+        for e in entries:
+            term = str(e.get("term", "")).strip()
+            if not term:
+                continue
+            terms.append(term)
+            for m in e.get("also_match", []) or []:
+                m = str(m).strip()
+                if not m:
+                    continue
+                pat = re.escape(m)
+                if m[0].isalnum():
+                    pat = r"\b" + pat
+                if m[-1].isalnum():
+                    pat = pat + r"\b"
+                subs.append((re.compile(pat, re.IGNORECASE), term))
+    except (OSError, ValueError, AttributeError) as ex:
+        log("dictionary load failed:", ex)
+        return [], []
+    _dict_cache.update(mtime=mt, terms=terms, subs=subs)
+    return terms, subs
+
+
+def apply_dictionary(text):
+    terms, subs = load_dictionary()
+    for rx, term in subs:
+        text = rx.sub(term, text)
+    return text
+
+
+def post_wav(url, wav_path, response_format, extra=None):
+    data = open(wav_path, "rb").read()
+    bound = "----sttpttboundary"
+    body = (
+        f"--{bound}\r\nContent-Disposition: form-data; name=\"file\"; "
+        f"filename=\"utt.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+    ).encode() + data + (
+        f"\r\n--{bound}\r\nContent-Disposition: form-data; "
+        f"name=\"response_format\"\r\n\r\n{response_format}\r\n"
+    ).encode()
+    for k, v in (extra or {}).items():
+        body += (
+            f"--{bound}\r\nContent-Disposition: form-data; "
+            f"name=\"{k}\"\r\n\r\n{v}\r\n"
+        ).encode()
+    body += f"--{bound}--\r\n".encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={bound}"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.loads(r.read().decode())
+
+
+def transcribe_parakeet(wav_path):
+    res = post_wav(PARAKEET_URL, wav_path, "json")
+    return res.get("text", "").strip()
+
+
+def transcribe_whisper(wav_path):
+    terms, _subs = load_dictionary()
+    extra = {"prompt": ", ".join(terms)} if terms else None
+    res = post_wav(SERVER_URL, wav_path, "verbose_json", extra)
+    segs = res.get("segments") or []
+    if segs:
+        probs = [float(s.get("no_speech_prob", 0.0)) for s in segs]
+        nsp = sum(probs) / len(probs)
+        text = "".join(s.get("text", "") for s in segs)
+        log(f"no_speech_prob={nsp:.2f}")
+        if nsp > 0.6:
+            return ""  # silence / room noise hallucination guard
+    else:
+        text = res.get("text", "")
+    return text.strip()
+
+
+def clean_text(text):
+    # drop whisper silence hallucinations
+    if not text or text.strip("[]()").strip().upper() in (
+            "BLANK_AUDIO", "BLANK AUDIO", "SILENCE", "BLANK"):
+        return ""
+    if len(text) >= 2 and text[0] in "[(" and text[-1] in "])":
+        return ""
+    return text
+
+
+FILLER_RE = re.compile(r"\b(u+h+|u+m+|e+r+|a+h+|e+h+|h+m+|m+m+)\b",
+                       re.IGNORECASE)
+
+
+def defiller(text):
+    """Drop filler sounds (um, uh, er, ah, eh, hmm, mm) and tidy up."""
+    t = FILLER_RE.sub("", text)
+    t = re.sub(r"([,.!?;:])(\s*\1)+", r"\1", t)  # collapse doubled punctuation
+    t = re.sub(r"\s+([,.!?;:])", r"\1", t)  # no space before punctuation
+    t = re.sub(r"\s{2,}", " ", t)
+    return t.strip(" ,;:").strip()
+
+
+_NUM_ONES = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+             "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+             "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+             "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+             "eighteen": 18, "nineteen": 19}
+_NUM_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+             "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+_NUM_SCALES = {"hundred": 100, "thousand": 1000, "million": 1000000,
+               "billion": 1000000000}
+_NUM_WORDS = sorted(set(_NUM_ONES) | set(_NUM_TENS) | set(_NUM_SCALES)
+                    | {"and", "a"}, key=len, reverse=True)
+_NUM_ALT = "|".join(_NUM_WORDS)
+_NUM_RUN_RE = re.compile(r"\b(?:%s)(?:[\s-]+(?:%s))*\b" % (_NUM_ALT, _NUM_ALT),
+                         re.IGNORECASE)
+
+
+def _tok_val(t):
+    if t == "a":
+        return 1
+    if t in _NUM_ONES:
+        return _NUM_ONES[t]
+    if t in _NUM_TENS:
+        return _NUM_TENS[t]
+    return None
+
+
+def _parse_scaled(words):
+    """Single value for runs containing hundred/thousand/million/billion."""
+    toks = [w.lower() for w in words if w.lower() != "and"]
+    if not toks or not any(w in _NUM_SCALES for w in toks):
+        return None
+    total, current = 0, 0
+    for w in toks:
+        if w in _NUM_SCALES:
+            s = _NUM_SCALES[w]
+            if s == 100:
+                current = (current or 1) * 100
+            else:
+                total += (current or 1) * s
+                current = 0
+        else:
+            v = _tok_val(w)
+            if v is None:
+                return None
+            current += v
+    return total + current
+
+
+def _parse_plain(words):
+    """Greedy tens+ones chunks for runs without scales. Returns a list of
+    (original words, value); handles years: 'twenty twenty four' -> 20, 24."""
+    chunks, cur_words, cur = [], [], 0
+    has_tens, has_ones, started = False, False, False
+    for orig in words:
+        w = orig.lower()
+        v = _tok_val(w)
+        if v is None:
+            return None
+        is_tens = w in _NUM_TENS
+        if not started:
+            cur, cur_words = v, [orig]
+            has_tens, has_ones = is_tens, not is_tens
+            started = True
+        elif is_tens:
+            chunks.append((cur_words, cur))
+            cur, cur_words = v, [orig]
+            has_tens, has_ones = True, False
+        elif has_tens and not has_ones:
+            cur += v
+            has_ones = True
+            cur_words.append(orig)
+        else:
+            chunks.append((cur_words, cur))
+            cur, cur_words = v, [orig]
+            has_tens, has_ones = False, True
+    chunks.append((cur_words, cur))
+    return chunks
+
+
+def numbers_to_digits(text, all_digits=False):
+    """'four thousand eight hundred and twenty one' -> '4821'. By default
+    only values over ten become digits (zero..ten stay words); with
+    all_digits every number does — except a lone 'a', which stays an
+    article."""
+
+    def is_lone_a(words):
+        return len(words) == 1 and words[0].lower() == "a"
+
+    def repl(m):
+        span = m.group(0)
+        # peel a bare leading/trailing 'and' (it's a connector, not a number)
+        pre, post, core = "", "", span
+        lm = re.match(r"(?i)^\s*and\s+", core)
+        if lm:
+            pre, core = lm.group(0), core[lm.end():]
+        tm = re.search(r"(?i)\s+and\s*$", core)
+        if tm:
+            post, core = tm.group(0), core[:tm.start()]
+        if not core.strip():
+            return span
+        if re.search(r"hundred|thousand|million|billion", core,
+                     re.IGNORECASE):
+            words = re.split(r"[\s-]+", core)
+            v = _parse_scaled(words)
+            if v is None:
+                return span
+            if v > 10 or (all_digits and not is_lone_a(words)):
+                return pre + str(v) + post
+            return span
+        # no scales: split on 'and' and keep the separators as-is
+        parts = re.split(r"(\s+and\s+)", core, flags=re.IGNORECASE)
+        out = []
+        for i, p in enumerate(parts):
+            if i % 2 == 1:
+                out.append(p)
+                continue
+            words = [w for w in re.split(r"[\s-]+", p) if w]
+            if not words:
+                out.append(p)
+                continue
+            chunks = _parse_plain(words)
+            if chunks is None:
+                return span
+            out.append(" ".join(
+                str(v) if (v > 10 or (all_digits and not is_lone_a(ws)))
+                else " ".join(ws)
+                for ws, v in chunks))
+        return pre + "".join(out) + post
+
+    return _NUM_RUN_RE.sub(repl, text)
+
+
+def transcribe(wav_path, engine):
+    if engine == "whisper":
+        return clean_text(transcribe_whisper(wav_path))
+    return clean_text(transcribe_parakeet(wav_path))
+
+
+def paste_text(text):
+    """Layout-proof output: clipboard + Shift+Insert.
+
+    Keycode injectors (ydotool type / wtype) emit physical keycodes, which the
+    compositor maps through the active layout — under Colemak that mangles
+    text. Shift+Insert uses no letter keys, so it pastes correctly under any
+    layout. The previous clipboard content is saved and restored.
+    """
+    os.environ.setdefault("YDOTOOLD_SOCKET", "/run/user/1000/.ydotool_socket")
+    try:
+        cur = subprocess.run(["wl-paste"], capture_output=True, timeout=10)
+        prev = cur.stdout if cur.returncode == 0 else None
+    except Exception as e:
+        log("clipboard read failed:", e)
+        prev = None
+    try:
+        subprocess.run(["wl-copy"], input=text.encode("utf-8"),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10, check=True)
+    except Exception as e:
+        log("clipboard write failed:", e)
+        return
+    time.sleep(0.25)
+    # KEY_LEFTSHIFT=42, KEY_INSERT=110 — layout-independent keycodes
+    try:
+        r = subprocess.run(
+            ["ydotool", "key", "42:1", "110:1", "110:0", "42:0"],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            log("paste keystroke failed:", (r.stderr or "").strip()[:200])
+            return
+    except Exception as e:
+        log("paste keystroke error:", e)
+        return
+    log("pasted via clipboard+Shift+Insert:", text[:80])
+    time.sleep(0.4)
+    if prev is not None:
+        try:
+            subprocess.run(["wl-copy"], input=prev,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+        except Exception as e:
+            log("clipboard restore failed:", e)
+
+
+# ---------------- recording ----------------
+
+def start_recording(target, path):
+    return subprocess.Popen(
+        ["pw-record", "--target", target, "--rate", str(SR),
+         "--channels", "4", "--format", "s16", path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------- main loop ----------------
+
+def find_kanata_device():
+    override = os.environ.get("STT_INPUT_DEVICE")
+    if override:  # debugging hook: listen on an arbitrary device instead
+        return evdev.InputDevice(override)
+    for path in sorted(__import__("glob").glob("/dev/input/event*")):
+        try:
+            d = evdev.InputDevice(path)
+        except OSError:
+            continue
+        if "kanata" not in d.name.lower():
+            continue
+        try:
+            if F24 in d.capabilities().get(evdev.ecodes.EV_KEY, []):
+                return d
+        except OSError:
+            continue
+    return None
+
+
+def process_utterance(raw_path):
+    t0 = time.time()
+    with tempfile.NamedTemporaryFile(suffix="-clean.wav",
+                                     delete=False) as f:
+        clean_path = f.name
+    try:
+        info = beamform_and_clean(raw_path, clean_path)
+        if info is None:
+            log("utterance empty after cleanup, skipping")
+            log_stats({"outcome": "skipped", "engine": current_engine(),
+                       "audio_s": 0.0, "words": 0, "transcribe_s": 0.0,
+                       "dsp_s": round(time.time() - t0, 3)})
+            return ""
+        log(f"cleaned {info['seconds']:.2f}s in {time.time()-t0:.2f}s")
+        t1 = time.time()
+        engine = current_engine()
+        try:
+            text = transcribe(clean_path, engine)
+        except Exception as e:
+            log(f"[{engine}] transcribe failed: {e}")
+            notify_stt("STT engine unavailable",
+                       "Speech models are unloaded (game mode?) — recording discarded.")
+            log_stats({"outcome": "failed", "engine": engine,
+                       "audio_s": round(info["seconds"], 2), "words": 0,
+                       "transcribe_s": 0.0,
+                       "dsp_s": round(time.time() - t0, 3)})
+            return ""
+        transcribe_s = time.time() - t1
+        do_defill, do_numbers, do_all = text_filters()
+        if do_defill:
+            text = defiller(text)
+        if do_numbers:
+            text = numbers_to_digits(text, all_digits=do_all)
+        text = apply_dictionary(text)
+        log(f"[{engine}] transcribed in {transcribe_s:.2f}s: {text[:120]!r}")
+        log_stats({"outcome": "ok" if text else "empty", "engine": engine,
+                   "audio_s": round(info["seconds"], 2),
+                   "words": len(text.split()),
+                   "transcribe_s": round(transcribe_s, 3),
+                   "dsp_s": round(time.time() - t0, 3)})
+        return text
+    finally:
+        for p in (raw_path, clean_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def main():
+    busy = False
+    while True:
+        dev = find_kanata_device()
+        if dev is None:
+            log("kanata device not found, retrying in 2s")
+            time.sleep(2)
+            continue
+        log(f"listening on {dev.path} ({dev.name})")
+        rec_proc = None
+        rec_path = None
+        press_t = 0.0
+        try:
+            for ev in dev.read_loop():
+                if ev.type != evdev.ecodes.EV_KEY or ev.code != F24:
+                    continue
+                if ev.value == 1:  # hold started (kanata fires F24 on Menu hold)
+                    if busy:
+                        log("busy, ignoring press")
+                        continue
+                    if not engine_available():
+                        log("engine unavailable, ignoring press")
+                        notify_stt("STT engine unavailable",
+                                   "Speech models are unloaded (game mode?)")
+                        continue
+                    target = find_mic_target()
+                    if target is None:
+                        log("mic not found, ignoring press")
+                        continue
+                    fd, rec_path = tempfile.mkstemp(suffix="-raw.wav")
+                    os.close(fd)
+                    rec_proc = start_recording(target, rec_path)
+                    press_t = time.time()
+                    log("recording...")
+                elif ev.value == 0 and rec_proc is not None:  # released
+                    held = time.time() - press_t
+                    try:
+                        rec_proc.send_signal(signal.SIGTERM)
+                        rec_proc.wait(timeout=5)
+                    except Exception:
+                        rec_proc.kill()
+                    rec_proc = None
+                    if held < MIN_HOLD_S:
+                        log(f"tap ({held:.2f}s), ignoring")
+                        try:
+                            os.unlink(rec_path)
+                        except OSError:
+                            pass
+                        continue
+                    if held > MAX_HOLD_S:
+                        log("over max hold, discarding")
+                        try:
+                            os.unlink(rec_path)
+                        except OSError:
+                            pass
+                        continue
+                    busy = True
+                    try:
+                        text = process_utterance(rec_path)
+                        if text:
+                            if os.environ.get("STT_DRY_RUN"):
+                                log(f"DRYRUN would type: {text[:120]!r}")
+                            else:
+                                paste_text(text + " ")
+                        else:
+                            log("no speech, typing nothing")
+                    finally:
+                        busy = False
+                        rec_path = None
+        except OSError as e:
+            log(f"device lost ({e}), re-discovering")
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--process":
+        text = process_utterance(sys.argv[2])
+        print("RESULT:", text)
+    else:
+        main()
