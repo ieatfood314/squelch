@@ -12,7 +12,7 @@ makedepends=('git' 'cmake' 'vulkan-headers' 'spirv-headers')
 optdepends=('python-huggingface_hub: alternative model downloads')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "whisper.cpp::git+https://github.com/ggml-org/whisper.cpp.git#commit=0c7be696371069e0baa2515ed7aa08d5a5473aa6")
-sha256sums=('TARBALL_SHA256_PLACEHOLDER'
+sha256sums=('4fba2b85e03cfa38bf1b2f9b3d6f596e6f4ae30f039297f0b217bb50e4715f46'
             'SKIP')
 options=('!debug')
 
