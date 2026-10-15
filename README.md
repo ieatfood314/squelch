@@ -47,11 +47,11 @@ Focus a text field, hold Menu, speak, release.
 | Action | How |
 |---|---|
 | Dictate | hold Menu, speak, release |
-| Settings popup (engine, filters, dictionary, analytics) | tap Menu |
-| Engine switch | popup, or right-click tray icon |
+| Settings (engine, cleanup, dictionary, analytics) | tap Menu, or tray menu → Settings |
+| Engine switch | settings popup, or right-click tray icon |
 | Dictionary: `squelch WORD [mishearings…]` | AI suggests what it sounds like when an OpenRouter key is configured (`~/.config/squelch/openrouter.key`, chmod 600); `--no-ai` skips that |
-| Dictionary fullscreen editor | popup → Dictionary button |
-| Analytics dashboard | popup → Analytics, or tray menu |
+| Dictionary fullscreen editor | settings → Dictionary tab (Add/Suggest/Save) |
+| Analytics dashboard | settings → Analytics tab, or glance line on the tap card |
 
 French or other languages: switch to Whisper in the popup (auto language
 detect). Game fullscreen unloads models automatically; dictating then shows

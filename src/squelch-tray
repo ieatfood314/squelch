@@ -18,10 +18,10 @@ from PyQt6.QtCore import (QSocketNotifier, QTimer, Qt, pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor,
                          QGuiApplication, QIcon, QPainter, QPixmap)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
-                             QHBoxLayout, QHeaderView, QLabel, QMenu,
-                             QPushButton, QRadioButton, QSystemTrayIcon,
-                             QTableWidget, QTableWidgetItem, QVBoxLayout,
-                             QWidget)
+                             QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                             QMenu, QPushButton, QRadioButton, QSystemTrayIcon,
+                             QTabWidget, QTableWidget, QTableWidgetItem,
+                             QVBoxLayout, QWidget)
 import json as _json
 
 ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
@@ -287,22 +287,33 @@ def write_filters(flt):
         __import__("json").dump(flt, f)
 
 
+DICT_HELP = ("Your words. 'term' is the correct spelling. 'also_match' lists "
+             "ways the engine mishears it, fixed automatically.")
+
+BTN = ("color: white; background: rgba(255,255,255,0.12);"
+       " border: 1px solid #555555; border-radius: 6px; padding: 4px;")
+TABLE_STYLE = (
+    "QTableWidget { background: #0a0a0a; color: white;"
+    " gridline-color: #333333; border: 1px solid #3d3d3d;"
+    " border-radius: 8px; }"
+    "QHeaderView::section { background: #1a1a1a; color: white;"
+    " border: none; padding: 6px; }")
+DIM_LABEL = "color: #aaaaaa; font-size: 11px;"
+
+
 class EnginePopup(QWidget):
-    """Translucent engine/settings popup toggled by tapping Menu (F23).
+    """Slim tap card: engine quick-switch, status, stats glance, and one
+    button into the unified Settings window. Plain top-level window: maps
+    fine on Wayland, unlike QMenu.popup()."""
 
-    A plain top-level window: maps fine on Wayland, unlike QMenu.popup()
-    which the compositor rejects without a transient parent."""
-
-    def __init__(self, on_engine, on_filters, on_dict, on_stats):
+    def __init__(self, on_engine, on_settings):
         super().__init__(
             None,
             Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.on_engine = on_engine
-        self.on_filters = on_filters
-        self.on_dict = on_dict
-        self.on_stats = on_stats
+        self.on_settings = on_settings
 
         panel = QWidget(self)
         panel.setObjectName("panel")
@@ -317,7 +328,7 @@ class EnginePopup(QWidget):
         inner.setContentsMargins(16, 12, 16, 12)
         inner.setSpacing(6)
 
-        title = QLabel("STT engine")
+        title = QLabel("Squelch")
         title.setStyleSheet("color: white; font-weight: bold; font-size: 14px;")
         inner.addWidget(title)
 
@@ -331,54 +342,25 @@ class EnginePopup(QWidget):
             self.radios[key] = rb
 
         self.status = QLabel()
-        self.status.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        self.status.setStyleSheet(DIM_LABEL)
         self.status.setWordWrap(True)
         inner.addWidget(self.status)
 
         self.stats_line = QLabel()
-        self.stats_line.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        self.stats_line.setStyleSheet(DIM_LABEL)
         self.stats_line.setWordWrap(True)
         inner.addWidget(self.stats_line)
 
-        self.cb_defill = QCheckBox("Remove filler words (um, ah, …)")
-        self.cb_numbers = QCheckBox("Write numbers as digits (over ten)")
-        self.cb_all = QCheckBox("Write ALL numbers as digits (incl. 0–10)")
-        for cb in (self.cb_defill, self.cb_numbers, self.cb_all):
-            cb.setStyleSheet("color: white;")
-        self.cb_defill.toggled.connect(lambda _c: self.filters_changed())
-        self.cb_numbers.toggled.connect(lambda _c: self.filters_changed())
-        self.cb_all.toggled.connect(lambda _c: self.filters_changed())
-        inner.addWidget(self.cb_defill)
-        inner.addWidget(self.cb_numbers)
-        inner.addWidget(self.cb_all)
-
-        self.dict_btn = QPushButton()
-        self.dict_btn.setStyleSheet(
-            "color: white; background: rgba(255,255,255,0.12);"
-            " border: 1px solid #555555; border-radius: 6px; padding: 4px;")
-        self.dict_btn.clicked.connect(self.on_dict)
-        inner.addWidget(self.dict_btn)
-
-        self.stats_btn = QPushButton("Analytics…")
-        self.stats_btn.setStyleSheet(
-            "color: white; background: rgba(255,255,255,0.12);"
-            " border: 1px solid #555555; border-radius: 6px; padding: 4px;")
-        self.stats_btn.clicked.connect(self.on_stats)
-        inner.addWidget(self.stats_btn)
+        self.settings_btn = QPushButton("Settings…")
+        self.settings_btn.setStyleSheet(BTN)
+        self.settings_btn.clicked.connect(self.on_settings)
+        inner.addWidget(self.settings_btn)
 
         hint = QLabel("tap Menu again, Esc, or click away to close")
         hint.setStyleSheet("color: #777777; font-size: 11px;")
         inner.addWidget(hint)
 
-    def filters_changed(self):
-        self.on_filters({"defiller": self.cb_defill.isChecked(),
-                         "numbers": self.cb_numbers.isChecked(),
-                         "numbers_all": self.cb_all.isChecked()})
-
-    def refresh_dict_button(self):
-        self.dict_btn.setText(f"Dictionary ({dict_term_count()} words)…")
-
-    def refresh(self, engine, status_text, flt):
+    def refresh(self, engine, status_text):
         for key, rb in self.radios.items():
             rb.blockSignals(True)
             rb.setChecked(key == engine)
@@ -392,17 +374,10 @@ class EnginePopup(QWidget):
                 f"{s['avg_lat']:.2f} s avg transcription")
         except Exception:
             self.stats_line.setText("")
-        for cb, name in ((self.cb_defill, "defiller"),
-                         (self.cb_numbers, "numbers"),
-                         (self.cb_all, "numbers_all")):
-            cb.blockSignals(True)
-            cb.setChecked(flt[name])
-            cb.blockSignals(False)
-        self.refresh_dict_button()
         self.adjustSize()
 
-    def show_at(self, engine, status_text, flt):
-        self.refresh(engine, status_text, flt)
+    def show_at(self, engine, status_text):
+        self.refresh(engine, status_text)
         pos = QCursor.pos()
         screen = QGuiApplication.screenAt(pos)
         area = screen.availableGeometry() if screen else None
@@ -433,81 +408,165 @@ class EnginePopup(QWidget):
             super().keyPressEvent(event)
 
 
-DICT_HELP = ("Your words. 'term' is the correct spelling. 'also_match' lists "
-             "ways the engine mishears it, fixed automatically.")
-
-
-class DictionaryEditor(QWidget):
-    """Fullscreen dictionary editor: dim overlay + centered card, term table
-    with Term / Also-heard-as columns, Add / Remove / Save / Cancel."""
+class SettingsWindow(QWidget):
+    """Unified low-profile settings: engine/text/dictionary/analytics tabs
+    in one centered window (not fullscreen)."""
 
     COLS = ("Term (correct spelling)", "Also heard as (comma separated)")
 
     suggested = pyqtSignal(int, object)  # row, [suggestions] (None = failed)
     suggest_failed = pyqtSignal(str)
 
-    def __init__(self, on_saved):
+    def __init__(self, on_engine):
         super().__init__(None, Qt.WindowType.Window)
+        self.setWindowTitle("Squelch settings")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.on_saved = on_saved
+        self.on_engine = on_engine
         self.suggested.connect(self._apply_suggestions)
         self.suggest_failed.connect(self._suggest_error)
         self.setStyleSheet(
-            "DictionaryEditor { background: rgba(0, 0, 0, 0.72); }")
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addStretch(1)
-        center = QHBoxLayout()
-        center.addStretch(1)
-        card = QWidget(self)
-        card.setObjectName("card")
-        card.setFixedSize(780, 580)
-        card.setStyleSheet(
-            "#card { background: rgba(8, 8, 8, 0.96);"
-            " border: 1px solid #3d3d3d; border-radius: 16px; }")
-        inner = QVBoxLayout(card)
-        inner.setContentsMargins(24, 20, 24, 20)
-        inner.setSpacing(10)
-        center.addWidget(card)
-        center.addStretch(1)
-        outer.addLayout(center)
-        outer.addStretch(1)
+            "SettingsWindow { background: rgba(8, 8, 8, 0.96); }")
+        self.resize(700, 540)
 
-        title = QLabel("Dictionary — your words")
-        title.setStyleSheet("color: white; font-weight: bold; font-size: 18px;")
-        inner.addWidget(title)
-        sub = QLabel("Terms bias Whisper and fix mishearings for both engines."
-                     " Changes apply on your next utterance.")
-        sub.setStyleSheet("color: #aaaaaa; font-size: 12px;")
-        sub.setWordWrap(True)
-        inner.addWidget(sub)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(
+            "QTabWidget::pane { background: rgba(8,8,8,0.96);"
+            " border: 1px solid #3d3d3d; border-radius: 8px; }"
+            "QTabBar::tab { background: #1a1a1a; color: #cccccc;"
+            " padding: 6px 14px; border-top-left-radius: 6px;"
+            " border-top-right-radius: 6px; }"
+            "QTabBar::tab:selected { background: #2a2a2a; color: white; }"
+            "QWidget { color: white; }")
+        lay.addWidget(self.tabs, 1)
+        self._build_general()
+        self._build_dictionary()
+        self._build_analytics()
+
+        self.analytics_timer = QTimer(self)
+        self.analytics_timer.setInterval(5000)
+        self.analytics_timer.timeout.connect(
+            lambda: self.isVisible() and self.refresh_analytics())
+
+    # ---- general tab ----
+    def _build_general(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(8)
+
+        eng = QLabel("Engine")
+        eng.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
+        lay.addWidget(eng)
+        self.g_radios = {}
+        for key, label in ENGINES:
+            rb = QRadioButton(label)
+            rb.toggled.connect(
+                lambda checked, k=key: checked and self.on_engine(k))
+            lay.addWidget(rb)
+            self.g_radios[key] = rb
+        self.g_status = QLabel()
+        self.g_status.setStyleSheet(DIM_LABEL)
+        self.g_status.setWordWrap(True)
+        lay.addWidget(self.g_status)
+
+        clf = QLabel("Text cleanup")
+        clf.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
+        lay.addWidget(clf)
+        self.cb_defill = QCheckBox("Remove filler words (um, ah, …)")
+        self.cb_numbers = QCheckBox("Write numbers as digits (over ten)")
+        self.cb_all = QCheckBox("Write ALL numbers as digits (incl. 0–10)")
+        for cb in (self.cb_defill, self.cb_numbers, self.cb_all):
+            cb.toggled.connect(lambda _c: self.filters_changed())
+            lay.addWidget(cb)
+
+        keyl = QLabel("OpenRouter (powers mishearing suggestions)")
+        keyl.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
+        lay.addWidget(keyl)
+        keyrow = QHBoxLayout()
+        self.key_field = QLineEdit()
+        self.key_field.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_field.setPlaceholderText("paste key, then Set")
+        self.key_field.setStyleSheet(
+            "background: #0a0a0a; color: white; border: 1px solid #3d3d3d;"
+            " border-radius: 6px; padding: 4px;")
+        set_btn = QPushButton("Set")
+        clear_btn = QPushButton("Clear")
+        for b in (set_btn, clear_btn):
+            b.setStyleSheet(BTN)
+        set_btn.clicked.connect(self.key_save)
+        clear_btn.clicked.connect(self.key_clear)
+        keyrow.addWidget(self.key_field, 1)
+        keyrow.addWidget(set_btn)
+        keyrow.addWidget(clear_btn)
+        lay.addLayout(keyrow)
+        self.key_status = QLabel()
+        self.key_status.setStyleSheet(DIM_LABEL)
+        lay.addWidget(self.key_status)
+        lay.addStretch(1)
+        self.tabs.addTab(tab, "General")
+
+    def filters_changed(self):
+        write_filters({"defiller": self.cb_defill.isChecked(),
+                       "numbers": self.cb_numbers.isChecked(),
+                       "numbers_all": self.cb_all.isChecked()})
+
+    def key_save(self):
+        k = self.key_field.text().strip()
+        if not k:
+            return
+        os.makedirs(os.path.dirname(OPENROUTER_KEY_FILE), exist_ok=True)
+        with open(OPENROUTER_KEY_FILE, "w") as f:
+            f.write(k + "\n")
+        os.chmod(OPENROUTER_KEY_FILE, 0o600)
+        self.key_field.clear()
+        try:
+            os.unlink(OPENROUTER_MODEL_FILE)  # re-probe models for new key
+        except OSError:
+            pass
+        self.refresh_key_status()
+
+    def key_clear(self):
+        try:
+            os.unlink(OPENROUTER_KEY_FILE)
+        except OSError:
+            pass
+        try:
+            os.unlink(OPENROUTER_MODEL_FILE)
+        except OSError:
+            pass
+        self.refresh_key_status()
+
+    def refresh_key_status(self):
+        self.key_status.setText(
+            "Key configured — suggestions enabled." if openrouter_key()
+            else "No key set — suggestions unavailable.")
+
+    # ---- dictionary tab ----
+    def _build_dictionary(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(8)
         self.or_status = QLabel()
-        self.or_status.setStyleSheet("color: #777777; font-size: 11px;")
-        inner.addWidget(self.or_status)
+        self.or_status.setStyleSheet(DIM_LABEL)
+        lay.addWidget(self.or_status)
 
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(list(self.COLS))
-        hdr = self.table.horizontalHeader()
+        self.dtable = QTableWidget(0, 2)
+        self.dtable.setHorizontalHeaderLabels(list(self.COLS))
+        hdr = self.dtable.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.setSelectionBehavior(
+        self.dtable.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setStyleSheet(
-            "QTableWidget { background: #0a0a0a; color: white;"
-            " gridline-color: #333333; border: 1px solid #3d3d3d;"
-            " border-radius: 8px; }"
-            "QHeaderView::section { background: #1a1a1a; color: white;"
-            " border: none; padding: 6px; }")
-        inner.addWidget(self.table, 1)
+        self.dtable.setStyleSheet(TABLE_STYLE)
+        lay.addWidget(self.dtable, 1)
 
         row = QHBoxLayout()
         add_btn = QPushButton("Add row")
         del_btn = QPushButton("Remove selected")
         self.suggest_btn = QPushButton("Suggest mishearings")
         for b in (add_btn, del_btn, self.suggest_btn):
-            b.setStyleSheet(
-                "color: white; background: rgba(255,255,255,0.12);"
-                " border: 1px solid #555555; border-radius: 6px; padding: 6px;")
+            b.setStyleSheet(BTN)
         add_btn.clicked.connect(self.add_row)
         del_btn.clicked.connect(self.del_rows)
         self.suggest_btn.clicked.connect(self.suggest)
@@ -515,69 +574,51 @@ class DictionaryEditor(QWidget):
         row.addWidget(del_btn)
         row.addWidget(self.suggest_btn)
         row.addStretch(1)
-        cancel_btn = QPushButton("Cancel")
-        save_btn = QPushButton("Save")
+        save_btn = QPushButton("Save dictionary")
         save_btn.setStyleSheet(
             "color: white; background: #3563c8;"
             " border: 1px solid #4a7de0; border-radius: 6px; padding: 6px 18px;")
-        cancel_btn.setStyleSheet(
-            "color: white; background: rgba(255,255,255,0.12);"
-            " border: 1px solid #555555; border-radius: 6px; padding: 6px 18px;")
-        cancel_btn.clicked.connect(self.close)
-        save_btn.clicked.connect(self.save)
-        row.addWidget(cancel_btn)
+        save_btn.clicked.connect(self.save_dict)
         row.addWidget(save_btn)
-        inner.addLayout(row)
+        lay.addLayout(row)
+        self.tabs.addTab(tab, "Dictionary")
 
-    def load(self):
+    def load_dict(self):
         try:
             with open(DICT_FILE) as f:
                 entries = _json.load(f).get("entries", [])
         except (OSError, ValueError, AttributeError):
             entries = []
-        self.table.setRowCount(0)
+        self.dtable.setRowCount(0)
         for e in entries:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            self.table.setItem(r, 0, QTableWidgetItem(str(e.get("term", ""))))
-            self.table.setItem(
+            r = self.dtable.rowCount()
+            self.dtable.insertRow(r)
+            self.dtable.setItem(r, 0, QTableWidgetItem(str(e.get("term", ""))))
+            self.dtable.setItem(
                 r, 1, QTableWidgetItem(
                     ", ".join(str(x) for x in e.get("also_match", []) or [])))
 
-    def open_fullscreen(self):
-        self.load()
-        self.refresh_or_status()
-        screen = QGuiApplication.screenAt(QCursor.pos())
-        if screen is not None:
-            self.move(screen.geometry().topLeft())
-        self.showFullScreen()
-
-    def refresh_or_status(self):
-        self.or_status.setText(
-            "OpenRouter: ready" if openrouter_key()
-            else "OpenRouter: no key — suggestions unavailable")
-
     def add_row(self):
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        self.table.setItem(r, 0, QTableWidgetItem(""))
-        self.table.setItem(r, 1, QTableWidgetItem(""))
-        self.table.editItem(self.table.item(r, 0))
+        r = self.dtable.rowCount()
+        self.dtable.insertRow(r)
+        self.dtable.setItem(r, 0, QTableWidgetItem(""))
+        self.dtable.setItem(r, 1, QTableWidgetItem(""))
+        self.dtable.editItem(self.dtable.item(r, 0))
 
     def del_rows(self):
         for idx in sorted(
-                {i.row() for i in self.table.selectedIndexes()},
+                {i.row() for i in self.dtable.selectedIndexes()},
                 reverse=True):
-            self.table.removeRow(idx)
+            self.dtable.removeRow(idx)
 
     def suggest(self):
         """Fill Also-heard-as for the selected row via OpenRouter (one call)."""
-        rows = sorted({i.row() for i in self.table.selectedIndexes()})
-        row = rows[0] if rows else self.table.currentRow()
-        if row < 0 or row >= self.table.rowCount():
+        rows = sorted({i.row() for i in self.dtable.selectedIndexes()})
+        row = rows[0] if rows else self.dtable.currentRow()
+        if row < 0 or row >= self.dtable.rowCount():
             self.or_status.setText("Select a row first.")
             return
-        item = self.table.item(row, 0)
+        item = self.dtable.item(row, 0)
         term = item.text().strip() if item else ""
         if not term:
             self.or_status.setText("Type the term first, then Suggest.")
@@ -595,11 +636,11 @@ class DictionaryEditor(QWidget):
 
     def _apply_suggestions(self, row, suggs):
         self.suggest_btn.setEnabled(True)
-        if suggs is None or row >= self.table.rowCount():
+        if suggs is None or row >= self.dtable.rowCount():
             return
-        term_item = self.table.item(row, 0)
+        term_item = self.dtable.item(row, 0)
         term = term_item.text().strip().lower() if term_item else ""
-        item = self.table.item(row, 1)
+        item = self.dtable.item(row, 1)
         have = [h.strip() for h in
                 ((item.text() if item else "").split(","))]
         have_l = {h.lower() for h in have if h}
@@ -607,7 +648,7 @@ class DictionaryEditor(QWidget):
                  if s.lower() not in have_l and s.lower() != term]
         if added:
             have = [h for h in have if h] + added
-            self.table.setItem(row, 1, QTableWidgetItem(", ".join(have)))
+            self.dtable.setItem(row, 1, QTableWidgetItem(", ".join(have)))
         self.or_status.setText(
             f"Added {len(added)} mishearing(s)."
             if added else "Nothing new suggested.")
@@ -616,14 +657,14 @@ class DictionaryEditor(QWidget):
         self.suggest_btn.setEnabled(True)
         self.or_status.setText(f"OpenRouter error: {msg}")
 
-    def save(self):
+    def save_dict(self):
         entries = []
-        for r in range(self.table.rowCount()):
-            term_item = self.table.item(r, 0)
+        for r in range(self.dtable.rowCount()):
+            term_item = self.dtable.item(r, 0)
             term = term_item.text().strip() if term_item else ""
             if not term:
                 continue
-            heard_item = self.table.item(r, 1)
+            heard_item = self.dtable.item(r, 1)
             heard = [h.strip() for h in
                      ((heard_item.text() if heard_item else "").split(","))]
             entries.append({"term": term,
@@ -632,138 +673,106 @@ class DictionaryEditor(QWidget):
         with open(DICT_FILE, "w") as f:
             _json.dump({"_help": DICT_HELP, "entries": entries}, f,
                        indent=2, ensure_ascii=False)
-        self.on_saved(len(entries))
-        self.close()
+        self.or_status.setText(f"Saved {len(entries)} term(s).")
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
-            self.close()
-        else:
-            super().keyPressEvent(event)
-
-
-class StatsWindow(QWidget):
-    """Fullscreen analytics: totals, recent WPM, latency, per-day table."""
-
-    def __init__(self):
-        super().__init__(None, Qt.WindowType.Window)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setStyleSheet("StatsWindow { background: rgba(0, 0, 0, 0.72); }")
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addStretch(1)
-        center = QHBoxLayout()
-        center.addStretch(1)
-        card = QWidget(self)
-        card.setObjectName("card")
-        card.setFixedSize(860, 620)
-        card.setStyleSheet(
-            "#card { background: rgba(8, 8, 8, 0.96);"
-            " border: 1px solid #3d3d3d; border-radius: 16px; }")
-        inner = QVBoxLayout(card)
-        inner.setContentsMargins(28, 24, 28, 24)
-        inner.setSpacing(12)
-        center.addWidget(card)
-        center.addStretch(1)
-        outer.addLayout(center)
-        outer.addStretch(1)
-
-        title = QLabel("Dictation analytics")
-        title.setStyleSheet("color: white; font-weight: bold; font-size: 18px;")
-        inner.addWidget(title)
-
+    # ---- analytics tab ----
+    def _build_analytics(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(10)
         tiles = QHBoxLayout()
-        tiles.setSpacing(16)
+        tiles.setSpacing(12)
         self.tiles = {}
-        for key, caption in (("words", "words dictated (all time)"),
-                             ("wpm", "avg words / minute (all time)"),
-                             ("lat", "avg transcription time"),
-                             ("utts", "utterances (all time)")):
+        for key, caption in (("words", "words (all time)"),
+                             ("wpm", "avg WPM (all time)"),
+                             ("lat", "avg transcription"),
+                             ("utts", "utterances")):
             box = QVBoxLayout()
             num = QLabel("—")
             num.setStyleSheet(
-                "color: white; font-weight: bold; font-size: 30px;")
+                "color: white; font-weight: bold; font-size: 22px;")
             cap = QLabel(caption)
-            cap.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+            cap.setStyleSheet("color: #aaaaaa; font-size: 11px;")
             cap.setWordWrap(True)
             box.addWidget(num)
             box.addWidget(cap)
-            box.addStretch(1)
             tiles.addLayout(box, 1)
             self.tiles[key] = num
-        inner.addLayout(tiles)
-
-        self.recent = QLabel()
-        self.recent.setStyleSheet("color: white; font-size: 13px;")
-        self.recent.setWordWrap(True)
-        inner.addWidget(self.recent)
-
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(
+        lay.addLayout(tiles)
+        self.a_recent = QLabel()
+        self.a_recent.setStyleSheet("color: white; font-size: 12px;")
+        self.a_recent.setWordWrap(True)
+        lay.addWidget(self.a_recent)
+        self.a_table = QTableWidget(0, 4)
+        self.a_table.setHorizontalHeaderLabels(
             ["Day", "Words", "Utterances", "Audio (min)"])
-        hdr = self.table.horizontalHeader()
+        hdr = self.a_table.horizontalHeader()
         for i in range(4):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
-        self.table.setSelectionBehavior(
+        self.a_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(
+        self.a_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setStyleSheet(
-            "QTableWidget { background: #0a0a0a; color: white;"
-            " gridline-color: #333333; border: 1px solid #3d3d3d;"
-            " border-radius: 8px; }"
-            "QHeaderView::section { background: #1a1a1a; color: white;"
-            " border: none; padding: 6px; }")
-        inner.addWidget(self.table, 1)
+        self.a_table.setStyleSheet(TABLE_STYLE)
+        lay.addWidget(self.a_table, 1)
+        self.tabs.addTab(tab, "Analytics")
 
-        row = QHBoxLayout()
-        row.addStretch(1)
-        self.refresh_btn = QPushButton("Refresh")
-        close_btn = QPushButton("Close")
-        for b in (self.refresh_btn, close_btn):
-            b.setStyleSheet(
-                "color: white; background: rgba(255,255,255,0.12);"
-                " border: 1px solid #555555; border-radius: 6px;"
-                " padding: 6px 18px;")
-        self.refresh_btn.clicked.connect(self.refresh)
-        close_btn.clicked.connect(self.close)
-        row.addWidget(self.refresh_btn)
-        row.addWidget(close_btn)
-        inner.addLayout(row)
-
-        self.timer = QTimer(self)
-        self.timer.setInterval(5000)
-        self.timer.timeout.connect(
-            lambda: self.isVisible() and self.refresh())
-
-    def open_fullscreen(self):
-        self.refresh()
-        screen = QGuiApplication.screenAt(QCursor.pos())
-        if screen is not None:
-            self.move(screen.geometry().topLeft())
-        self.showFullScreen()
-        if not self.timer.isActive():
-            self.timer.start()
-
-    def refresh(self):
+    def refresh_analytics(self):
         s = summarize_stats(load_stats())
         self.tiles["words"].setText(f"{s['words']:,}")
         self.tiles["wpm"].setText(f"{s['wpm']:.0f}")
         self.tiles["lat"].setText(f"{s['avg_lat']:.2f} s")
         self.tiles["utts"].setText(f"{s['utterances']:,}")
         utt_word = "utterance" if s['recent_n'] == 1 else "utterances"
-        self.recent.setText(
-            f"Last {s['recent_min']} min: {s['recent_wpm']:.0f} WPM across "
-            f"{s['recent_words']:,} words ({s['recent_n']} {utt_word})"
-            f"  ·  transcription avg (last 10): {s['recent_lat']:.2f} s")
-        self.table.setRowCount(0)
+        self.a_recent.setText(
+            f"Last hour: {s['recent_wpm']:.0f} WPM · "
+            f"{s['recent_words']:,} words ({s['recent_n']} {utt_word}) · "
+            f"transcription avg (last 10): {s['recent_lat']:.2f} s")
+        self.a_table.setRowCount(0)
         for d, w, u, a in s["days"]:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            self.table.setItem(r, 0, QTableWidgetItem(d))
-            self.table.setItem(r, 1, QTableWidgetItem(f"{w:,}"))
-            self.table.setItem(r, 2, QTableWidgetItem(f"{u:,}"))
-            self.table.setItem(r, 3, QTableWidgetItem(f"{a:.1f}"))
+            r = self.a_table.rowCount()
+            self.a_table.insertRow(r)
+            self.a_table.setItem(r, 0, QTableWidgetItem(d))
+            self.a_table.setItem(r, 1, QTableWidgetItem(f"{w:,}"))
+            self.a_table.setItem(r, 2, QTableWidgetItem(f"{u:,}"))
+            self.a_table.setItem(r, 3, QTableWidgetItem(f"{a:.1f}"))
+
+    # ---- open / refresh ----
+    def refresh_general(self):
+        cur = read_engine()
+        for key, rb in self.g_radios.items():
+            rb.blockSignals(True)
+            rb.setChecked(key == cur)
+            rb.blockSignals(False)
+        self.g_status.setText("services:  " + service_status())
+        flt = read_filters()
+        for cb, name in ((self.cb_defill, "defiller"),
+                         (self.cb_numbers, "numbers"),
+                         (self.cb_all, "numbers_all")):
+            cb.blockSignals(True)
+            cb.setChecked(flt[name])
+            cb.blockSignals(False)
+        self.key_field.clear()
+        self.refresh_key_status()
+
+    def open(self, tab=0):
+        self.refresh_general()
+        self.load_dict()
+        self.or_status.setText(
+            "OpenRouter: ready" if openrouter_key()
+            else "OpenRouter: no key — suggestions unavailable")
+        self.refresh_analytics()
+        self.tabs.setCurrentIndex(tab)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        screen = QGuiApplication.screenAt(QCursor.pos())
+        if screen is not None:
+            geo = screen.availableGeometry()
+            self.move(geo.x() + (geo.width() - self.width()) // 2,
+                      geo.y() + (geo.height() - self.height()) // 3)
+        if not self.analytics_timer.isActive():
+            self.analytics_timer.start()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -874,10 +883,9 @@ def main():
     status_action.setEnabled(False)
     menu.addAction(status_action)
     menu.addSeparator()
-    stats_action = QAction("Analytics…", menu)
-    stats_action.triggered.connect(
-        lambda: stats.open_fullscreen())
-    menu.addAction(stats_action)
+    settings_action = QAction("Settings…", menu)
+    settings_action.triggered.connect(lambda: settings.open())
+    menu.addAction(settings_action)
     menu.addSeparator()
     quit_action = QAction("Quit tray (dictation keeps working)", menu)
     quit_action.triggered.connect(app.quit)
@@ -901,20 +909,16 @@ def main():
     menu.aboutToShow.connect(on_show)
     tray.setContextMenu(menu)
 
+    settings = SettingsWindow(on_engine=lambda key: (switch(key), refresh()))
     popup = EnginePopup(
         on_engine=lambda key: (switch(key), refresh()),
-        on_filters=write_filters,
-        on_dict=lambda: editor.open_fullscreen(),
-        on_stats=lambda: stats.open_fullscreen())
-    editor = DictionaryEditor(
-        on_saved=lambda n: popup.refresh_dict_button())
-    stats = StatsWindow()
+        on_settings=settings.open)
 
     def on_menu_tap():
         if popup.isVisible():
             popup.hide()
         else:
-            popup.show_at(read_engine(), service_status(), read_filters())
+            popup.show_at(read_engine(), service_status())
 
     watcher = MenuKeyWatcher(on_menu_tap)
     refresh()

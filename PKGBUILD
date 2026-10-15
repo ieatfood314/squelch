@@ -1,6 +1,6 @@
 # Maintainer: Aidan Heeney <aidan.heeney@proton.me>
 pkgname=squelch
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Push-to-talk speech-to-text on GPU: Parakeet/Whisper, mic-array beamforming, Menu-key dictation'
 arch=('x86_64')
@@ -25,6 +25,7 @@ build() {
 package() {
   install -Dm755 build/bin/whisper-server build/bin/whisper-cli \
     build/bin/parakeet-cli -t "$pkgdir/usr/bin/"
+  install -d "$pkgdir/usr/lib/"
   for f in build/bin/libwhisper.so* build/bin/libparakeet.so* \
            build/bin/libggml*.so*; do
     [ -e "$f" ] || continue

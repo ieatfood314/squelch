@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Squelch
 Comment=Push-to-talk speech-to-text (hold Menu to dictate)
-Exec=/home/aidan-heeney/.local/bin/squelch-tray
+Exec=/usr/bin/squelch-tray
 Icon=audio-input-microphone
 Terminal=false
 Type=Application
