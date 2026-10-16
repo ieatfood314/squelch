@@ -62,10 +62,13 @@ detect). Game fullscreen unloads models automatically; dictating then shows
 one notification instead of failing silently.
 
 Every utterance is archived for future training: raw 4-channel audio,
-cleaned mono, and the transcript go to `/mnt/raid1/aidan/squelch/` (when
+cleaned mono, and the transcript go to `/mnt/nas/Aidan/squelch/` (when
 writable; otherwise queued locally and uploaded later). Adaptation is fully
 on-device — frequent words you actually say are mined into your Whisper
 vocabulary prompt over time. No gradients leave your machine, ever.
+
+Music (any MPRIS player) pauses while you hold the trigger and resumes on
+release, so it never bleeds into the mic.
 
 ## Layout
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=STT push-to-talk (Menu hold -> PS Eye beamform -> whisper GPU -> type)
+Description=STT push-to-talk (trigger hold -> mic array -> GPU -> paste)
 After=squelch-whisper.service pipewire.service kanata.service
 Wants=squelch-whisper.service
 

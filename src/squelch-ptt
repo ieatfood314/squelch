@@ -35,7 +35,7 @@ INSERTION_FILE = os.path.expanduser("~/.config/squelch/insertion.json")
 TRANSCRIPTS_FILE = os.path.expanduser("~/.config/squelch/transcripts.jsonl")
 VOCAB_FILE = os.path.expanduser("~/.config/squelch/vocab.json")
 SPOOL_DIR = os.path.expanduser("~/.config/squelch/spool")
-NAS_ROOT = "/mnt/raid1/aidan/squelch"
+NAS_ROOT = "/mnt/nas/Aidan/squelch"
 _nas_state = {"ok": False, "checked": 0.0}
 _spool_lock = threading.Lock()
 _spool_counter = 0
@@ -806,6 +806,49 @@ def paste_text(text):
 
 # ---------------- recording ----------------
 
+def playing_players():
+    """Names of MPRIS players currently playing (empty if none/playerctl)."""
+    try:
+        r = subprocess.run(["playerctl", "-l"], capture_output=True,
+                           text=True, timeout=5)
+    except (FileNotFoundError, OSError):
+        return []
+    except Exception:
+        return []
+    out = []
+    for name in r.stdout.split():
+        try:
+            s = subprocess.run(["playerctl", "-p", name, "status"],
+                               capture_output=True, text=True, timeout=5)
+            if s.stdout.strip() == "Playing":
+                out.append(name)
+        except Exception:
+            continue
+    return out
+
+
+def pause_players(names):
+    for n in names:
+        try:
+            subprocess.run(["playerctl", "-p", n, "pause"], timeout=5,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    if names:
+        log(f"paused music: {', '.join(names)}")
+
+
+def resume_players(names):
+    for n in names:
+        try:
+            subprocess.run(["playerctl", "-p", n, "play"], timeout=5,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
 def start_recording(target, path):
     return subprocess.Popen(
         ["pw-record", "--target", target, "--rate", str(SR),
@@ -899,6 +942,7 @@ def main():
         log(f"listening on {dev.path} ({dev.name})")
         rec_proc = None
         rec_path = None
+        rec_paused = []
         press_t = 0.0
         try:
             for ev in dev.read_loop():
@@ -913,13 +957,17 @@ def main():
                         notify_stt("STT engine unavailable",
                                    "Speech models are unloaded (game mode?)")
                         continue
+                    paused = playing_players()
+                    pause_players(paused)
                     target = find_mic_target()
                     if target is None:
                         log("mic not found, ignoring press")
+                        resume_players(paused)
                         continue
                     fd, rec_path = tempfile.mkstemp(suffix="-raw.wav")
                     os.close(fd)
                     rec_proc = start_recording(target, rec_path)
+                    rec_paused = paused
                     press_t = time.time()
                     log("recording...")
                 elif ev.value == 0 and rec_proc is not None:  # released
@@ -930,6 +978,8 @@ def main():
                     except Exception:
                         rec_proc.kill()
                     rec_proc = None
+                    resume_players(rec_paused)
+                    rec_paused = []
                     if held < MIN_HOLD_S:
                         log(f"tap ({held:.2f}s), ignoring")
                         try:

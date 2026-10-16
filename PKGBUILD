@@ -1,13 +1,14 @@
 # Maintainer: Aidan Heeney <aidan.heeney@proton.me>
 pkgname=squelch
-pkgver=0.4.0
+pkgver=0.4.1
 pkgrel=1
 pkgdesc='Push-to-talk speech-to-text on GPU: Parakeet/Whisper, mic-array beamforming, Menu-key dictation'
 arch=('x86_64')
 url='https://github.com/ieatfood314/squelch'
 license=('MIT')
 depends=('python' 'python-evdev' 'python-numpy' 'python-pyqt6' 'ydotool'
-         'wl-clipboard' 'libnotify' 'pipewire' 'vulkan-icd-loader' 'kanata')
+         'wl-clipboard' 'libnotify' 'pipewire' 'vulkan-icd-loader' 'kanata'
+         'playerctl')
 makedepends=('git' 'cmake' 'vulkan-headers' 'spirv-headers')
 optdepends=('python-huggingface_hub: alternative model downloads')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
