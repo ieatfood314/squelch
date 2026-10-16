@@ -47,7 +47,7 @@ Focus a text field, hold your trigger key, speak, release.
 | Action | How |
 |---|---|
 | Dictate | hold trigger key, speak, release |
-| Settings (engine, trigger, insertion, cleanup, dictionary, analytics, setup) | tap trigger, or tray menu → Settings |
+| Settings (engine, trigger, insertion, cleanup, dictionary, analytics, setup) | tap trigger, double-tap for Settings, or tray menu |
 | Engine switch | settings popup, General tab, or right-click tray icon |
 | Trigger key (Menu/Caps Lock/Scroll Lock) | settings → General (rewrites kanata binding) |
 | Insertion (paste/type/clipboard-only) | settings → General |
@@ -60,6 +60,12 @@ Focus a text field, hold your trigger key, speak, release.
 Other languages: switch to Whisper in the popup (auto language
 detect). Game fullscreen unloads models automatically; dictating then shows
 one notification instead of failing silently.
+
+Every utterance is archived for future training: raw 4-channel audio,
+cleaned mono, and the transcript go to `/mnt/raid1/aidan/squelch/` (when
+writable; otherwise queued locally and uploaded later). Adaptation is fully
+on-device — frequent words you actually say are mined into your Whisper
+vocabulary prompt over time. No gradients leave your machine, ever.
 
 ## Layout
 

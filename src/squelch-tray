@@ -107,9 +107,11 @@ def read_filters():
             d = __import__("json").load(f)
         return {"defiller": bool(d.get("defiller", True)),
                 "numbers": bool(d.get("numbers", True)),
-                "numbers_all": bool(d.get("numbers_all", False))}
+                "numbers_all": bool(d.get("numbers_all", False)),
+                "dict_advanced": bool(d.get("dict_advanced", False))}
     except (OSError, ValueError):
-        return {"defiller": True, "numbers": True, "numbers_all": False}
+        return {"defiller": True, "numbers": True, "numbers_all": False,
+                "dict_advanced": False}
 
 
 def dict_term_count():
@@ -472,10 +474,10 @@ DICT_HELP = ("Your words. 'term' is the correct spelling. 'also_match' lists "
 BTN = ("color: white; background: rgba(255,255,255,0.12);"
        " border: 1px solid #555555; border-radius: 6px; padding: 4px;")
 TABLE_STYLE = (
-    "QTableWidget { background: #0a0a0a; color: white;"
+    "QTableWidget { background: #000000; color: white;"
     " gridline-color: #333333; border: 1px solid #3d3d3d;"
     " border-radius: 8px; }"
-    "QHeaderView::section { background: #1a1a1a; color: white;"
+    "QHeaderView::section { background: #000000; color: white;"
     " border: none; padding: 6px; }")
 DIM_LABEL = "color: #aaaaaa; font-size: 11px;"
 
@@ -609,19 +611,19 @@ class SettingsWindow(QWidget):
         self.dl_done.connect(self._dl_finished)
         self.refresh_needed.connect(self.refresh_setup)
         self.setStyleSheet(
-            "SettingsWindow { background: rgba(8, 8, 8, 0.96); }")
+            "SettingsWindow { background: rgba(0, 0, 0, 0.6); }")
         self.resize(700, 540)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 14, 16, 14)
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(
-            "QTabWidget::pane { background: rgba(8,8,8,0.96);"
+            "QTabWidget::pane { background: #000000;"
             " border: 1px solid #3d3d3d; border-radius: 8px; }"
-            "QTabBar::tab { background: #1a1a1a; color: #cccccc;"
+            "QTabBar::tab { background: #000000; color: #cccccc;"
             " padding: 6px 14px; border-top-left-radius: 6px;"
             " border-top-right-radius: 6px; }"
-            "QTabBar::tab:selected { background: #2a2a2a; color: white; }"
+            "QTabBar::tab:selected { background: #1c1c1c; color: white; }"
             "QWidget { color: white; }")
         lay.addWidget(self.tabs, 1)
         self._build_general()
@@ -664,7 +666,7 @@ class SettingsWindow(QWidget):
         for key, label in HOTKEYS:
             self.hk_combo.addItem(label, key)
         self.hk_combo.setStyleSheet(
-            "background: #0a0a0a; color: white; border: 1px solid #3d3d3d;"
+            "background: #000000; color: white; border: 1px solid #3d3d3d;"
             " border-radius: 6px; padding: 4px;")
         hkrow.addWidget(self.hk_combo, 1)
         hk_apply = QPushButton("Apply")
@@ -749,7 +751,7 @@ class SettingsWindow(QWidget):
             row.addWidget(lab, 1)
             combo = QComboBox()
             combo.setStyleSheet(
-                "background: #0a0a0a; color: white;"
+                "background: #000000; color: white;"
                 " border: 1px solid #3d3d3d; border-radius: 6px; padding: 4px;")
             combo.currentIndexChanged.connect(
                 lambda _i, k=kind: self.model_changed(k))
@@ -798,30 +800,6 @@ class SettingsWindow(QWidget):
         note.setStyleSheet(DIM_LABEL)
         note.setWordWrap(True)
         lay.addWidget(note)
-
-        keyl = QLabel("OpenRouter (powers mishearing suggestions)")
-        keyl.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
-        lay.addWidget(keyl)
-        keyrow = QHBoxLayout()
-        self.key_field = QLineEdit()
-        self.key_field.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_field.setPlaceholderText("paste key, then Set")
-        self.key_field.setStyleSheet(
-            "background: #0a0a0a; color: white; border: 1px solid #3d3d3d;"
-            " border-radius: 6px; padding: 4px;")
-        set_btn = QPushButton("Set")
-        clear_btn = QPushButton("Clear")
-        for b in (set_btn, clear_btn):
-            b.setStyleSheet(BTN)
-        set_btn.clicked.connect(self.key_save)
-        clear_btn.clicked.connect(self.key_clear)
-        keyrow.addWidget(self.key_field, 1)
-        keyrow.addWidget(set_btn)
-        keyrow.addWidget(clear_btn)
-        lay.addLayout(keyrow)
-        self.key_status = QLabel()
-        self.key_status.setStyleSheet(DIM_LABEL)
-        lay.addWidget(self.key_status)
         lay.addStretch(1)
         self.tabs.addTab(tab, "Setup")
 
@@ -945,6 +923,34 @@ class SettingsWindow(QWidget):
         self.or_status.setStyleSheet(DIM_LABEL)
         lay.addWidget(self.or_status)
 
+        keyrow = QHBoxLayout()
+        keylab = QLabel("OpenRouter key:")
+        keylab.setStyleSheet("color: white;")
+        self.key_field = QLineEdit()
+        self.key_field.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_field.setPlaceholderText("paste key, then Set")
+        self.key_field.setStyleSheet(
+            "background: #000000; color: white; border: 1px solid #3d3d3d;"
+            " border-radius: 6px; padding: 4px;")
+        set_btn = QPushButton("Set")
+        clear_btn = QPushButton("Clear")
+        for b in (set_btn, clear_btn):
+            b.setStyleSheet(BTN)
+        set_btn.clicked.connect(self.key_save)
+        clear_btn.clicked.connect(self.key_clear)
+        keyrow.addWidget(keylab)
+        keyrow.addWidget(self.key_field, 1)
+        keyrow.addWidget(set_btn)
+        keyrow.addWidget(clear_btn)
+        lay.addLayout(keyrow)
+        self.key_status = QLabel()
+        self.key_status.setStyleSheet(DIM_LABEL)
+        lay.addWidget(self.key_status)
+
+        self.adv_toggle = QCheckBox("Advanced: show mishearing phrases")
+        self.adv_toggle.toggled.connect(self.adv_toggled)
+        lay.addWidget(self.adv_toggle)
+
         self.dtable = QTableWidget(0, 2)
         self.dtable.setHorizontalHeaderLabels(list(self.COLS))
         hdr = self.dtable.horizontalHeader()
@@ -977,7 +983,17 @@ class SettingsWindow(QWidget):
         lay.addLayout(row)
         self.tabs.addTab(tab, "Dictionary")
 
+    def adv_toggled(self, checked):
+        self.dtable.setColumnHidden(1, not checked)
+        flt = read_filters()
+        flt["dict_advanced"] = bool(checked)
+        write_filters(flt)
+
     def load_dict(self):
+        self.adv_toggle.blockSignals(True)
+        self.adv_toggle.setChecked(read_filters().get("dict_advanced", False))
+        self.adv_toggle.blockSignals(False)
+        self.dtable.setColumnHidden(1, not self.adv_toggle.isChecked())
         try:
             with open(DICT_FILE) as f:
                 entries = _json.load(f).get("entries", [])
@@ -1288,7 +1304,7 @@ def main():
     menu.addAction(status_action)
     menu.addSeparator()
     settings_action = QAction("Settings…", menu)
-    settings_action.triggered.connect(lambda: settings.open())
+    settings_action.triggered.connect(lambda: open_settings())
     menu.addAction(settings_action)
     menu.addSeparator()
     quit_action = QAction("Quit tray (dictation keeps working)", menu)
@@ -1315,15 +1331,42 @@ def main():
 
     settings = SettingsWindow(on_engine=lambda key: (switch(key), refresh()),
                               on_filters=write_filters)
+
+    def open_settings(tab=0):
+        popup.hide()  # single-window policy: settings closes the tap card
+        settings.open(tab)
+
     popup = EnginePopup(
         on_engine=lambda key: (switch(key), refresh()),
-        on_settings=settings.open)
+        on_settings=open_settings)
 
-    def on_menu_tap():
-        if popup.isVisible():
+    tap = {"pending": False}
+    tap_timer = QTimer()
+    tap_timer.setSingleShot(True)
+    tap_timer.setInterval(350)
+
+    def on_tap_timeout():
+        if not tap["pending"]:
+            return
+        tap["pending"] = False
+        if settings.isVisible():
+            settings.close()  # single tap with settings open closes it
+        elif popup.isVisible():
             popup.hide()
         else:
             popup.show_at(read_engine(), service_status())
+
+    tap_timer.timeout.connect(on_tap_timeout)
+
+    def on_menu_tap():
+        if tap["pending"]:
+            # double tap: straight to settings, tap card stays closed
+            tap["pending"] = False
+            tap_timer.stop()
+            open_settings()
+        else:
+            tap["pending"] = True
+            tap_timer.start()
 
     watcher = MenuKeyWatcher(on_menu_tap)
     refresh()
