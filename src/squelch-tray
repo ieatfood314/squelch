@@ -20,9 +20,10 @@ from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor,
                          QGuiApplication, QIcon, QPainter, QPixmap)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                              QComboBox, QHBoxLayout, QHeaderView, QLabel,
-                             QLineEdit, QMenu, QPushButton, QRadioButton,
-                             QSystemTrayIcon, QTabWidget, QTableWidget,
-                             QTableWidgetItem, QVBoxLayout, QWidget)
+                             QLineEdit, QListWidget, QMenu, QPushButton,
+                             QRadioButton, QSystemTrayIcon, QTabWidget,
+                             QTableWidget, QTableWidgetItem, QVBoxLayout,
+                             QWidget)
 import json as _json
 
 ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
@@ -480,6 +481,11 @@ TABLE_STYLE = (
     "QHeaderView::section { background: #000000; color: white;"
     " border: none; padding: 6px; }")
 DIM_LABEL = "color: #aaaaaa; font-size: 11px;"
+FIELD = ("background: #000000; color: white; border: 1px solid #3d3d3d;"
+         " border-radius: 6px; padding: 4px;")
+LIST = ("QListWidget { background: #000000; color: white;"
+        " border: 1px solid #3d3d3d; border-radius: 8px; }"
+        "QListWidget::item:selected { background: #1c1c1c; }")
 
 
 class EnginePopup(QWidget):
@@ -592,8 +598,6 @@ class EnginePopup(QWidget):
 class SettingsWindow(QWidget):
     """Unified low-profile settings: engine/text/dictionary/analytics tabs
     in one centered window (not fullscreen)."""
-
-    COLS = ("Term (correct spelling)", "Also heard as (comma separated)")
 
     suggested = pyqtSignal(int, object)  # row, [suggestions] (None = failed)
     suggest_failed = pyqtSignal(str)
@@ -883,155 +887,204 @@ class SettingsWindow(QWidget):
             cb.setChecked(service_enabled(svc))
             cb.blockSignals(False)
 
-    def key_save(self):
-        k = self.key_field.text().strip()
-        if not k:
-            return
-        os.makedirs(os.path.dirname(OPENROUTER_KEY_FILE), exist_ok=True)
-        with open(OPENROUTER_KEY_FILE, "w") as f:
-            f.write(k + "\n")
-        os.chmod(OPENROUTER_KEY_FILE, 0o600)
-        self.key_field.clear()
-        try:
-            os.unlink(OPENROUTER_MODEL_FILE)  # re-probe models for new key
-        except OSError:
-            pass
-        self.refresh_key_status()
-
-    def key_clear(self):
-        try:
-            os.unlink(OPENROUTER_KEY_FILE)
-        except OSError:
-            pass
-        try:
-            os.unlink(OPENROUTER_MODEL_FILE)
-        except OSError:
-            pass
-        self.refresh_key_status()
-
-    def refresh_key_status(self):
-        self.key_status.setText(
-            "Key configured — suggestions enabled." if openrouter_key()
-            else "No key set — suggestions unavailable.")
+    # ---- setup tab (models, services) ----
 
     # ---- dictionary tab ----
     def _build_dictionary(self):
         tab = QWidget()
         lay = QVBoxLayout(tab)
         lay.setSpacing(8)
+
+        addrow = QHBoxLayout()
+        self.add_field = QLineEdit()
+        self.add_field.setPlaceholderText("Type a word, press Enter…")
+        self.add_field.setStyleSheet(FIELD)
+        self.add_field.returnPressed.connect(self.dict_add)
+        add_btn = QPushButton("Add")
+        add_btn.setStyleSheet(BTN)
+        add_btn.clicked.connect(self.dict_add)
+        key_btn = QPushButton("OpenRouter…")
+        key_btn.setStyleSheet(BTN)
+        key_btn.clicked.connect(self.open_key_dialog)
+        addrow.addWidget(self.add_field, 1)
+        addrow.addWidget(add_btn)
+        addrow.addWidget(key_btn)
+        lay.addLayout(addrow)
+
+        self.term_list = QListWidget()
+        self.term_list.setStyleSheet(LIST)
+        self.term_list.currentRowChanged.connect(self.dict_select)
+        lay.addWidget(self.term_list, 1)
+
+        detrow = QHBoxLayout()
+        detlab = QLabel("Sounds like:")
+        detlab.setStyleSheet("color: white;")
+        self.heard_field = QLineEdit()
+        self.heard_field.setPlaceholderText("comma separated, optional")
+        self.heard_field.setStyleSheet(FIELD)
+        self.heard_field.editingFinished.connect(self.heard_save)
+        self.suggest_btn = QPushButton("Suggest")
+        self.suggest_btn.setStyleSheet(BTN)
+        self.suggest_btn.clicked.connect(self.suggest)
+        rm_btn = QPushButton("Remove")
+        rm_btn.setStyleSheet(BTN)
+        rm_btn.clicked.connect(self.dict_remove)
+        detrow.addWidget(detlab)
+        detrow.addWidget(self.heard_field, 1)
+        detrow.addWidget(self.suggest_btn)
+        detrow.addWidget(rm_btn)
+        lay.addLayout(detrow)
+
         self.or_status = QLabel()
         self.or_status.setStyleSheet(DIM_LABEL)
+        self.or_status.setWordWrap(True)
         lay.addWidget(self.or_status)
-
-        keyrow = QHBoxLayout()
-        keylab = QLabel("OpenRouter key:")
-        keylab.setStyleSheet("color: white;")
-        self.key_field = QLineEdit()
-        self.key_field.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_field.setPlaceholderText("paste key, then Set")
-        self.key_field.setStyleSheet(
-            "background: #000000; color: white; border: 1px solid #3d3d3d;"
-            " border-radius: 6px; padding: 4px;")
-        set_btn = QPushButton("Set")
-        clear_btn = QPushButton("Clear")
-        for b in (set_btn, clear_btn):
-            b.setStyleSheet(BTN)
-        set_btn.clicked.connect(self.key_save)
-        clear_btn.clicked.connect(self.key_clear)
-        keyrow.addWidget(keylab)
-        keyrow.addWidget(self.key_field, 1)
-        keyrow.addWidget(set_btn)
-        keyrow.addWidget(clear_btn)
-        lay.addLayout(keyrow)
-        self.key_status = QLabel()
-        self.key_status.setStyleSheet(DIM_LABEL)
-        lay.addWidget(self.key_status)
-
-        self.adv_toggle = QCheckBox("Advanced: show mishearing phrases")
-        self.adv_toggle.toggled.connect(self.adv_toggled)
-        lay.addWidget(self.adv_toggle)
-
-        self.dtable = QTableWidget(0, 2)
-        self.dtable.setHorizontalHeaderLabels(list(self.COLS))
-        hdr = self.dtable.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.dtable.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
-        self.dtable.setStyleSheet(TABLE_STYLE)
-        lay.addWidget(self.dtable, 1)
-
-        row = QHBoxLayout()
-        add_btn = QPushButton("Add row")
-        del_btn = QPushButton("Remove selected")
-        self.suggest_btn = QPushButton("Suggest mishearings")
-        for b in (add_btn, del_btn, self.suggest_btn):
-            b.setStyleSheet(BTN)
-        add_btn.clicked.connect(self.add_row)
-        del_btn.clicked.connect(self.del_rows)
-        self.suggest_btn.clicked.connect(self.suggest)
-        row.addWidget(add_btn)
-        row.addWidget(del_btn)
-        row.addWidget(self.suggest_btn)
-        row.addStretch(1)
-        save_btn = QPushButton("Save dictionary")
-        save_btn.setStyleSheet(
-            "color: white; background: #3563c8;"
-            " border: 1px solid #4a7de0; border-radius: 6px; padding: 6px 18px;")
-        save_btn.clicked.connect(self.save_dict)
-        row.addWidget(save_btn)
-        lay.addLayout(row)
         self.tabs.addTab(tab, "Dictionary")
 
-    def adv_toggled(self, checked):
-        self.dtable.setColumnHidden(1, not checked)
-        flt = read_filters()
-        flt["dict_advanced"] = bool(checked)
-        write_filters(flt)
+        self.dict_entries = []
 
     def load_dict(self):
-        self.adv_toggle.blockSignals(True)
-        self.adv_toggle.setChecked(read_filters().get("dict_advanced", False))
-        self.adv_toggle.blockSignals(False)
-        self.dtable.setColumnHidden(1, not self.adv_toggle.isChecked())
         try:
             with open(DICT_FILE) as f:
                 entries = _json.load(f).get("entries", [])
         except (OSError, ValueError, AttributeError):
             entries = []
-        self.dtable.setRowCount(0)
-        for e in entries:
-            r = self.dtable.rowCount()
-            self.dtable.insertRow(r)
-            self.dtable.setItem(r, 0, QTableWidgetItem(str(e.get("term", ""))))
-            self.dtable.setItem(
-                r, 1, QTableWidgetItem(
-                    ", ".join(str(x) for x in e.get("also_match", []) or [])))
+        self.dict_entries = [
+            {"term": str(e.get("term", "")),
+             "also_match": [str(x) for x in e.get("also_match", []) or []]}
+            for e in entries]
+        self.term_list.blockSignals(True)
+        self.term_list.clear()
+        for e in self.dict_entries:
+            self.term_list.addItem(e["term"])
+        self.term_list.blockSignals(False)
+        self.heard_field.clear()
+        self.or_status.setText(
+            f"{len(self.dict_entries)} word(s) in dictionary.")
 
-    def add_row(self):
-        r = self.dtable.rowCount()
-        self.dtable.insertRow(r)
-        self.dtable.setItem(r, 0, QTableWidgetItem(""))
-        self.dtable.setItem(r, 1, QTableWidgetItem(""))
-        self.dtable.editItem(self.dtable.item(r, 0))
+    def save_dict(self, quiet=False):
+        entries = [e for e in self.dict_entries if e["term"].strip()]
+        os.makedirs(os.path.dirname(DICT_FILE), exist_ok=True)
+        with open(DICT_FILE, "w") as f:
+            _json.dump({"_help": DICT_HELP, "entries": entries}, f,
+                       indent=2, ensure_ascii=False)
+        if not quiet:
+            self.or_status.setText(f"Saved {len(entries)} word(s).")
 
-    def del_rows(self):
-        for idx in sorted(
-                {i.row() for i in self.dtable.selectedIndexes()},
-                reverse=True):
-            self.dtable.removeRow(idx)
+    def dict_add(self):
+        term = self.add_field.text().strip()
+        if not term:
+            return
+        for i, e in enumerate(self.dict_entries):
+            if e["term"].lower() == term.lower():
+                self.term_list.setCurrentRow(i)
+                self.add_field.clear()
+                self.add_field.setFocus()
+                self.or_status.setText("Already in dictionary.")
+                return
+        self.dict_entries.append({"term": term, "also_match": []})
+        self.save_dict(quiet=True)
+        self.load_dict()
+        self.term_list.setCurrentRow(len(self.dict_entries) - 1)
+        self.add_field.clear()
+        self.add_field.setFocus()
+        self.or_status.setText(f"Added “{term}”.")
+
+    def dict_select(self, row):
+        if 0 <= row < len(self.dict_entries):
+            self.heard_field.setText(
+                ", ".join(self.dict_entries[row]["also_match"]))
+        else:
+            self.heard_field.clear()
+
+    def heard_save(self):
+        row = self.term_list.currentRow()
+        if 0 <= row < len(self.dict_entries):
+            heard = [h.strip() for h in self.heard_field.text().split(",")]
+            self.dict_entries[row]["also_match"] = [h for h in heard if h]
+            self.save_dict(quiet=True)
+
+    def dict_remove(self):
+        row = self.term_list.currentRow()
+        if 0 <= row < len(self.dict_entries):
+            term = self.dict_entries[row]["term"]
+            del self.dict_entries[row]
+            self.save_dict(quiet=True)
+            self.load_dict()
+            self.or_status.setText(f"Removed “{term}”.")
+
+    def open_key_dialog(self):
+        from PyQt6.QtWidgets import QDialog as _QDialog
+        dlg = _QDialog(self)
+        dlg.setWindowTitle("OpenRouter key")
+        dlg.setStyleSheet("QDialog { background: #000000; }")
+        lay = QVBoxLayout(dlg)
+        lab = QLabel("Powers AI mishearing suggestions.\n"
+                     "Stored owner-only at ~/.config/squelch/openrouter.key")
+        lab.setStyleSheet("color: white;")
+        lab.setWordWrap(True)
+        lay.addWidget(lab)
+        field = QLineEdit()
+        field.setEchoMode(QLineEdit.EchoMode.Password)
+        field.setPlaceholderText(
+            "key set — paste a new one to replace" if openrouter_key()
+            else "paste key here")
+        field.setStyleSheet(FIELD)
+        lay.addWidget(field)
+        st = QLabel()
+        st.setStyleSheet(DIM_LABEL)
+        lay.addWidget(st)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        set_btn = QPushButton("Set")
+        clear_btn = QPushButton("Clear")
+        close_btn = QPushButton("Close")
+        for b in (set_btn, clear_btn, close_btn):
+            b.setStyleSheet(BTN)
+        row.addWidget(set_btn)
+        row.addWidget(clear_btn)
+        row.addWidget(close_btn)
+        lay.addLayout(row)
+
+        def do_set():
+            k = field.text().strip()
+            if not k:
+                return
+            os.makedirs(os.path.dirname(OPENROUTER_KEY_FILE), exist_ok=True)
+            with open(OPENROUTER_KEY_FILE, "w") as f:
+                f.write(k + "\n")
+            os.chmod(OPENROUTER_KEY_FILE, 0o600)
+            try:
+                os.unlink(OPENROUTER_MODEL_FILE)
+            except OSError:
+                pass
+            field.clear()
+            st.setText("Key saved.")
+
+        def do_clear():
+            try:
+                os.unlink(OPENROUTER_KEY_FILE)
+                st.setText("Key removed.")
+            except OSError:
+                st.setText("No key was set.")
+            try:
+                os.unlink(OPENROUTER_MODEL_FILE)
+            except OSError:
+                pass
+
+        set_btn.clicked.connect(do_set)
+        clear_btn.clicked.connect(do_clear)
+        close_btn.clicked.connect(dlg.accept)
+        dlg.exec()
 
     def suggest(self):
-        """Fill Also-heard-as for the selected row via OpenRouter (one call)."""
-        rows = sorted({i.row() for i in self.dtable.selectedIndexes()})
-        row = rows[0] if rows else self.dtable.currentRow()
-        if row < 0 or row >= self.dtable.rowCount():
-            self.or_status.setText("Select a row first.")
+        """Suggest mishearings for the selected word (one OpenRouter call)."""
+        row = self.term_list.currentRow()
+        if row < 0 or row >= len(self.dict_entries):
+            self.or_status.setText("Select a word first.")
             return
-        item = self.dtable.item(row, 0)
-        term = item.text().strip() if item else ""
+        term = self.dict_entries[row]["term"]
         if not term:
-            self.or_status.setText("Type the term first, then Suggest.")
             return
         self.suggest_btn.setEnabled(False)
         self.or_status.setText(f"Asking OpenRouter what “{term}” sounds like…")
@@ -1046,19 +1099,19 @@ class SettingsWindow(QWidget):
 
     def _apply_suggestions(self, row, suggs):
         self.suggest_btn.setEnabled(True)
-        if suggs is None or row >= self.dtable.rowCount():
+        if suggs is None or row >= len(self.dict_entries):
             return
-        term_item = self.dtable.item(row, 0)
-        term = term_item.text().strip().lower() if term_item else ""
-        item = self.dtable.item(row, 1)
-        have = [h.strip() for h in
-                ((item.text() if item else "").split(","))]
-        have_l = {h.lower() for h in have if h}
+        term = self.dict_entries[row]["term"].lower()
+        have = self.dict_entries[row]["also_match"]
+        have_l = {h.lower() for h in have}
         added = [s for s in suggs
                  if s.lower() not in have_l and s.lower() != term]
         if added:
-            have = [h for h in have if h] + added
-            self.dtable.setItem(row, 1, QTableWidgetItem(", ".join(have)))
+            self.dict_entries[row]["also_match"] = have + added
+            self.save_dict(quiet=True)
+            if self.term_list.currentRow() == row:
+                self.heard_field.setText(
+                    ", ".join(self.dict_entries[row]["also_match"]))
         self.or_status.setText(
             f"Added {len(added)} mishearing(s)."
             if added else "Nothing new suggested.")
@@ -1066,24 +1119,6 @@ class SettingsWindow(QWidget):
     def _suggest_error(self, msg):
         self.suggest_btn.setEnabled(True)
         self.or_status.setText(f"OpenRouter error: {msg}")
-
-    def save_dict(self):
-        entries = []
-        for r in range(self.dtable.rowCount()):
-            term_item = self.dtable.item(r, 0)
-            term = term_item.text().strip() if term_item else ""
-            if not term:
-                continue
-            heard_item = self.dtable.item(r, 1)
-            heard = [h.strip() for h in
-                     ((heard_item.text() if heard_item else "").split(","))]
-            entries.append({"term": term,
-                            "also_match": [h for h in heard if h]})
-        os.makedirs(os.path.dirname(DICT_FILE), exist_ok=True)
-        with open(DICT_FILE, "w") as f:
-            _json.dump({"_help": DICT_HELP, "entries": entries}, f,
-                       indent=2, ensure_ascii=False)
-        self.or_status.setText(f"Saved {len(entries)} term(s).")
 
     # ---- analytics tab ----
     def _build_analytics(self):
@@ -1162,15 +1197,10 @@ class SettingsWindow(QWidget):
             cb.blockSignals(True)
             cb.setChecked(flt[name])
             cb.blockSignals(False)
-        self.key_field.clear()
-        self.refresh_key_status()
 
     def refresh_setup(self):
         self.refresh_models()
         self.refresh_services()
-        if hasattr(self, "key_field"):
-            self.key_field.clear()
-            self.refresh_key_status()
 
     def open(self, tab=0):
         self.refresh_general()
