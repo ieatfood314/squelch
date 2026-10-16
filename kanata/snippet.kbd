@@ -1,4 +1,5 @@
-# Squelch kanata snippet — hold Menu to dictate, tap Menu for the popup.
+# Squelch kanata snippet — hold the trigger key to dictate, tap it for
+# the popup (Menu key in this example; change `menu` to caps/scrlck etc.).
 #
 # Merge into your kanata config:
 #   1. add `menu` to your (defsrc ...) list

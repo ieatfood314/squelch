@@ -4,6 +4,7 @@ After=pipewire.service
 Wants=pipewire.service
 
 [Service]
+EnvironmentFile=%h/.config/squelch/engines.env
 ExecStart=/usr/bin/squelch-parakeet-server
 Restart=always
 RestartSec=3

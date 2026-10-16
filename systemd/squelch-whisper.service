@@ -4,7 +4,8 @@ After=pipewire.service
 Wants=pipewire.service
 
 [Service]
-ExecStart=/usr/bin/whisper-server -m %h/.local/share/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin --host 127.0.0.1 --port 1893 --convert
+EnvironmentFile=%h/.config/squelch/engines.env
+ExecStart=/usr/bin/whisper-server -m ${SQUELCH_WHISPER_MODEL} --host 127.0.0.1 --port 1893 --convert
 Restart=always
 RestartSec=3
 Nice=-5

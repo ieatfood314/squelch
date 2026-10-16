@@ -5,7 +5,7 @@ well under a second. Tap **Menu** for a settings popup. Fully on-device,
 no cloud, no accounts.
 
 - **Fast GPU inference**: Parakeet TDT 0.6B v3 (English default, ~0.2 s for
-  11 s of audio) and Whisper large-v3-turbo (multilingual/French fallback),
+  11 s of audio) and Whisper large-v3-turbo (other-languages fallback),
   both resident in VRAM via Vulkan — NVIDIA and AMD both work
 - **Mic-array beamforming**: adaptive delay-and-sum across your camera/mic
   channels, high-pass, diffraction EQ, noise gate, normalization
@@ -32,7 +32,7 @@ yay -S squelch
 squelch-setup-models     # downloads ~1.2 GB of models, resumable
 ```
 
-Then wire up the Menu key (needs [kanata](https://github.com/jtroo/kanata)) —
+Then wire up a trigger key — Menu by default (needs [kanata](https://github.com/jtroo/kanata)) —
 see [kanata/snippet.kbd](kanata/snippet.kbd), validate with
 `kanata --check`, restart kanata — and start everything:
 
@@ -40,20 +40,24 @@ see [kanata/snippet.kbd](kanata/snippet.kbd), validate with
 systemctl --user enable --now squelch-ptt squelch-tray squelch-vram squelch-ydotoold
 ```
 
-Focus a text field, hold Menu, speak, release.
+Focus a text field, hold your trigger key, speak, release.
 
 ## Usage
 
 | Action | How |
 |---|---|
-| Dictate | hold Menu, speak, release |
-| Settings (engine, cleanup, dictionary, analytics) | tap Menu, or tray menu → Settings |
-| Engine switch | settings popup, or right-click tray icon |
+| Dictate | hold trigger key, speak, release |
+| Settings (engine, trigger, insertion, cleanup, dictionary, analytics, setup) | tap trigger, or tray menu → Settings |
+| Engine switch | settings popup, General tab, or right-click tray icon |
+| Trigger key (Menu/Caps Lock/Scroll Lock) | settings → General (rewrites kanata binding) |
+| Insertion (paste/type/clipboard-only) | settings → General |
+| Speech models (per-engine file) | settings → Setup |
+| Download models, autostart services, API key | settings → Setup (no terminal needed) |
 | Dictionary: `squelch WORD [mishearings…]` | AI suggests what it sounds like when an OpenRouter key is configured (`~/.config/squelch/openrouter.key`, chmod 600); `--no-ai` skips that |
-| Dictionary fullscreen editor | settings → Dictionary tab (Add/Suggest/Save) |
+| Dictionary editor | settings → Dictionary tab (Add/Suggest/Save) |
 | Analytics dashboard | settings → Analytics tab, or glance line on the tap card |
 
-French or other languages: switch to Whisper in the popup (auto language
+Other languages: switch to Whisper in the popup (auto language
 detect). Game fullscreen unloads models automatically; dictating then shows
 one notification instead of failing silently.
 

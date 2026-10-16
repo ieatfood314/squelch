@@ -16,8 +16,15 @@ import time
 
 ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
 STATE_FILE = os.path.expanduser("~/.config/squelch/state.json")
+ENGINES_ENV = os.path.expanduser("~/.config/squelch/engines.env")
 SERVICES = {"parakeet": "squelch-parakeet.service",
             "whisper": "squelch-whisper.service"}
+DEFAULT_MODELS = {
+    "parakeet": os.path.expanduser(
+        "~/.local/share/parakeet/ggml-parakeet-tdt-0.6b-v3-q8_0.bin"),
+    "whisper": os.path.expanduser(
+        "~/.local/share/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin"),
+}
 POLL_S = 5
 
 
@@ -87,12 +94,36 @@ def set_service(svc, want_active):
         log(f"failed to {action} {svc}:", e)
 
 
-def write_state(gaming, want):
+def engine_models():
+    """Model paths from engines.env (created with defaults if missing)."""
+    models = dict(DEFAULT_MODELS)
+    try:
+        with open(ENGINES_ENV) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("SQUELCH_PARAKEET_MODEL="):
+                    models["parakeet"] = line.split("=", 1)[1].strip()
+                elif line.startswith("SQUELCH_WHISPER_MODEL="):
+                    models["whisper"] = line.split("=", 1)[1].strip()
+        return models
+    except OSError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(ENGINES_ENV), exist_ok=True)
+        with open(ENGINES_ENV, "w") as f:
+            f.write(f"SQUELCH_PARAKEET_MODEL={models['parakeet']}\n"
+                    f"SQUELCH_WHISPER_MODEL={models['whisper']}\n")
+    except OSError as e:
+        log("engines.env write failed:", e)
+    return models
+
+
+def write_state(gaming, want, model_ok=True, model=""):
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         with open(STATE_FILE, "w") as f:
-            json.dump({"gaming": gaming, "want": want,
-                       "updated": time.time()}, f)
+            json.dump({"gaming": gaming, "want": want, "model_ok": model_ok,
+                       "model": model, "updated": time.time()}, f)
     except OSError as e:
         log("state write failed:", e)
 
@@ -119,13 +150,25 @@ def main():
                 last_gaming = gaming
 
             want = None if gaming else current_engine()
+            models = engine_models()
+            model = models.get(want, "") if want else ""
+            model_ok = (not want) or bool(model) and os.path.exists(model)
+            if want and not model_ok:
+                want = None  # model file missing: stay unloaded, UI shows it
             for eng, svc in SERVICES.items():
                 should = (eng == want)
-                if is_active(svc) != should:
+                active = is_active(svc)
+                if active and should and eng == want:
+                    # restart if the model path changed under a running engine
+                    if getattr(main, "_models", {}).get(eng) != models.get(eng):
+                        set_service(svc, False)
+                        active = False
+                if active != should:
                     set_service(svc, should)
                     log(f"{svc} -> {'started' if should else 'stopped'}"
                         f" (gaming={gaming}, want={want})")
-            write_state(gaming, want)
+            main._models = models
+            write_state(gaming, want, model_ok, model)
             if gaming != getattr(main, "_prev", gaming):
                 if gaming:
                     notify("STT paused — fullscreen app",

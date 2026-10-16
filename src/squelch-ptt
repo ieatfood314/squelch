@@ -29,6 +29,7 @@ ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
 FILTERS_FILE = os.path.expanduser("~/.config/squelch/filters.json")
 DICT_FILE = os.path.expanduser("~/.config/squelch/dictionary.json")
 STATS_FILE = os.path.expanduser("~/.config/squelch/stats.jsonl")
+INSERTION_FILE = os.path.expanduser("~/.config/squelch/insertion.json")
 
 
 def log_stats(entry):
@@ -493,6 +494,52 @@ def transcribe(wav_path, engine):
     return clean_text(transcribe_parakeet(wav_path))
 
 
+def insertion_mode():
+    """paste (default), type (ydotool raw keycodes, QWERTY assumed), or
+    clipboard (copy only, you paste yourself)."""
+    try:
+        with open(INSERTION_FILE) as f:
+            m = json.load(f).get("mode", "paste")
+        return m if m in ("paste", "type", "clipboard") else "paste"
+    except (OSError, ValueError):
+        return "paste"
+
+
+def type_ydotool(text):
+    os.environ.setdefault("YDOTOOLD_SOCKET", "/run/user/1000/.ydotool_socket")
+    try:
+        r = subprocess.run(["ydotool", "type", "--", text],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            log("typed via ydotool:", text[:80])
+        else:
+            log("ydotool type failed:", (r.stderr or "").strip()[:200])
+    except Exception as e:
+        log("ydotool type error:", e)
+
+
+def clipboard_only(text):
+    try:
+        subprocess.run(["wl-copy"], input=text.encode("utf-8"),
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10, check=True)
+        log("copied to clipboard:", text[:80])
+        notify_stt("Squelch: copied",
+                   (text[:120] + "…") if len(text) > 120 else text)
+    except Exception as e:
+        log("clipboard copy failed:", e)
+
+
+def output_text(text):
+    mode = insertion_mode()
+    if mode == "type":
+        type_ydotool(text)
+    elif mode == "clipboard":
+        clipboard_only(text)
+    else:
+        paste_text(text)
+
+
 def paste_text(text):
     """Layout-proof output: clipboard + Shift+Insert.
 
@@ -680,7 +727,7 @@ def main():
                             if os.environ.get("STT_DRY_RUN"):
                                 log(f"DRYRUN would type: {text[:120]!r}")
                             else:
-                                paste_text(text + " ")
+                                output_text(text + " ")
                         else:
                             log("no speech, typing nothing")
                     finally:

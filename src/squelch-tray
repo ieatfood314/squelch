@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """STT engine tray applet (KDE Plasma): right-click to switch between
-Parakeet TDT v3 (English default) and Whisper Turbo (multilingual/French).
+Parakeet TDT v3 (English default) and Whisper Turbo (other languages).
 
 Switching writes ~/.config/squelch/engine, which the squelch-ptt daemon reads on
 every utterance — no restarts needed. Both engines stay resident in VRAM.
 Quitting the tray does NOT stop dictation.
 """
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -18,10 +19,10 @@ from PyQt6.QtCore import (QSocketNotifier, QTimer, Qt, pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor,
                          QGuiApplication, QIcon, QPainter, QPixmap)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
-                             QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                             QMenu, QPushButton, QRadioButton, QSystemTrayIcon,
-                             QTabWidget, QTableWidget, QTableWidgetItem,
-                             QVBoxLayout, QWidget)
+                             QComboBox, QHBoxLayout, QHeaderView, QLabel,
+                             QLineEdit, QMenu, QPushButton, QRadioButton,
+                             QSystemTrayIcon, QTabWidget, QTableWidget,
+                             QTableWidgetItem, QVBoxLayout, QWidget)
 import json as _json
 
 ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
@@ -29,6 +30,25 @@ STATE_FILE = os.path.expanduser("~/.config/squelch/state.json")
 FILTERS_FILE = os.path.expanduser("~/.config/squelch/filters.json")
 DICT_FILE = os.path.expanduser("~/.config/squelch/dictionary.json")
 STATS_FILE = os.path.expanduser("~/.config/squelch/stats.jsonl")
+INSERTION_FILE = os.path.expanduser("~/.config/squelch/insertion.json")
+HOTKEY_FILE = os.path.expanduser("~/.config/squelch/hotkey")
+ENGINES_ENV = os.path.expanduser("~/.config/squelch/engines.env")
+KANATA_CFG = os.path.expanduser("~/.config/kanata/kanata.kbd")
+HOTKEYS = (("menu", "Menu (recommended)"),
+           ("caps", "Caps Lock (loses caps function)"),
+           ("scrlck", "Scroll Lock"))
+INSERTION_MODES = (
+    ("paste", "Clipboard + Shift+Insert (layout-proof, recommended)"),
+    ("type", "Type keys directly (QWERTY assumed)"),
+    ("clipboard", "Copy only — you paste yourself"))
+PARAKEET_DIR = os.path.expanduser("~/.local/share/parakeet")
+WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp/models")
+DEFAULT_MODELS = {
+    "parakeet": os.path.join(
+        PARAKEET_DIR, "ggml-parakeet-tdt-0.6b-v3-q8_0.bin"),
+    "whisper": os.path.join(
+        WHISPER_DIR, "ggml-large-v3-turbo-q5_0.bin"),
+}
 OPENROUTER_KEY_FILE = os.path.expanduser("~/.config/squelch/openrouter.key")
 OPENROUTER_MODEL_FILE = os.path.expanduser("~/.config/squelch/openrouter.model")
 _MODEL_PREFERENCE = ("llama-3.1-8b", "llama-3-8b", "gemma-2-9b",
@@ -43,7 +63,7 @@ F23 = evdev.ecodes.KEY_F23
 POPUP_BG_OPACITY = 0.4
 ENGINES = [
     ("parakeet", "Parakeet TDT v3 — English"),
-    ("whisper", "Whisper Turbo — multilingual / French"),
+    ("whisper", "Whisper Turbo — other languages"),
 ]
 
 
@@ -98,6 +118,165 @@ def dict_term_count():
             return len(__import__("json").load(f).get("entries", []))
     except (OSError, ValueError, AttributeError):
         return 0
+
+
+def read_insertion():
+    try:
+        with open(INSERTION_FILE) as f:
+            m = _json.load(f).get("mode", "paste")
+        return m if m in ("paste", "type", "clipboard") else "paste"
+    except (OSError, ValueError):
+        return "paste"
+
+
+def write_insertion(mode):
+    os.makedirs(os.path.dirname(INSERTION_FILE), exist_ok=True)
+    with open(INSERTION_FILE, "w") as f:
+        _json.dump({"mode": mode}, f)
+
+
+def read_hotkey():
+    try:
+        with open(HOTKEY_FILE) as f:
+            h = f.read().strip().lower()
+        return h if h in dict(HOTKEYS) else "menu"
+    except OSError:
+        return "menu"
+
+
+def apply_hotkey(newkey):
+    """Point kanata's tap-hold at a different physical key. Returns (ok, msg)."""
+    import re as _re
+    import shutil as _shutil
+    try:
+        with open(KANATA_CFG) as f:
+            text = f.read()
+    except OSError:
+        return False, "kanata config not found (~/.config/kanata/kanata.kbd)"
+    m = _re.search(r"\(tap-hold\s+\d+\s+\d+\s+(\S+)\s+f23\s+f24\)", text)
+    if not m:
+        return False, "Squelch tap-hold pattern missing — see kanata/snippet.kbd"
+    old = m.group(1)
+    if old == newkey:
+        try:
+            with open(HOTKEY_FILE, "w") as f:
+                f.write(newkey + "\n")
+        except OSError:
+            pass
+        return True, "already set"
+    dm = _re.search(r"\(defsrc([^)]*)\)", text)
+    if not dm or not _re.search(r"(?<!\S)" + _re.escape(old) + r"(?!\S)",
+                                dm.group(1)):
+        return False, "physical key not in defsrc — edit kanata config manually"
+    new_defsrc = _re.sub(r"(?<!\S)" + _re.escape(old) + r"(?!\S)", newkey,
+                         dm.group(1), count=1)
+    text = text[:dm.start(1)] + new_defsrc + text[dm.end(1):]
+    text = text.replace(m.group(0), m.group(0).replace(old, newkey, 1))
+    try:
+        _shutil.copy(KANATA_CFG, KANATA_CFG + ".bak-squelch")
+        with open(KANATA_CFG, "w") as f:
+            f.write(text)
+    except OSError as e:
+        return False, f"write failed: {e}"
+    chk = subprocess.run(["kanata", "--check", "--cfg", KANATA_CFG],
+                         capture_output=True, text=True, timeout=30)
+    if chk.returncode != 0:
+        try:
+            _shutil.copy(KANATA_CFG + ".bak-squelch", KANATA_CFG)
+        except OSError:
+            pass
+        return False, "kanata rejected the config — restored backup"
+    rst = subprocess.run(["sudo", "-n", "systemctl", "restart", "kanata"],
+                         capture_output=True, text=True, timeout=30)
+    try:
+        with open(HOTKEY_FILE, "w") as f:
+            f.write(newkey + "\n")
+    except OSError:
+        pass
+    if rst.returncode != 0:
+        return True, ("config updated but kanata needs a manual restart "
+                      "(sudo systemctl restart kanata)")
+    return True, f"trigger is now {dict(HOTKEYS)[newkey].split(' (')[0]}"
+
+
+def read_engine_models():
+    models = dict(DEFAULT_MODELS)
+    try:
+        with open(ENGINES_ENV) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("SQUELCH_PARAKEET_MODEL="):
+                    models["parakeet"] = line.split("=", 1)[1].strip()
+                elif line.startswith("SQUELCH_WHISPER_MODEL="):
+                    models["whisper"] = line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return models
+
+
+def write_engine_models(models):
+    os.makedirs(os.path.dirname(ENGINES_ENV), exist_ok=True)
+    with open(ENGINES_ENV, "w") as f:
+        f.write(f"SQUELCH_PARAKEET_MODEL={models['parakeet']}\n"
+                f"SQUELCH_WHISPER_MODEL={models['whisper']}\n")
+
+
+def list_model_files(kind):
+    d = PARAKEET_DIR if kind == "parakeet" else WHISPER_DIR
+    out = []
+    try:
+        for name in sorted(os.listdir(d)):
+            if name.endswith(".bin"):
+                p = os.path.join(d, name)
+                try:
+                    out.append((name, os.path.getsize(p) / 1048576, p))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def service_active(svc):
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", svc],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def service_enabled(svc):
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-enabled", svc],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() == "enabled"
+    except Exception:
+        return False
+
+
+def set_service_enabled(svc, enable, is_self=False):
+    """Toggle boot autostart; enabling also starts now (except ourselves)."""
+    try:
+        if enable:
+            subprocess.run(["systemctl", "--user", "enable", svc],
+                           timeout=15, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            if not is_self:
+                subprocess.run(["systemctl", "--user", "start", svc],
+                               timeout=30, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["systemctl", "--user", "disable", svc],
+                           timeout=15, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            if not is_self:
+                subprocess.run(["systemctl", "--user", "stop", svc],
+                               timeout=30, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
 
 
 def load_stats():
@@ -356,7 +535,7 @@ class EnginePopup(QWidget):
         self.settings_btn.clicked.connect(self.on_settings)
         inner.addWidget(self.settings_btn)
 
-        hint = QLabel("tap Menu again, Esc, or click away to close")
+        hint = QLabel("tap trigger again, Esc, or click away to close")
         hint.setStyleSheet("color: #777777; font-size: 11px;")
         inner.addWidget(hint)
 
@@ -416,14 +595,19 @@ class SettingsWindow(QWidget):
 
     suggested = pyqtSignal(int, object)  # row, [suggestions] (None = failed)
     suggest_failed = pyqtSignal(str)
+    dl_done = pyqtSignal(str)
+    refresh_needed = pyqtSignal()
 
-    def __init__(self, on_engine):
+    def __init__(self, on_engine, on_filters):
         super().__init__(None, Qt.WindowType.Window)
         self.setWindowTitle("Squelch settings")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.on_engine = on_engine
+        self.on_filters = on_filters
         self.suggested.connect(self._apply_suggestions)
         self.suggest_failed.connect(self._suggest_error)
+        self.dl_done.connect(self._dl_finished)
+        self.refresh_needed.connect(self.refresh_setup)
         self.setStyleSheet(
             "SettingsWindow { background: rgba(8, 8, 8, 0.96); }")
         self.resize(700, 540)
@@ -441,13 +625,15 @@ class SettingsWindow(QWidget):
             "QWidget { color: white; }")
         lay.addWidget(self.tabs, 1)
         self._build_general()
+        self._build_setup()
         self._build_dictionary()
         self._build_analytics()
 
         self.analytics_timer = QTimer(self)
         self.analytics_timer.setInterval(5000)
         self.analytics_timer.timeout.connect(
-            lambda: self.isVisible() and self.refresh_analytics())
+            lambda: self.isVisible() and (self.refresh_analytics(),
+                                          self.refresh_setup()))
 
     # ---- general tab ----
     def _build_general(self):
@@ -470,6 +656,38 @@ class SettingsWindow(QWidget):
         self.g_status.setWordWrap(True)
         lay.addWidget(self.g_status)
 
+        trig = QLabel("Push-to-talk trigger key")
+        trig.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
+        lay.addWidget(trig)
+        hkrow = QHBoxLayout()
+        self.hk_combo = QComboBox()
+        for key, label in HOTKEYS:
+            self.hk_combo.addItem(label, key)
+        self.hk_combo.setStyleSheet(
+            "background: #0a0a0a; color: white; border: 1px solid #3d3d3d;"
+            " border-radius: 6px; padding: 4px;")
+        hkrow.addWidget(self.hk_combo, 1)
+        hk_apply = QPushButton("Apply")
+        hk_apply.setStyleSheet(BTN)
+        hk_apply.clicked.connect(self.hotkey_apply)
+        hkrow.addWidget(hk_apply)
+        lay.addLayout(hkrow)
+        self.hk_status = QLabel()
+        self.hk_status.setStyleSheet(DIM_LABEL)
+        self.hk_status.setWordWrap(True)
+        lay.addWidget(self.hk_status)
+
+        ins = QLabel("How dictated text is inserted")
+        ins.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
+        lay.addWidget(ins)
+        self.ins_radios = {}
+        for key, label in INSERTION_MODES:
+            rb = QRadioButton(label)
+            rb.toggled.connect(
+                lambda checked, k=key: checked and self.insertion_set(k))
+            lay.addWidget(rb)
+            self.ins_radios[key] = rb
+
         clf = QLabel("Text cleanup")
         clf.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
         lay.addWidget(clf)
@@ -479,6 +697,107 @@ class SettingsWindow(QWidget):
         for cb in (self.cb_defill, self.cb_numbers, self.cb_all):
             cb.toggled.connect(lambda _c: self.filters_changed())
             lay.addWidget(cb)
+        lay.addStretch(1)
+        self.tabs.addTab(tab, "General")
+
+    def filters_changed(self):
+        self.on_filters({"defiller": self.cb_defill.isChecked(),
+                         "numbers": self.cb_numbers.isChecked(),
+                         "numbers_all": self.cb_all.isChecked()})
+
+    def hotkey_apply(self):
+        key = self.hk_combo.currentData()
+        _ok, msg = apply_hotkey(key)
+        self.hk_status.setText(msg)
+        self.refresh_hotkey()
+
+    def refresh_hotkey(self):
+        cur = read_hotkey()
+        for i in range(self.hk_combo.count()):
+            if self.hk_combo.itemData(i) == cur:
+                self.hk_combo.blockSignals(True)
+                self.hk_combo.setCurrentIndex(i)
+                self.hk_combo.blockSignals(False)
+                break
+
+    def insertion_set(self, mode):
+        write_insertion(mode)
+
+    def refresh_insertion(self):
+        cur = read_insertion()
+        for key, rb in self.ins_radios.items():
+            rb.blockSignals(True)
+            rb.setChecked(key == cur)
+            rb.blockSignals(False)
+
+    # ---- setup tab (models, services, API key) ----
+    def _build_setup(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(8)
+
+        ml = QLabel("Speech models")
+        ml.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
+        lay.addWidget(ml)
+        self.model_combos = {}
+        self.model_sizes = {}
+        for kind, title in (("parakeet", "English engine (Parakeet)"),
+                            ("whisper", "Other-languages engine (Whisper)")):
+            row = QHBoxLayout()
+            lab = QLabel(title)
+            lab.setStyleSheet("color: white;")
+            row.addWidget(lab, 1)
+            combo = QComboBox()
+            combo.setStyleSheet(
+                "background: #0a0a0a; color: white;"
+                " border: 1px solid #3d3d3d; border-radius: 6px; padding: 4px;")
+            combo.currentIndexChanged.connect(
+                lambda _i, k=kind: self.model_changed(k))
+            row.addWidget(combo, 2)
+            size = QLabel()
+            size.setStyleSheet(DIM_LABEL)
+            row.addWidget(size)
+            lay.addLayout(row)
+            self.model_combos[kind] = combo
+            self.model_sizes[kind] = size
+        dlrow = QHBoxLayout()
+        self.dl_btn = QPushButton("Download models")
+        self.dl_btn.setStyleSheet(BTN)
+        self.dl_btn.clicked.connect(self.download_models)
+        dlrow.addWidget(self.dl_btn)
+        self.dl_status = QLabel()
+        self.dl_status.setStyleSheet(DIM_LABEL)
+        self.dl_status.setWordWrap(True)
+        dlrow.addWidget(self.dl_status, 1)
+        lay.addLayout(dlrow)
+
+        sv = QLabel("Services (start at login)")
+        sv.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
+        lay.addWidget(sv)
+        self.svc_rows = {}
+        for svc, label in (
+                ("squelch-ptt.service", "Dictation daemon"),
+                ("squelch-tray.service", "Tray + settings (this app)"),
+                ("squelch-vram.service", "VRAM supervisor"),
+                ("squelch-ydotoold.service", "Typing daemon")):
+            row = QHBoxLayout()
+            lab = QLabel(label)
+            lab.setStyleSheet("color: white;")
+            row.addWidget(lab, 1)
+            st = QLabel()
+            st.setStyleSheet(DIM_LABEL)
+            row.addWidget(st)
+            cb = QCheckBox("autostart")
+            cb.toggled.connect(
+                lambda checked, s=svc: self.service_toggled(s, checked))
+            row.addWidget(cb)
+            lay.addLayout(row)
+            self.svc_rows[svc] = (st, cb)
+        note = QLabel("Engine services are managed automatically"
+                      " (one loaded at a time, none while gaming).")
+        note.setStyleSheet(DIM_LABEL)
+        note.setWordWrap(True)
+        lay.addWidget(note)
 
         keyl = QLabel("OpenRouter (powers mishearing suggestions)")
         keyl.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
@@ -504,12 +823,87 @@ class SettingsWindow(QWidget):
         self.key_status.setStyleSheet(DIM_LABEL)
         lay.addWidget(self.key_status)
         lay.addStretch(1)
-        self.tabs.addTab(tab, "General")
+        self.tabs.addTab(tab, "Setup")
 
-    def filters_changed(self):
-        write_filters({"defiller": self.cb_defill.isChecked(),
-                       "numbers": self.cb_numbers.isChecked(),
-                       "numbers_all": self.cb_all.isChecked()})
+    def model_changed(self, kind):
+        combo = self.model_combos[kind]
+        path = combo.currentData()
+        if not path:
+            return
+        models = read_engine_models()
+        if models.get(kind) == path:
+            return
+        models[kind] = path
+        write_engine_models(models)
+        self.refresh_models()
+
+    def refresh_models(self):
+        models = read_engine_models()
+        for kind, combo in self.model_combos.items():
+            files = list_model_files(kind)
+            if models.get(kind) not in [p for _n, _s, p in files]:
+                files.append((os.path.basename(models.get(kind, "")) + " (missing)",
+                              0.0, models.get(kind, "")))
+            combo.blockSignals(True)
+            combo.clear()
+            for name, _sz, path in files:
+                combo.addItem(name, path)
+            for i in range(combo.count()):
+                if combo.itemData(i) == models.get(kind):
+                    combo.setCurrentIndex(i)
+                    break
+            combo.blockSignals(False)
+            cur = [s for n, s, p in files if p == models.get(kind)]
+            self.model_sizes[kind].setText(
+                f"{cur[0]:.0f} MB" if cur and cur[0] > 0 else "missing")
+        missing = [k for k in ("parakeet", "whisper")
+                   if not os.path.exists(models.get(k, ""))]
+        self.dl_btn.setEnabled(bool(missing))
+        self.dl_status.setText(
+            "" if not missing
+            else f"missing: {', '.join(missing)} — download takes a few minutes")
+
+    def download_models(self):
+        self.dl_btn.setEnabled(False)
+        self.dl_status.setText("downloading…")
+        threading.Thread(target=self._download_worker, daemon=True).start()
+
+    def _download_worker(self):
+        import subprocess as _sp
+        jobs = [(DEFAULT_MODELS["parakeet"],
+                 "https://huggingface.co/ggml-org/parakeet-GGUF/resolve/main/"
+                 "ggml-parakeet-tdt-0.6b-v3-q8_0.bin"),
+                (DEFAULT_MODELS["whisper"],
+                 "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+                 "ggml-large-v3-turbo-q5_0.bin")]
+        try:
+            for path, url in jobs:
+                if os.path.exists(path):
+                    continue
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                _sp.run(["curl", "-sL", "-C", "-", "-o", path, url],
+                        timeout=1800, check=False)
+            self.dl_done.emit("done — engines load automatically")
+        except Exception as e:
+            self.dl_done.emit(f"download failed: {e}")
+        self.refresh_needed.emit()
+
+    def _dl_finished(self, msg):
+        self.dl_status.setText(msg)
+        self.refresh_models()
+
+    def service_toggled(self, svc, checked):
+        is_self = svc == "squelch-tray.service"
+        set_service_enabled(svc, checked, is_self=is_self)
+        self.refresh_services()
+
+    def refresh_services(self):
+        for svc, (st, cb) in self.svc_rows.items():
+            active = service_active(svc)
+            st.setText("running" if active else "stopped")
+            cb.blockSignals(True)
+            cb.setChecked(service_enabled(svc))
+            cb.blockSignals(False)
 
     def key_save(self):
         k = self.key_field.text().strip()
@@ -755,13 +1149,23 @@ class SettingsWindow(QWidget):
         self.key_field.clear()
         self.refresh_key_status()
 
+    def refresh_setup(self):
+        self.refresh_models()
+        self.refresh_services()
+        if hasattr(self, "key_field"):
+            self.key_field.clear()
+            self.refresh_key_status()
+
     def open(self, tab=0):
         self.refresh_general()
+        self.refresh_hotkey()
+        self.refresh_insertion()
         self.load_dict()
         self.or_status.setText(
             "OpenRouter: ready" if openrouter_key()
             else "OpenRouter: no key — suggestions unavailable")
         self.refresh_analytics()
+        self.refresh_setup()
         self.tabs.setCurrentIndex(tab)
         self.show()
         self.raise_()
@@ -909,7 +1313,8 @@ def main():
     menu.aboutToShow.connect(on_show)
     tray.setContextMenu(menu)
 
-    settings = SettingsWindow(on_engine=lambda key: (switch(key), refresh()))
+    settings = SettingsWindow(on_engine=lambda key: (switch(key), refresh()),
+                              on_filters=write_filters)
     popup = EnginePopup(
         on_engine=lambda key: (switch(key), refresh()),
         on_settings=settings.open)
