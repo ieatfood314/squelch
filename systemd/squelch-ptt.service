@@ -8,8 +8,8 @@ ExecStart=/usr/bin/squelch-ptt
 Restart=always
 RestartSec=2
 Nice=-5
-Environment=WAYLAND_DISPLAY=wayland-0
-Environment=XDG_RUNTIME_DIR=/run/user/1000
+# WAYLAND_DISPLAY comes from the imported session env; squelch-ptt also
+# discovers the live socket itself so paste works even when started early.
 Environment=YDOTOOLD_SOCKET=/run/user/1000/.ydotool_socket
 
 [Install]

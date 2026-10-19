@@ -7,8 +7,9 @@ PartOf=graphical-session.target
 ExecStart=/usr/bin/squelch-tray
 Restart=always
 RestartSec=3
-Environment=WAYLAND_DISPLAY=wayland-0
-Environment=XDG_RUNTIME_DIR=/run/user/1000
+# WAYLAND_DISPLAY/XDG_RUNTIME_DIR come from the imported session env
+# (After=graphical-session.target); hardcoding the socket name breaks when
+# the compositor creates a renumbered socket.
 Environment=QT_QPA_PLATFORM=wayland
 
 [Install]

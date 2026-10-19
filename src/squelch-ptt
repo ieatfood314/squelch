@@ -8,6 +8,7 @@ Usage:
   squelch-ptt                run the daemon (systemd user service does this)
   squelch-ptt --process F    DSP + transcribe file F, print result (no typing)
 """
+import glob
 import json
 import os
 import re
@@ -39,6 +40,29 @@ NAS_ROOT = "/mnt/nas/Aidan/squelch"
 _nas_state = {"ok": False, "checked": 0.0}
 _spool_lock = threading.Lock()
 _spool_counter = 0
+
+
+def fix_wayland_env():
+    """Point wl-copy/wl-paste at a Wayland socket that actually exists.
+
+    The packaged unit hardcodes wayland-0, which is wrong by the time the
+    daemon starts (the session socket is imported after default.target and
+    often renumbered across boots), so fall back to the newest existing
+    socket in XDG_RUNTIME_DIR if the configured one is missing.
+    """
+    display = os.environ.get("WAYLAND_DISPLAY", "")
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
+    if display and os.path.exists(os.path.join(runtime, display)):
+        return
+    sockets = [s for s in glob.glob(os.path.join(runtime, "wayland-*"))
+               if not s.endswith(".lock")]
+    if not sockets:
+        return
+    newest = max(sockets, key=os.path.getmtime)
+    chosen = os.path.basename(newest)
+    if chosen != display:
+        os.environ["WAYLAND_DISPLAY"] = chosen
+        log("wayland display not set/valid, using", chosen)
 
 
 def log_stats(entry):
@@ -738,6 +762,7 @@ def type_ydotool(text):
 
 
 def clipboard_only(text):
+    fix_wayland_env()
     try:
         subprocess.run(["wl-copy"], input=text.encode("utf-8"),
                        stdout=subprocess.DEVNULL,
@@ -768,6 +793,7 @@ def paste_text(text):
     layout. The previous clipboard content is saved and restored.
     """
     os.environ.setdefault("YDOTOOLD_SOCKET", "/run/user/1000/.ydotool_socket")
+    fix_wayland_env()
     try:
         cur = subprocess.run(["wl-paste"], capture_output=True, timeout=10)
         prev = cur.stdout if cur.returncode == 0 else None
