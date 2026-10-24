@@ -10,7 +10,8 @@ no cloud, no accounts.
 - **Mic-array beamforming**: adaptive delay-and-sum across your camera/mic
   channels, high-pass, diffraction EQ, noise gate, normalization
 - **Layout-proof output**: pastes via clipboard + Shift+Insert, so Colemak
-  (or any layout) never mangles dictated text
+  (or any layout) never mangles dictated text. In browsers it sends Ctrl+V
+  instead, since web editors like Word online ignore Shift+Insert
 - **Text cleanup**: filler words (um/uh/ah…) removed, number words over ten
   (optionally all) written as digits, custom dictionary with AI-suggested
   mishearings via OpenRouter
@@ -20,8 +21,8 @@ no cloud, no accounts.
   7-day table, in the tap popup and a fullscreen dashboard
 - **Everything survives reboot** via systemd user services
 
-Tested on EndeavourOS / KDE Plasma 6 / Wayland, AMD RX 5700, Sony
-PlayStation Eye 4-mic array, kanata. PipeWire required; KWin fullscreen
+Tested on EndeavourOS / KDE Plasma 6 / Wayland, AMD RX 5700,
+Logitech C920 webcam (stereo mic), kanata. PipeWire required; KWin fullscreen
 detection and tray applet assume Plasma, other Wayland compositors need
 small tweaks.
 
@@ -70,6 +71,17 @@ vocabulary prompt over time. No gradients leave your machine, ever.
 Music (any MPRIS player) pauses while you hold the trigger and resumes on
 release, so it never bleeds into the mic.
 
+### Mic
+
+Squelch records from a Logitech C920's stereo mic pair (the PlayStation
+Eye was dropped: its mic array wedged after nearly every suspend and only
+a replug fixed it). Squelch still checks the mic after every resume and
+whenever a recording comes back short. If it's dead, it power-cycles the
+webcam's USB port and notifies you whether that worked. Cutting port power
+needs a hub with per-port power switching; on ports without it you get a
+"replug the webcam" notification. `squelch-ptt --probe-mic` checks the mic
+by hand.
+
 ## Layout
 
 - `src/squelch-ptt` — push-to-talk daemon (record → beamform → transcribe → paste)
@@ -77,7 +89,9 @@ release, so it never bleeds into the mic.
 - `src/squelch-tray` — tray applet, tap popup, dictionary editor, analytics
 - `src/squelch-vram` — supervisor: one engine at a time, unload when gaming
 - `src/squelch` — dictionary CLI · `src/squelch-setup-models` — model downloads
-- `systemd/` — user units · `kanata/snippet.kbd` — Menu tap-hold wiring
+- `src/squelch-mic-reset` — root helper: power-cycle the webcam's USB port
+- `systemd/` — user units · `systemd/system/` — mic-reset unit
+- `polkit/` — lets squelch-ptt start the mic-reset unit · `kanata/snippet.kbd` — Menu tap-hold wiring
 
 Runtime state lives in `~/.config/squelch/` (engine, filters, dictionary,
 stats, key). Models in `~/.local/share/whisper.cpp/models` and

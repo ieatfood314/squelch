@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """STT push-to-talk daemon: hold F24 (from kanata Menu tap-hold) to record
-from the 4-mic Sony Playstation Eye array, beamform + clean, transcribe with
+from the Logitech C920's stereo mic pair, beamform + clean, transcribe with
 the local whisper-server (Vulkan GPU), and paste the result via clipboard +
 Shift+Insert (layout-proof: raw keycode typing gets mangled by Colemak).
 
 Usage:
   squelch-ptt                run the daemon (systemd user service does this)
   squelch-ptt --process F    DSP + transcribe file F, print result (no typing)
+  squelch-ptt --probe-mic    record 1.5 s, report whether the mic delivers audio
+  squelch-ptt --reset-mic    power-cycle the mic's USB port and re-probe
 """
 import glob
 import json
@@ -281,18 +283,17 @@ def maybe_adapt_vocab(text):
     except Exception as e:
         log("vocab mining failed:", e)
 ENGINE_PORTS = {"parakeet": 1894, "whisper": 1893}
-_last_notify = 0.0
+_last_notify = {}
 
 
-def notify_stt(summary, body=""):
-    """Best-effort desktop notification, rate-limited to one per minute."""
-    global _last_notify
+def notify_stt(summary, body="", urgency="low"):
+    """Best-effort desktop notification, each summary at most once a minute."""
     now = time.time()
-    if now - _last_notify < 60:
+    if now - _last_notify.get(summary, 0.0) < 60:
         return
-    _last_notify = now
+    _last_notify[summary] = now
     try:
-        subprocess.run(["notify-send", "-a", "Squelch", "-u", "low",
+        subprocess.run(["notify-send", "-a", "Squelch", "-u", urgency,
                         summary, body],
                        timeout=5, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
@@ -320,8 +321,19 @@ def log(*a):
 
 # ---------------- mic discovery ----------------
 
+# The C920's ALSA source (not its "(V4L2)" twin, and not the PS Eye, which
+# wedges its mic across suspend and is no longer used).
+MIC_MATCH = "C920"
+MIC_CHANNELS = 2
+# Idle room after cleanup sits well under these (C920 at its +50 dB
+# hardware gain: raw peak ~1800, rms ~350); real speech at the desk is far
+# louder. Below both, the clip is silence and whisper would hallucinate.
+QUIET_PEAK = 3000.0
+QUIET_RMS = 500.0
+
+
 def find_mic_target():
-    """Resolve the PS Eye PipeWire node name dynamically."""
+    """Resolve the C920 mic's PipeWire node name dynamically."""
     try:
         out = subprocess.run(
             ["pw-dump"], capture_output=True, timeout=10).stdout
@@ -332,16 +344,16 @@ def find_mic_target():
                 continue
             name = str(props.get("node.name", ""))
             desc = str(props.get("node.description", ""))
-            if ("OmniVision" in name or "Playstation Eye" in desc
-                    or "PlayStation Eye" in desc):
-                if props.get("media.class") == "Audio/Source":
-                    return name
+            if (MIC_MATCH in name or MIC_MATCH in desc) and \
+                    name.startswith("alsa_input.") and \
+                    props.get("media.class") == "Audio/Source":
+                return name
     except Exception as e:
         log("mic discovery failed:", e)
     return None
 
 
-# ---------------- DSP: 4-mic beamform + monitor-diffraction comp ----------------
+# ---------------- DSP: mic-pair beamform + monitor-diffraction comp ----------------
 
 def gcc_phat_lag(sig, ref, max_shift=8):
     n = len(sig)
@@ -360,7 +372,7 @@ def gcc_phat_lag(sig, ref, max_shift=8):
 
 
 def beamform_and_clean(path_in, path_out, sr=SR):
-    """Delay-and-sum the 4 raw capsules, HP filter, HF shelf to compensate
+    """Delay-and-sum the raw capsules, HP filter, HF shelf to compensate
     monitor-edge diffraction loss, gate room noise, normalize, trim."""
     with wave.open(path_in, "rb") as w:
         nch, rate, nframes = (w.getnchannels(), w.getframerate(),
@@ -374,18 +386,18 @@ def beamform_and_clean(path_in, path_out, sr=SR):
     a = a.reshape(-1, nch)
     a -= a.mean(axis=0, keepdims=True)
 
-    if nch == 4:
+    if nch > 1:
         ref = a[:, 0]
         aligned = [ref]
         lags = [0]
-        for k in range(1, 4):
+        for k in range(1, nch):
             lag = gcc_phat_lag(a[:, k], ref)
             lags.append(lag)
             aligned.append(np.roll(a[:, k], -lag))
         m = np.mean(np.stack(aligned), axis=0)
-    else:  # unexpected layout: fall back to plain average
-        lags = [0] * nch
-        m = a.mean(axis=1)
+    else:
+        lags = [0]
+        m = a[:, 0]
     log(f"align lags (samples @16k): {lags}")
 
     n = len(m)
@@ -425,10 +437,9 @@ def beamform_and_clean(path_in, path_out, sr=SR):
     if peak < 1e-6:
         return None
     rms_pre = float(np.sqrt((y * y).mean()))
-    if peak < 600.0 or rms_pre < 120.0:
-        # Room-noise floor (PS Eye idle: peak ~300, rms ~70). Real speech at
-        # the desk is far louder. Gate BEFORE normalization, since the gain
-        # below would amplify silence into something whisper hallucinates on.
+    if peak < QUIET_PEAK or rms_pre < QUIET_RMS:
+        # Gate BEFORE normalization, since the gain below would amplify
+        # silence into something whisper hallucinates on.
         log(f"utterance too quiet (peak={peak:.0f} rms={rms_pre:.0f}), skipping")
         try:
             os.unlink(path_out)
@@ -784,8 +795,64 @@ def output_text(text):
         paste_text(text)
 
 
+# Web editors (Word/Office online, Google Docs) handle paste themselves and
+# ignore Shift+Insert, so browsers get Ctrl+V. V sits on the same key in
+# QWERTY and Colemak, so the keycode still means "v".
+CTRL_V_CLASSES = ("zen", "firefox", "librewolf", "floorp", "chromium",
+                  "google-chrome", "brave-browser", "vivaldi-stable", "opera")
+PASTE_SHIFT_INSERT = ["42:1", "110:1", "110:0", "42:0"]  # LEFTSHIFT, INSERT
+PASTE_CTRL_V = ["29:1", "47:1", "47:0", "29:0"]          # LEFTCTRL, V
+
+
+def active_window_class():
+    """resourceClass of KWin's focused window, or None.
+
+    KWin has no D-Bus getter for the active window, so run a one-shot KWin
+    script that prints it (with a unique tag) and read that back from
+    kwin_wayland's journal.
+    """
+    tag = f"squelch-active-{os.getpid()}-{time.monotonic_ns()}"
+    since = time.time() - 1
+    fd, script = tempfile.mkstemp(suffix=".js")
+    with os.fdopen(fd, "w") as f:
+        f.write("var w = workspace.activeWindow;\n"
+                f"print('{tag} ' + (w ? w.resourceClass : ''));\n")
+    qd = ["qdbus6", "--session", "org.kde.KWin"]
+    try:
+        sid = subprocess.run(
+            qd + ["/Scripting", "org.kde.kwin.Scripting.loadScript",
+                  script, tag],
+            capture_output=True, text=True, timeout=2).stdout.strip()
+        if not sid.lstrip("-").isdigit() or int(sid) < 0:
+            return None
+        subprocess.run(qd + [f"/Scripting/Script{sid}",
+                             "org.kde.kwin.Script.run"],
+                       capture_output=True, timeout=2)
+        subprocess.run(qd + ["/Scripting",
+                             "org.kde.kwin.Scripting.unloadScript", tag],
+                       capture_output=True, timeout=2)
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            out = subprocess.run(
+                ["journalctl", "--user", "_COMM=kwin_wayland",
+                 f"--since=@{since:.0f}", "-o", "cat", "--no-pager"],
+                capture_output=True, text=True, timeout=2).stdout
+            for line in out.splitlines():
+                if line.startswith(tag):
+                    return line[len(tag):].strip().lower() or None
+            time.sleep(0.05)
+    except Exception as e:
+        log("active window lookup failed:", e)
+    finally:
+        try:
+            os.unlink(script)
+        except OSError:
+            pass
+    return None
+
+
 def paste_text(text):
-    """Layout-proof output: clipboard + Shift+Insert.
+    """Layout-proof output: clipboard + Shift+Insert (Ctrl+V in browsers).
 
     Keycode injectors (ydotool type / wtype) emit physical keycodes, which the
     compositor maps through the active layout — under Colemak that mangles
@@ -794,6 +861,11 @@ def paste_text(text):
     """
     os.environ.setdefault("YDOTOOLD_SOCKET", "/run/user/1000/.ydotool_socket")
     fix_wayland_env()
+    wclass = active_window_class()
+    if wclass in CTRL_V_CLASSES:
+        chord, chord_name = PASTE_CTRL_V, "Ctrl+V"
+    else:
+        chord, chord_name = PASTE_SHIFT_INSERT, "Shift+Insert"
     try:
         cur = subprocess.run(["wl-paste"], capture_output=True, timeout=10)
         prev = cur.stdout if cur.returncode == 0 else None
@@ -808,18 +880,17 @@ def paste_text(text):
         log("clipboard write failed:", e)
         return
     time.sleep(0.25)
-    # KEY_LEFTSHIFT=42, KEY_INSERT=110 — layout-independent keycodes
     try:
-        r = subprocess.run(
-            ["ydotool", "key", "42:1", "110:1", "110:0", "42:0"],
-            capture_output=True, text=True, timeout=30)
+        r = subprocess.run(["ydotool", "key", *chord],
+                           capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             log("paste keystroke failed:", (r.stderr or "").strip()[:200])
             return
     except Exception as e:
         log("paste keystroke error:", e)
         return
-    log("pasted via clipboard+Shift+Insert:", text[:80])
+    log(f"pasted via clipboard+{chord_name} ({wclass or 'unknown'}):",
+        text[:80])
     time.sleep(0.4)
     if prev is not None:
         try:
@@ -878,8 +949,123 @@ def resume_players(names):
 def start_recording(target, path):
     return subprocess.Popen(
         ["pw-record", "--target", target, "--rate", str(SR),
-         "--channels", "4", "--format", "s16", path],
+         "--channels", str(MIC_CHANNELS), "--format", "s16", path],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def raw_frames(path):
+    try:
+        with wave.open(path, "rb") as w:
+            return w.getnframes()
+    except (wave.Error, EOFError, OSError):
+        return 0
+
+
+# pw-record takes ~0.1-0.2 s to attach; a healthy mic fills the rest. A
+# wedged mic delivers a few percent of real time, or nothing at all.
+CAPTURE_LATENCY_S = 0.3
+
+
+def capture_dead(path, seconds):
+    expected = (seconds - CAPTURE_LATENCY_S) * SR
+    return expected > 0 and raw_frames(path) < 0.5 * expected
+
+
+def probe_mic(seconds=1.5):
+    """Record a throwaway clip; True if the mic delivers real-time audio."""
+    target = find_mic_target()
+    if target is None:
+        return False
+    fd, path = tempfile.mkstemp(suffix="-probe.wav")
+    os.close(fd)
+    try:
+        proc = start_recording(target, path)
+        time.sleep(seconds)
+        try:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+        return not capture_dead(path, seconds)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+_mic_reset_lock = threading.Lock()
+
+
+def mic_resetting():
+    return _mic_reset_lock.locked()
+
+
+def recover_mic(reason):
+    """A USB mic's audio can wedge across suspend (video keeps working) and
+    only losing power clears it. Have the root helper power-cycle its USB
+    port, then re-probe; if that didn't take (port can't switch power),
+    tell the user to replug instead of eating dictations as "no speech"."""
+    if not _mic_reset_lock.acquire(blocking=False):
+        return
+    try:
+        log(f"mic dead ({reason}), power-cycling its USB port")
+        notify_stt("Squelch: mic wedged, resetting",
+                   "Power-cycling the webcam. Try again in ~15 seconds.",
+                   urgency="normal")
+        try:
+            r = subprocess.run(
+                ["systemctl", "start", "--no-ask-password",
+                 "squelch-mic-reset.service"],
+                capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                log("squelch-mic-reset failed:", r.stderr.strip())
+        except Exception as e:
+            log("squelch-mic-reset failed:", e)
+        deadline = time.time() + 15
+        while find_mic_target() is None and time.time() < deadline:
+            time.sleep(1)
+        time.sleep(1)
+        if probe_mic():
+            log("mic recovered")
+            notify_stt("Squelch: mic is back",
+                       "The webcam was reset. Dictation works again.",
+                       urgency="normal")
+        else:
+            log("mic still dead after port power-cycle")
+            notify_stt("Squelch: replug the webcam",
+                       "Its mic is dead and power-cycling the USB port "
+                       "didn't fix it. Unplug and replug the camera. To make "
+                       "this automatic, plug it into a dock or hub port: "
+                       "motherboard ports usually can't cut power.",
+                       urgency="critical")
+    finally:
+        _mic_reset_lock.release()
+
+
+def recover_mic_async(reason):
+    threading.Thread(target=recover_mic, args=(reason,), daemon=True).start()
+
+
+def suspended_seconds():
+    return (time.clock_gettime(time.CLOCK_BOOTTIME)
+            - time.clock_gettime(time.CLOCK_MONOTONIC))
+
+
+def watch_resume():
+    """Probe the mic after every suspend, so a wedge gets fixed (or
+    reported) before the next dictation instead of during it."""
+    last = suspended_seconds()
+    while True:
+        time.sleep(5)
+        if suspended_seconds() - last < 2:
+            continue
+        time.sleep(10)  # let the sleep hook, USB and PipeWire settle
+        last = suspended_seconds()
+        if probe_mic():
+            log("mic ok after resume")
+        else:
+            recover_mic("after resume")
 
 
 # ---------------- main loop ----------------
@@ -959,6 +1145,7 @@ def process_utterance(raw_path):
 
 def main():
     busy = False
+    threading.Thread(target=watch_resume, daemon=True).start()
     while True:
         dev = find_kanata_device()
         if dev is None:
@@ -983,12 +1170,16 @@ def main():
                         notify_stt("STT engine unavailable",
                                    "Speech models are unloaded (game mode?)")
                         continue
+                    if mic_resetting():
+                        log("mic reset in progress, ignoring press")
+                        continue
                     paused = playing_players()
                     pause_players(paused)
                     target = find_mic_target()
                     if target is None:
                         log("mic not found, ignoring press")
                         resume_players(paused)
+                        recover_mic_async("not found")
                         continue
                     fd, rec_path = tempfile.mkstemp(suffix="-raw.wav")
                     os.close(fd)
@@ -1020,6 +1211,16 @@ def main():
                         except OSError:
                             pass
                         continue
+                    if capture_dead(rec_path, held):
+                        log(f"recording got {raw_frames(rec_path)} frames "
+                            f"in {held:.1f}s (mic wedged?)")
+                        recover_mic_async("short capture")
+                        try:
+                            os.unlink(rec_path)
+                        except OSError:
+                            pass
+                        rec_path = None
+                        continue
                     busy = True
                     try:
                         text = process_utterance(rec_path)
@@ -1042,5 +1243,11 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--process":
         text = process_utterance(sys.argv[2])
         print("RESULT:", text)
+    elif sys.argv[1:] == ["--probe-mic"]:
+        ok = probe_mic()
+        print("mic ok" if ok else "mic DEAD")
+        sys.exit(0 if ok else 1)
+    elif sys.argv[1:] == ["--reset-mic"]:
+        recover_mic("requested")
     else:
         main()

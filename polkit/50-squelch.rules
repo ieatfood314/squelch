@@ -1,0 +1,10 @@
+// Let squelch-ptt (a user service, so not in a logind session) start the
+// root oneshot that power-cycles the webcam's USB port. The unit takes no
+// arguments and only touches that one port.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "squelch-mic-reset.service" &&
+        action.lookup("verb") == "start") {
+        return polkit.Result.YES;
+    }
+});

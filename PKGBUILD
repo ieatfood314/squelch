@@ -8,7 +8,7 @@ url='https://github.com/ieatfood314/squelch'
 license=('MIT')
 depends=('python' 'python-evdev' 'python-numpy' 'python-pyqt6' 'ydotool'
          'wl-clipboard' 'libnotify' 'pipewire' 'vulkan-icd-loader' 'kanata'
-         'playerctl')
+         'playerctl' 'polkit')
 makedepends=('git' 'cmake' 'vulkan-headers' 'spirv-headers')
 optdepends=('python-huggingface_hub: alternative model downloads')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
@@ -39,8 +39,12 @@ package() {
   cd "$srcdir/$pkgname-$pkgver"
   install -Dm755 src/squelch src/squelch-ptt src/squelch-parakeet-server \
     src/squelch-tray src/squelch-vram src/squelch-setup-models \
-    -t "$pkgdir/usr/bin/"
+    src/squelch-mic-reset -t "$pkgdir/usr/bin/"
   install -Dm644 systemd/*.service -t "$pkgdir/usr/lib/systemd/user/"
+  install -Dm644 systemd/system/squelch-mic-reset.service -t \
+    "$pkgdir/usr/lib/systemd/system/"
+  install -Dm644 polkit/50-squelch.rules -t \
+    "$pkgdir/usr/share/polkit-1/rules.d/"
   install -Dm644 desktop/squelch.desktop -t \
     "$pkgdir/usr/share/applications/"
   install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"

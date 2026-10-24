@@ -1,0 +1,87 @@
+#!/bin/sh
+# Squelch: power-cycle the C920 webcam's USB port (root only).
+#
+#   squelch-mic-reset cycle   cut VBUS for a few seconds, then restore
+#   squelch-mic-reset off     cut VBUS
+#   squelch-mic-reset on      restore VBUS
+#
+# A USB webcam's audio block can wedge across suspend: the device
+# enumerates, video works, but isoch audio delivers a trickle or nothing
+# (ALSA read returns EIO). Port resets, usbreset and re-authorizing don't
+# help; only losing power clears it. Writing 1 to a port's sysfs "disable" attribute
+# sends ClearPortFeature(PORT_POWER), which really cuts VBUS only on hubs
+# that do per-port power switching. Most external hubs (docks) do. Many
+# motherboard root ports don't (xHCI PPC=0), so on those this is a no-op
+# and the camera has to be replugged by hand.
+
+SYS=/sys/bus/usb/devices
+STATE=/run/squelch-mic-port
+OFF_SECONDS=${SQUELCH_MIC_OFF_SECONDS:-3}
+
+# Logitech HD Pro Webcam C920
+VID=046d
+PID=0892
+
+cam_dir() {
+    for d in "$SYS"/*; do
+        [ -f "$d/idVendor" ] || continue
+        [ "$(cat "$d/idVendor")" = "$VID" ] || continue
+        [ "$(cat "$d/idProduct")" = "$PID" ] || continue
+        echo "$d"
+        return 0
+    done
+    return 1
+}
+
+# The camera's port, from the live device or, if it's powered off and
+# gone, from where we left it.
+cam_port() {
+    if d=$(cam_dir) && [ -e "$d/port/disable" ]; then
+        p=$(readlink -f "$d/port")
+        echo "$p" > "$STATE"
+        echo "$p"
+        return 0
+    fi
+    if [ -f "$STATE" ]; then
+        p=$(cat "$STATE")
+        [ -e "$p/disable" ] && { echo "$p"; return 0; }
+    fi
+    return 1
+}
+
+say() {
+    logger -t squelch-mic-reset "$*"
+    [ -t 2 ] && echo "$*" >&2
+    return 0
+}
+
+port_power() {
+    if echo "$2" > "$1/disable" 2>/dev/null; then
+        return 0
+    fi
+    say "failed to write $2 to $1/disable"
+    return 1
+}
+
+case "$1" in
+    off)
+        p=$(cam_port) || exit 0
+        port_power "$p" 1 && say "webcam port $(basename "$p") powered off"
+        ;;
+    on)
+        p=$(cam_port) || { say "webcam port unknown, nothing to power on"; exit 0; }
+        port_power "$p" 0 && say "webcam port $(basename "$p") powered on"
+        ;;
+    cycle)
+        p=$(cam_port) || { say "webcam not found"; exit 1; }
+        port_power "$p" 1 || exit 1
+        sleep "$OFF_SECONDS"
+        port_power "$p" 0 || exit 1
+        say "webcam port $(basename "$p") power-cycled"
+        ;;
+    *)
+        echo "usage: $0 cycle|off|on" >&2
+        exit 2
+        ;;
+esac
+exit 0
