@@ -2,6 +2,10 @@
 Description=STT engine tray applet (switch Parakeet/Whisper)
 After=graphical-session.target
 PartOf=graphical-session.target
+# Give up after 5 crashes in a minute instead of looping (and dumping core)
+# every few seconds when there's no display to connect to.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 ExecStart=/usr/bin/squelch-tray
@@ -13,4 +17,6 @@ RestartSec=3
 Environment=QT_QPA_PLATFORM=wayland
 
 [Install]
-WantedBy=default.target
+# Not default.target: with linger the user manager starts at boot, long
+# before Plasma provides a Wayland display.
+WantedBy=graphical-session.target
