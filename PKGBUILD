@@ -13,7 +13,7 @@ makedepends=('git' 'cmake' 'vulkan-headers' 'spirv-headers')
 optdepends=('aspell-en: learn your vocabulary for Whisper')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "whisper.cpp::git+https://github.com/ggml-org/whisper.cpp.git#commit=0c7be696371069e0baa2515ed7aa08d5a5473aa6")
-sha256sums=('921276d5f788db4cee746a04168d65bd6e3b42eb323d02c80c63e129df904b65'
+sha256sums=('35d081a6b7210dc04572712339f3ca524187078db9f3f52370773fb8c462128b'
             'SKIP')
 options=('!debug')
 
