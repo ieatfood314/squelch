@@ -1,0 +1,6 @@
+[Unit]
+Description=Power-cycle USB device %i to unwedge its mic
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/squelch-mic-reset cycle %i

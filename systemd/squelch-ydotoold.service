@@ -1,8 +1,10 @@
 [Unit]
 Description=ydotoold (uinput typing daemon for ydotool/Wayland)
-ConditionPathExists=!/run/user/1000/.ydotool_socket
+# Same socket ($XDG_RUNTIME_DIR/.ydotool_socket) as ydotool's own unit.
+Conflicts=ydotool.service
 
 [Service]
+# ydotoold removes a stale socket left by a crash itself.
 ExecStart=/usr/bin/ydotoold
 Restart=always
 RestartSec=3

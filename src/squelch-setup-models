@@ -1,15 +1,31 @@
 #!/bin/sh
 # squelch-setup-models — download the on-device speech models.
 # Whisper large-v3-turbo (q5_0, multilingual/French fallback) and
-# Parakeet TDT 0.6B v3 (q8_0, English default). ~1.2 GB total. Resumable.
+# Parakeet TDT 0.6B v3 (q8_0, English default). ~1.2 GB total. Resumable:
+# each file downloads to NAME.part and is renamed only once complete, so a
+# failed or partial download never looks like a model.
 set -e
 WDIR="$HOME/.local/share/whisper.cpp/models"
 PDIR="$HOME/.local/share/parakeet"
-mkdir -p "$WDIR" "$PDIR"
+
+fetch() {  # fetch DEST URL MIN_BYTES
+    [ -s "$1" ] && { echo "   already there"; return 0; }
+    mkdir -p "$(dirname "$1")"
+    curl -fL --retry 3 -C - -o "$1.part" "$2"
+    size=$(stat -c %s "$1.part")
+    if [ "$size" -lt "$3" ]; then
+        echo "   only $size bytes, expected at least $3; try again" >&2
+        exit 1
+    fi
+    mv "$1.part" "$1"
+}
+
 echo "-> whisper large-v3-turbo-q5_0 (~550 MB)"
-curl -sL -C - -o "$WDIR/ggml-large-v3-turbo-q5_0.bin" \
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
+fetch "$WDIR/ggml-large-v3-turbo-q5_0.bin" \
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin" \
+  500000000
 echo "-> parakeet-tdt-0.6b-v3-q8_0 (~670 MB)"
-curl -sL -C - -o "$PDIR/ggml-parakeet-tdt-0.6b-v3-q8_0.bin" \
-  "https://huggingface.co/ggml-org/parakeet-GGUF/resolve/main/ggml-parakeet-tdt-0.6b-v3-q8_0.bin"
-echo "done. Enable with: systemctl --user enable --now squelch-ptt squelch-tray squelch-vram"
+fetch "$PDIR/ggml-parakeet-tdt-0.6b-v3-q8_0.bin" \
+  "https://huggingface.co/ggml-org/parakeet-GGUF/resolve/main/ggml-parakeet-tdt-0.6b-v3-q8_0.bin" \
+  600000000
+echo "done. Enable with: systemctl --user enable --now squelch-ptt squelch-tray squelch-vram squelch-ydotoold"

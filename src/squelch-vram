@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """STT VRAM supervisor: exactly one speech engine loaded at a time, and none
-while a fullscreen app (game) is on screen.
+while a fullscreen game is on screen.
 
-- Polls KWin every 5 s for fullscreen state (read-only D-Bus call).
-- want = None when gaming, else the engine in ~/.config/squelch/engine.
+- Loads a small KWin script that prints the classes of fullscreen game
+  windows (with a tag) to KWin's journal whenever that set changes, and
+  follows the journal for it. Screenshot overlays (Spectacle), the lock
+  screen, browsers and video players don't count as games.
+- want = None while a game has been fullscreen for GAME_SETTLE_S, else the
+  engine in ~/.config/squelch/engine.
 - Starts/stops the parakeet-server / whisper-server user units to match.
 - Writes ~/.config/squelch/state.json for the tray + daemon.
-- Notifies on game start/end. Fail-safe: any detection error -> not gaming
-  (models stay loaded, dictation keeps working).
+- Notifies on game start/end. Fail-safe: if KWin can't be asked, assume no
+  game (models stay loaded, dictation keeps working).
 """
 import json
 import os
 import subprocess
+import threading
 import time
 
 ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
@@ -19,6 +24,7 @@ STATE_FILE = os.path.expanduser("~/.config/squelch/state.json")
 ENGINES_ENV = os.path.expanduser("~/.config/squelch/engines.env")
 SERVICES = {"parakeet": "squelch-parakeet.service",
             "whisper": "squelch-whisper.service"}
+ENGINE_NAMES = {"parakeet": "Parakeet", "whisper": "Whisper"}
 DEFAULT_MODELS = {
     "parakeet": os.path.expanduser(
         "~/.local/share/parakeet/ggml-parakeet-tdt-0.6b-v3-q8_0.bin"),
@@ -26,6 +32,52 @@ DEFAULT_MODELS = {
         "~/.local/share/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin"),
 }
 POLL_S = 5
+# A game must stay fullscreen (or stay gone) this long before models move,
+# so brief fullscreen moments don't bounce gigabytes in and out of VRAM.
+GAME_SETTLE_S = 10
+QDBUS = ["/usr/bin/qdbus6", "--session", "org.kde.KWin"]
+SCRIPT_NAME = "squelch-fullscreen"
+TAG = f"squelch-fullscreen-{os.getpid()}"
+# Fullscreen windows that aren't games (lowercase resourceClass substrings).
+NOT_GAMES = ["spectacle", "kscreenlocker", "ksmserver", "krunner",
+             "plasmashell", "ksplash", "zen", "firefox", "librewolf",
+             "floorp", "chromium", "chrome", "brave", "vivaldi", "opera",
+             "crx_", "mpv", "vlc", "celluloid", "haruna", "smplayer",
+             "totem", "showtime"]
+KWIN_SCRIPT = """\
+var TAG = %(tag)s;
+var NOT_GAMES = %(not_games)s;
+var last = null;
+function isGame(w, gone) {
+    if (w === gone || !w.fullScreen || w.minimized || !w.normalWindow)
+        return false;
+    var c = String(w.resourceClass).toLowerCase();
+    for (var i = 0; i < NOT_GAMES.length; i++)
+        if (c.indexOf(NOT_GAMES[i]) >= 0)
+            return false;
+    return true;
+}
+function report(gone) {
+    var apps = [];
+    var ws = workspace.windowList();
+    for (var i = 0; i < ws.length; i++)
+        if (isGame(ws[i], gone))
+            apps.push(String(ws[i].resourceClass) || "unknown");
+    var s = apps.sort().join(" ");
+    if (s !== last) {
+        last = s;
+        print(TAG + " [" + s + "]");
+    }
+}
+function watch(w) {
+    w.fullScreenChanged.connect(function () { report(); });
+    w.minimizedChanged.connect(function () { report(); });
+}
+workspace.windowList().forEach(watch);
+workspace.windowAdded.connect(function (w) { watch(w); report(); });
+workspace.windowRemoved.connect(function (w) { report(w); });
+report();
+"""
 
 
 def log(*a):
@@ -51,29 +103,87 @@ def current_engine():
         return "parakeet"
 
 
-def fullscreen_active():
-    """True if KWin's fullscreen effect is active (a window is fullscreen)."""
-    try:
-        r = subprocess.run(
-            ["/usr/bin/qdbus6", "--session", "org.kde.KWin", "/KWin",
-             "supportInformation"],
-            capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            return False
-        lines = r.stdout.splitlines()
-        for i, line in enumerate(lines):
-            if line.strip() == "fullscreen:":
-                for nxt in lines[i + 1:i + 8]:
-                    if not nxt.strip():
-                        break
-                    if "isActiveFullScreenEffect" in nxt:
-                        return "true" in nxt.split(":")[-1].lower()
-                return False
-        return False
-    except Exception as e:
-        log("fullscreen check failed (assuming windowed):", e)
-        return False
+# ---------------- fullscreen game detection ----------------
 
+class GameWatch:
+    """Fullscreen game windows, as reported by our KWin script."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.apps = []
+        self.changed = time.monotonic()  # when "any game" last flipped
+        self.reported = False  # heard from the script since it was loaded
+        self.loaded_at = 0.0
+        runtime = os.environ.get("XDG_RUNTIME_DIR",
+                                 f"/run/user/{os.getuid()}")
+        self.script_path = os.path.join(runtime, SCRIPT_NAME + ".js")
+        threading.Thread(target=self._follow, daemon=True).start()
+
+    def _follow(self):
+        while True:
+            try:
+                p = subprocess.Popen(
+                    ["journalctl", "--user", "-f", "-n", "0",
+                     "_COMM=kwin_wayland", "-o", "cat"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True)
+                for line in p.stdout:
+                    if line.startswith(TAG + " "):
+                        rest = line[len(TAG):].strip().strip("[]")
+                        self._update(rest.split())
+                log("journal follower exited, restarting")
+            except Exception as e:
+                log("journal follower failed:", e)
+            time.sleep(5)
+
+    def _update(self, apps):
+        with self.lock:
+            if bool(apps) != bool(self.apps):
+                self.changed = time.monotonic()
+            self.apps = apps
+            self.reported = True
+
+    def _qdbus(self, *args):
+        r = subprocess.run(QDBUS + list(args), capture_output=True,
+                           text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    def ensure_script(self):
+        """(Re)load the KWin script if KWin restarted or it never spoke."""
+        try:
+            loaded = self._qdbus("/Scripting",
+                                 "org.kde.kwin.Scripting.isScriptLoaded",
+                                 SCRIPT_NAME) == "true"
+            if loaded and (self.reported
+                           or time.monotonic() - self.loaded_at < 15):
+                return
+            with open(self.script_path, "w") as f:
+                f.write(KWIN_SCRIPT % {"tag": json.dumps(TAG),
+                                       "not_games": json.dumps(NOT_GAMES)})
+            self._qdbus("/Scripting", "org.kde.kwin.Scripting.unloadScript",
+                        SCRIPT_NAME)
+            sid = self._qdbus("/Scripting",
+                              "org.kde.kwin.Scripting.loadScript",
+                              self.script_path, SCRIPT_NAME)
+            if not sid or not sid.lstrip("-").isdigit() or int(sid) < 0:
+                raise RuntimeError(f"loadScript returned {sid!r}")
+            self._qdbus(f"/Scripting/Script{sid}", "org.kde.kwin.Script.run")
+            with self.lock:
+                self.reported = False
+                self.apps = []
+            self.loaded_at = time.monotonic()
+            log("fullscreen watcher loaded into KWin")
+        except Exception as e:
+            log("can't load the KWin script (assuming no game):", e)
+            with self.lock:
+                self.apps = []
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.apps), time.monotonic() - self.changed
+
+
+# ---------------- engines ----------------
 
 def is_active(svc):
     try:
@@ -87,11 +197,14 @@ def is_active(svc):
 def set_service(svc, want_active):
     action = "start" if want_active else "stop"
     try:
-        subprocess.run(["systemctl", "--user", action, svc],
-                       timeout=30, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
+        r = subprocess.run(["systemctl", "--user", action, svc],
+                           timeout=30, capture_output=True, text=True)
+        if r.returncode == 0:
+            return True
+        log(f"failed to {action} {svc}:", r.stderr.strip()[:200])
     except Exception as e:
         log(f"failed to {action} {svc}:", e)
+    return False
 
 
 def engine_models():
@@ -118,36 +231,38 @@ def engine_models():
     return models
 
 
-def write_state(gaming, want, model_ok=True, model=""):
+def write_state(gaming, want, model_ok=True, model="", games=()):
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            json.dump({"gaming": gaming, "want": want, "model_ok": model_ok,
-                       "model": model, "updated": time.time()}, f)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"gaming": gaming, "games": list(games), "want": want,
+                       "model_ok": model_ok, "model": model,
+                       "updated": time.time()}, f)
+        os.replace(tmp, STATE_FILE)
     except OSError as e:
         log("state write failed:", e)
 
 
 def main():
     log("supervisor starting")
-    last_gaming = None
-    consec = 0  # hysteresis: 2 agreeing polls before switching
+    watch = GameWatch()
+    gaming = False
+    known_models = engine_models()  # don't restart a running engine at boot
     while True:
         try:
-            fs = fullscreen_active()
-            if fs == last_gaming or (last_gaming is None and not fs):
-                consec = 0
-                gaming = last_gaming if last_gaming is not None else False
-            else:
-                consec += 1
-                if consec >= 2:
-                    gaming = fs
-                    last_gaming = fs
-                    consec = 0
+            watch.ensure_script()
+            apps, stable_for = watch.snapshot()
+            if bool(apps) != gaming and stable_for >= GAME_SETTLE_S:
+                gaming = bool(apps)
+                if gaming:
+                    log("game fullscreen:", ", ".join(apps))
+                    notify("Squelch paused",
+                           f"Models unloaded for {apps[0]}.")
                 else:
-                    gaming = last_gaming if last_gaming is not None else False
-            if last_gaming is None:
-                last_gaming = gaming
+                    log("game gone")
+                    notify("Squelch resumed",
+                           f"{ENGINE_NAMES[current_engine()]} is loading.")
 
             want = None if gaming else current_engine()
             models = engine_models()
@@ -156,27 +271,18 @@ def main():
             if want and not model_ok:
                 want = None  # model file missing: stay unloaded, UI shows it
             for eng, svc in SERVICES.items():
-                should = (eng == want)
+                should = eng == want
                 active = is_active(svc)
-                if active and should and eng == want:
-                    # restart if the model path changed under a running engine
-                    if getattr(main, "_models", {}).get(eng) != models.get(eng):
-                        set_service(svc, False)
-                        active = False
-                if active != should:
-                    set_service(svc, should)
+                if active and should and known_models.get(eng) != models[eng]:
+                    log(f"{eng} model changed, restarting {svc}")
+                    set_service(svc, False)
+                    active = False
+                if active != should and set_service(svc, should):
                     log(f"{svc} -> {'started' if should else 'stopped'}"
                         f" (gaming={gaming}, want={want})")
-            main._models = models
-            write_state(gaming, want, model_ok, model)
-            if gaming != getattr(main, "_prev", gaming):
-                if gaming:
-                    notify("STT paused — fullscreen app",
-                           "Speech models unloaded from VRAM.")
-                else:
-                    notify("STT resumed",
-                           f"{want or 'engine'} model reloaded.")
-            main._prev = gaming
+            known_models = models
+            write_state(gaming, want, model_ok, model,
+                        apps if gaming else ())
         except Exception as e:
             log("loop error:", e)
         time.sleep(POLL_S)

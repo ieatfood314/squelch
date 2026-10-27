@@ -1,6 +1,0 @@
-[Unit]
-Description=Power-cycle the webcam's USB port to unwedge its mic
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/squelch-mic-reset cycle

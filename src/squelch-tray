@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""STT engine tray applet (KDE Plasma): right-click to switch between
-Parakeet TDT v3 (English default) and Whisper Turbo (other languages).
+"""Squelch tray applet (KDE Plasma): engine switch, tap card and settings.
 
-Switching writes ~/.config/squelch/engine, which the squelch-ptt daemon reads on
-every utterance — no restarts needed. Both engines stay resident in VRAM.
-Quitting the tray does NOT stop dictation.
+Switching writes ~/.config/squelch/engine, which the squelch-ptt daemon
+reads on every utterance and squelch-vram uses to pick the one engine that
+stays loaded. Quitting the tray does NOT stop dictation.
 """
+import datetime
+import fcntl
+import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import evdev
@@ -18,30 +23,31 @@ import evdev
 from PyQt6.QtCore import (QSocketNotifier, QTimer, Qt, pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor,
                          QGuiApplication, QIcon, QPainter, QPixmap)
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
-                             QComboBox, QHBoxLayout, QHeaderView, QLabel,
-                             QLineEdit, QListWidget, QMenu, QPushButton,
-                             QRadioButton, QSystemTrayIcon, QTabWidget,
-                             QTableWidget, QTableWidgetItem, QVBoxLayout,
-                             QWidget)
-import json as _json
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication,
+                             QButtonGroup, QCheckBox, QComboBox, QDialog, QHBoxLayout, QHeaderView,
+                             QLabel, QLineEdit, QListWidget, QMenu,
+                             QPushButton, QRadioButton, QSystemTrayIcon,
+                             QTabWidget, QTableWidget, QTableWidgetItem,
+                             QVBoxLayout, QWidget)
 
-ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
-STATE_FILE = os.path.expanduser("~/.config/squelch/state.json")
-FILTERS_FILE = os.path.expanduser("~/.config/squelch/filters.json")
-DICT_FILE = os.path.expanduser("~/.config/squelch/dictionary.json")
-STATS_FILE = os.path.expanduser("~/.config/squelch/stats.jsonl")
-INSERTION_FILE = os.path.expanduser("~/.config/squelch/insertion.json")
-HOTKEY_FILE = os.path.expanduser("~/.config/squelch/hotkey")
-ENGINES_ENV = os.path.expanduser("~/.config/squelch/engines.env")
+CONFIG_DIR = os.path.expanduser("~/.config/squelch")
+ENGINE_FILE = os.path.join(CONFIG_DIR, "engine")
+STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
+FILTERS_FILE = os.path.join(CONFIG_DIR, "filters.json")
+DICT_FILE = os.path.join(CONFIG_DIR, "dictionary.json")
+STATS_FILE = os.path.join(CONFIG_DIR, "stats.jsonl")
+INSERTION_FILE = os.path.join(CONFIG_DIR, "insertion.json")
+HOTKEY_FILE = os.path.join(CONFIG_DIR, "hotkey")
+ENGINES_ENV = os.path.join(CONFIG_DIR, "engines.env")
+MIC_FILE = os.path.join(CONFIG_DIR, "mic")
 KANATA_CFG = os.path.expanduser("~/.config/kanata/kanata.kbd")
-HOTKEYS = (("menu", "Menu (recommended)"),
-           ("caps", "Caps Lock (loses caps function)"),
+HOTKEYS = (("menu", "Menu"),
+           ("caps", "Caps Lock"),
            ("scrlck", "Scroll Lock"))
 INSERTION_MODES = (
-    ("paste", "Clipboard + Shift+Insert (layout-proof, recommended)"),
-    ("type", "Type keys directly (QWERTY assumed)"),
-    ("clipboard", "Copy only — you paste yourself"))
+    ("paste", "Paste"),
+    ("type", "Type keys (QWERTY only)"),
+    ("clipboard", "Clipboard only"))
 PARAKEET_DIR = os.path.expanduser("~/.local/share/parakeet")
 WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp/models")
 DEFAULT_MODELS = {
@@ -50,8 +56,11 @@ DEFAULT_MODELS = {
     "whisper": os.path.join(
         WHISPER_DIR, "ggml-large-v3-turbo-q5_0.bin"),
 }
-OPENROUTER_KEY_FILE = os.path.expanduser("~/.config/squelch/openrouter.key")
-OPENROUTER_MODEL_FILE = os.path.expanduser("~/.config/squelch/openrouter.model")
+ENGINE_PORTS = {"parakeet": 1894, "whisper": 1893}
+ENGINE_SERVICES = {"parakeet": "squelch-parakeet.service",
+                   "whisper": "squelch-whisper.service"}
+OPENROUTER_KEY_FILE = os.path.join(CONFIG_DIR, "openrouter.key")
+OPENROUTER_MODEL_FILE = os.path.join(CONFIG_DIR, "openrouter.model")
 _MODEL_PREFERENCE = ("llama-3.1-8b", "llama-3-8b", "gemma-2-9b",
                      "mistral-7b", "qwen2", "phi-3", "gemma", "mistral")
 _NON_CHAT = ("embed", "tts", "whisper", "dall-e", "diffusion", "vision",
@@ -59,13 +68,87 @@ _NON_CHAT = ("embed", "tts", "whisper", "dall-e", "diffusion", "vision",
 # nonsense example used in the prompt; never accepted as a suggestion
 _EXAMPLE_PHRASES = ("rye task", "wry tusk")
 F23 = evdev.ecodes.KEY_F23
-# kitty-style panel: black background at 0.4 alpha; all text painted fully
-# opaque on top. No compositor blur or window-opacity requests.
-POPUP_BG_OPACITY = 0.4
 ENGINES = [
-    ("parakeet", "Parakeet TDT v3 — English"),
-    ("whisper", "Whisper Turbo — other languages"),
+    ("parakeet", "Parakeet · English"),
+    ("whisper", "Whisper · other languages"),
 ]
+ENGINE_NAMES = {"parakeet": "Parakeet", "whisper": "Whisper"}
+SERVICES = (("squelch-ptt.service", "Dictation"),
+            ("squelch-tray.service", "Tray"),
+            ("squelch-vram.service", "VRAM supervisor"),
+            ("squelch-ydotoold.service", "Typing"))
+
+# Earthrise (regolith's kitty look): white text, muted/faint greys, steel
+# blue as the one accent. Squelch is in Better Blur DX's force-blur list,
+# so the settings window is real glass; the tap card is a popover.
+FG, MUTED, FAINT = "#FFFFFF", "#7d8a99", "#4a5666"
+STEEL, STEEL_FOCUS, BORDER = "#31475F", "#6f93b8", "#1d2731"
+GLASS = "rgba(0, 0, 0, 0.40)"
+POPOVER = "rgba(6, 8, 11, 0.92)"
+APP_STYLE = f"""
+* {{ font-family: "JetBrains Mono", monospace; color: {FG}; }}
+QLabel#title {{ font-weight: bold; font-size: 14px; }}
+QLabel#heading {{ font-weight: bold; margin-top: 8px; }}
+QLabel#dim {{ color: {MUTED}; font-size: 11px; }}
+QLabel#num {{ font-weight: bold; font-size: 22px; }}
+QPushButton {{ background: transparent; border: 1px solid {BORDER};
+    border-radius: 6px; padding: 5px 12px; }}
+QPushButton:hover, QPushButton:focus {{ border-color: {STEEL_FOCUS}; }}
+QPushButton:pressed {{ background: {STEEL}; }}
+QPushButton:disabled {{ color: {FAINT}; }}
+QLineEdit, QComboBox {{ background: rgba(0, 0, 0, 0.5);
+    border: 1px solid {BORDER}; border-radius: 6px; padding: 4px 6px; }}
+QLineEdit:focus, QComboBox:focus {{ border-color: {STEEL_FOCUS}; }}
+QComboBox QAbstractItemView {{ background: {POPOVER};
+    selection-background-color: {STEEL}; border: 1px solid {BORDER}; }}
+QListWidget, QTableWidget {{ background: rgba(0, 0, 0, 0.5);
+    border: 1px solid {BORDER}; border-radius: 8px; gridline-color: {BORDER}; }}
+QListWidget::item:selected, QTableWidget::item:selected {{
+    background: {STEEL}; }}
+QHeaderView, QHeaderView::section, QTableCornerButton::section {{
+    background: transparent; color: {MUTED}; border: none; padding: 6px; }}
+QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 8px;
+    padding: 12px; }}
+QTabBar::tab {{ background: transparent; color: {MUTED};
+    padding: 6px 14px; border-top-left-radius: 6px;
+    border-top-right-radius: 6px; }}
+QTabBar::tab:selected {{ background: {STEEL}; color: {FG}; }}
+QCheckBox::indicator, QRadioButton::indicator {{ width: 12px; height: 12px;
+    border: 1px solid {STEEL_FOCUS}; background: transparent; }}
+QRadioButton::indicator {{ border-radius: 7px; }}
+QCheckBox::indicator {{ border-radius: 3px; }}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+    background: {STEEL_FOCUS}; }}
+QMenu {{ background: {POPOVER}; border: 1px solid {BORDER}; }}
+QMenu::item:selected {{ background: {STEEL}; }}
+"""
+
+
+def label(text, name=None, wrap=False):
+    w = QLabel(text)
+    if name:
+        w.setObjectName(name)
+    w.setWordWrap(wrap)
+    return w
+
+
+# ---------------- config files ----------------
+
+def atomic_write(path, text):
+    """Write via a temp file + rename, so readers never see half a file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
 
 
 def read_engine():
@@ -78,67 +161,231 @@ def read_engine():
 
 
 def write_engine(e):
-    os.makedirs(os.path.dirname(ENGINE_FILE), exist_ok=True)
-    with open(ENGINE_FILE, "w") as f:
-        f.write(e + "\n")
+    atomic_write(ENGINE_FILE, e + "\n")
 
 
-def service_status():
-    out = []
-    for name, url in (("parakeet", "http://127.0.0.1:1894/health"),
-                      ("whisper", "http://127.0.0.1:1893/")):
-        try:
-            r = urllib.request.urlopen(url, timeout=1)
-            out.append(f"{name}: ok" if r.status == 200 else f"{name}: {r.status}")
-        except Exception:
-            out.append(f"{name}: down")
+def service_states(units):
+    """{unit: (active, enabled)} from one systemctl call."""
+    out = {u: (False, False) for u in units}
     try:
-        with open(STATE_FILE) as f:
-            st = __import__("json").load(f)
-        if st.get("gaming"):
-            out.append("game: FULLSCREEN — models unloaded")
-    except (OSError, ValueError):
+        r = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "Id", "-p", "ActiveState",
+             "-p", "UnitFileState", *units],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        return out
+    for block in r.stdout.strip().split("\n\n"):
+        props = dict(line.split("=", 1) for line in block.splitlines()
+                     if "=" in line)
+        if props.get("Id") in out:
+            out[props["Id"]] = (props.get("ActiveState") == "active",
+                                props.get("UnitFileState") == "enabled")
+    return out
+
+
+def engine_status():
+    """One short status line for the selected engine."""
+    st = read_json(STATE_FILE, {})
+    if not isinstance(st, dict):
+        st = {}
+    if st.get("gaming"):
+        return "Paused for game"
+    if st.get("model_ok") is False:
+        return "Model missing"
+    engine = read_engine()
+    try:
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{ENGINE_PORTS[engine]}/", timeout=1)
+        return "Ready"
+    except urllib.error.HTTPError:
+        return "Ready"  # answering, just not on /
+    except Exception:
         pass
-    return "   ·   ".join(out)
+    svc = ENGINE_SERVICES[engine]
+    return "Loading" if service_states([svc])[svc][0] else "Stopped"
 
 
 def read_filters():
-    try:
-        with open(FILTERS_FILE) as f:
-            d = __import__("json").load(f)
-        return {"defiller": bool(d.get("defiller", True)),
-                "numbers": bool(d.get("numbers", True)),
-                "numbers_all": bool(d.get("numbers_all", False)),
-                "dict_advanced": bool(d.get("dict_advanced", False))}
-    except (OSError, ValueError):
-        return {"defiller": True, "numbers": True, "numbers_all": False,
-                "dict_advanced": False}
+    d = read_json(FILTERS_FILE, {})
+    if not isinstance(d, dict):
+        d = {}
+    return {"defiller": bool(d.get("defiller", True)),
+            "numbers": bool(d.get("numbers", True)),
+            "numbers_all": bool(d.get("numbers_all", False))}
 
 
-def dict_term_count():
-    try:
-        with open(DICT_FILE) as f:
-            return len(__import__("json").load(f).get("entries", []))
-    except (OSError, ValueError, AttributeError):
-        return 0
+def write_filters(flt):
+    atomic_write(FILTERS_FILE, json.dumps(flt))
 
 
 def read_insertion():
-    try:
-        with open(INSERTION_FILE) as f:
-            m = _json.load(f).get("mode", "paste")
-        return m if m in ("paste", "type", "clipboard") else "paste"
-    except (OSError, ValueError):
-        return "paste"
+    d = read_json(INSERTION_FILE, {})
+    m = d.get("mode", "paste") if isinstance(d, dict) else "paste"
+    return m if m in dict(INSERTION_MODES) else "paste"
 
 
 def write_insertion(mode):
-    os.makedirs(os.path.dirname(INSERTION_FILE), exist_ok=True)
-    with open(INSERTION_FILE, "w") as f:
-        _json.dump({"mode": mode}, f)
+    atomic_write(INSERTION_FILE, json.dumps({"mode": mode}))
+
+
+def read_mic():
+    try:
+        with open(MIC_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def write_mic(name):
+    if name:
+        atomic_write(MIC_FILE, name + "\n")
+    else:
+        try:
+            os.unlink(MIC_FILE)
+        except OSError:
+            pass
+
+
+def list_mics():
+    """[(node name, description)] of PipeWire audio sources."""
+    try:
+        out = subprocess.run(["pw-dump"], capture_output=True,
+                             timeout=10).stdout
+        objs = json.loads(out)
+    except Exception:
+        return []
+    mics = []
+    for o in objs:
+        props = ((o.get("info") or {}).get("props") or {}) \
+            if isinstance(o, dict) else {}
+        if props.get("media.class") == "Audio/Source":
+            name = str(props.get("node.name", ""))
+            mics.append((name, str(props.get("node.description") or name)))
+    return sorted(mics, key=lambda m: m[1].lower())
+
+
+# ---------------- dictionary ----------------
+
+def _clean_entries(raw):
+    entries = []
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict):
+            continue
+        term = str(e.get("term", "")).strip()
+        if term:
+            entries.append({"term": term, "also_match": [
+                str(x) for x in e.get("also_match", []) or []]})
+    return entries
+
+
+def load_dict():
+    d = read_json(DICT_FILE, {})
+    return _clean_entries(d.get("entries") if isinstance(d, dict) else [])
+
+
+def update_dict(change):
+    """Read the dictionary fresh, apply change(entries) and save, under a
+    lock shared with the squelch CLI, so edits from both never clobber
+    each other. Returns the saved entries."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(DICT_FILE + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        entries = load_dict()
+        change(entries)
+        atomic_write(DICT_FILE, json.dumps(
+            {"_help": DICT_HELP, "entries": entries},
+            indent=2, ensure_ascii=False))
+    return entries
+
+
+def find_entry(entries, term):
+    return next((e for e in entries if e["term"].lower() == term.lower()),
+                None)
+
+
+DICT_HELP = ("Your words. 'term' is the correct spelling. 'also_match' lists "
+             "ways the engine mishears it, fixed automatically.")
+
+
+# ---------------- kanata trigger key ----------------
+
+TRIGGER_RE = re.compile(r"\(\s*tap-hold\s+\d+\s+\d+\s+f23\s+f24\s*\)")
+
+
+def _kanata_forms(text):
+    """Top-level kanata forms as (name, [(item text, start, end)]).
+    Items are atoms or whole nested lists; comments are skipped."""
+    forms, i, n = [], 0, len(text)
+    depth, items, start = 0, None, None
+    while i < n:
+        c = text[i]
+        if text.startswith(";;", i):
+            i = text.find("\n", i)
+            i = n if i < 0 else i
+            continue
+        if text.startswith("#|", i):
+            j = text.find("|#", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c == "(":
+            if depth == 0:
+                items = []
+            elif depth == 1:
+                start = i
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 1 and start is not None:
+                items.append((text[start:i + 1], start, i + 1))
+                start = None
+            elif depth == 0 and items is not None:
+                if items:
+                    forms.append((items[0][0], items[1:]))
+                items = None
+        elif not c.isspace() and depth >= 1:
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in "()":
+                j += 1
+            if depth == 1:
+                items.append((text[i:j], i, j))
+            i = j
+            continue
+        i += 1
+    return forms
+
+
+def find_trigger(text):
+    """(defsrc key the Squelch tap-hold sits on, its (start, end) span in
+    the text, all defsrc keys), or None."""
+    forms = _kanata_forms(text)
+    src = next((items for name, items in forms if name == "defsrc"), None)
+    if src is None:
+        return None
+    aliases = set()
+    for name, items in forms:
+        if name == "defalias":
+            for k in range(0, len(items) - 1, 2):
+                if TRIGGER_RE.fullmatch(items[k + 1][0]):
+                    aliases.add("@" + items[k][0])
+    for name, items in forms:
+        if name != "deflayer" or not items:
+            continue
+        for idx, (item, _s, _e) in enumerate(items[1:]):
+            if (TRIGGER_RE.fullmatch(item) or item in aliases) \
+                    and idx < len(src):
+                key, s, e = src[idx]
+                return key, (s, e), [k for k, _a, _b in src]
+    return None
 
 
 def read_hotkey():
+    try:
+        with open(KANATA_CFG) as f:
+            found = find_trigger(f.read())
+        if found and found[0] in dict(HOTKEYS):
+            return found[0]
+    except OSError:
+        pass
     try:
         with open(HOTKEY_FILE) as f:
             h = f.read().strip().lower()
@@ -148,59 +395,46 @@ def read_hotkey():
 
 
 def apply_hotkey(newkey):
-    """Point kanata's tap-hold at a different physical key. Returns (ok, msg)."""
-    import re as _re
-    import shutil as _shutil
+    """Move kanata's Squelch tap-hold to another physical key.
+    Returns (ok, short message)."""
     try:
         with open(KANATA_CFG) as f:
             text = f.read()
     except OSError:
-        return False, "kanata config not found (~/.config/kanata/kanata.kbd)"
-    m = _re.search(r"\(tap-hold\s+\d+\s+\d+\s+(\S+)\s+f23\s+f24\)", text)
-    if not m:
-        return False, "Squelch tap-hold pattern missing — see kanata/snippet.kbd"
-    old = m.group(1)
+        return False, "No kanata config"
+    found = find_trigger(text)
+    if found is None:
+        return False, "Trigger not found in kanata config"
+    old, (s, e), keys = found
+    name = dict(HOTKEYS)[newkey]
     if old == newkey:
-        try:
-            with open(HOTKEY_FILE, "w") as f:
-                f.write(newkey + "\n")
-        except OSError:
-            pass
-        return True, "already set"
-    dm = _re.search(r"\(defsrc([^)]*)\)", text)
-    if not dm or not _re.search(r"(?<!\S)" + _re.escape(old) + r"(?!\S)",
-                                dm.group(1)):
-        return False, "physical key not in defsrc — edit kanata config manually"
-    new_defsrc = _re.sub(r"(?<!\S)" + _re.escape(old) + r"(?!\S)", newkey,
-                         dm.group(1), count=1)
-    text = text[:dm.start(1)] + new_defsrc + text[dm.end(1):]
-    text = text.replace(m.group(0), m.group(0).replace(old, newkey, 1))
+        atomic_write(HOTKEY_FILE, newkey + "\n")
+        return True, "Already set"
+    if newkey in keys:
+        return False, f"{name} is already mapped in kanata"
+    backup = KANATA_CFG + ".bak-squelch"
     try:
-        _shutil.copy(KANATA_CFG, KANATA_CFG + ".bak-squelch")
-        with open(KANATA_CFG, "w") as f:
-            f.write(text)
-    except OSError as e:
-        return False, f"write failed: {e}"
+        shutil.copy(KANATA_CFG, backup)
+        atomic_write(KANATA_CFG, text[:s] + newkey + text[e:])
+    except OSError as ex:
+        return False, f"Write failed: {ex}"
     chk = subprocess.run(["kanata", "--check", "--cfg", KANATA_CFG],
                          capture_output=True, text=True, timeout=30)
     if chk.returncode != 0:
         try:
-            _shutil.copy(KANATA_CFG + ".bak-squelch", KANATA_CFG)
+            shutil.copy(backup, KANATA_CFG)
         except OSError:
             pass
-        return False, "kanata rejected the config — restored backup"
+        return False, "kanata rejected it, config restored"
+    atomic_write(HOTKEY_FILE, newkey + "\n")
     rst = subprocess.run(["sudo", "-n", "systemctl", "restart", "kanata"],
                          capture_output=True, text=True, timeout=30)
-    try:
-        with open(HOTKEY_FILE, "w") as f:
-            f.write(newkey + "\n")
-    except OSError:
-        pass
     if rst.returncode != 0:
-        return True, ("config updated but kanata needs a manual restart "
-                      "(sudo systemctl restart kanata)")
-    return True, f"trigger is now {dict(HOTKEYS)[newkey].split(' (')[0]}"
+        return True, "Saved. Restart kanata to apply"
+    return True, f"Trigger is now {name}"
 
+
+# ---------------- models + services ----------------
 
 def read_engine_models():
     models = dict(DEFAULT_MODELS)
@@ -218,10 +452,9 @@ def read_engine_models():
 
 
 def write_engine_models(models):
-    os.makedirs(os.path.dirname(ENGINES_ENV), exist_ok=True)
-    with open(ENGINES_ENV, "w") as f:
-        f.write(f"SQUELCH_PARAKEET_MODEL={models['parakeet']}\n"
-                f"SQUELCH_WHISPER_MODEL={models['whisper']}\n")
+    atomic_write(ENGINES_ENV,
+                 f"SQUELCH_PARAKEET_MODEL={models['parakeet']}\n"
+                 f"SQUELCH_WHISPER_MODEL={models['whisper']}\n")
 
 
 def list_model_files(kind):
@@ -240,47 +473,29 @@ def list_model_files(kind):
     return out
 
 
-def service_active(svc):
-    try:
-        r = subprocess.run(["systemctl", "--user", "is-active", svc],
-                           capture_output=True, text=True, timeout=10)
-        return r.stdout.strip() == "active"
-    except Exception:
-        return False
-
-
-def service_enabled(svc):
-    try:
-        r = subprocess.run(["systemctl", "--user", "is-enabled", svc],
-                           capture_output=True, text=True, timeout=10)
-        return r.stdout.strip() == "enabled"
-    except Exception:
-        return False
-
-
 def set_service_enabled(svc, enable, is_self=False):
     """Toggle boot autostart; enabling also starts now (except ourselves)."""
-    try:
-        if enable:
-            subprocess.run(["systemctl", "--user", "enable", svc],
-                           timeout=15, stdout=subprocess.DEVNULL,
+    cmds = [["enable" if enable else "disable", svc]]
+    if not is_self:
+        cmds.append(["start" if enable else "stop", svc])
+    for c in cmds:
+        try:
+            subprocess.run(["systemctl", "--user", *c], timeout=30,
+                           stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
-            if not is_self:
-                subprocess.run(["systemctl", "--user", "start", svc],
-                               timeout=30, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-        else:
-            subprocess.run(["systemctl", "--user", "disable", svc],
-                           timeout=15, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-            if not is_self:
-                subprocess.run(["systemctl", "--user", "stop", svc],
-                               timeout=30, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-        return True
-    except Exception:
-        return False
+        except Exception:
+            return False
+    return True
 
+
+def setup_models_cmd():
+    """squelch-setup-models next to this script (dev checkout) or on PATH."""
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                        "squelch-setup-models")
+    return here if os.access(here, os.X_OK) else "squelch-setup-models"
+
+
+# ---------------- analytics ----------------
 
 def load_stats():
     rows = []
@@ -288,7 +503,7 @@ def load_stats():
         with open(STATS_FILE) as f:
             for line in f:
                 try:
-                    rows.append(_json.loads(line))
+                    rows.append(json.loads(line))
                 except ValueError:
                     continue
     except OSError:
@@ -298,8 +513,7 @@ def load_stats():
 
 def summarize_stats(rows, now=None, recent_min=60):
     """Totals + recent WPM + latency + per-day table for the dashboard."""
-    import datetime as _dt
-    now = now or __import__("time").time()
+    now = now or time.time()
     ok = [r for r in rows if r.get("outcome") == "ok"]
     words = sum(int(r.get("words", 0)) for r in ok)
     audio = sum(float(r.get("audio_s", 0)) for r in ok)
@@ -311,7 +525,8 @@ def summarize_stats(rows, now=None, recent_min=60):
     last10_lat = [float(r.get("transcribe_s", 0)) for r in last10]
     days = {}
     for r in ok:
-        d = _dt.datetime.fromtimestamp(float(r.get("ts", 0))).date().isoformat()
+        d = datetime.datetime.fromtimestamp(
+            float(r.get("ts", 0))).date().isoformat()
         e = days.setdefault(d, [0, 0, 0.0])
         e[0] += int(r.get("words", 0))
         e[1] += 1
@@ -333,6 +548,8 @@ def summarize_stats(rows, now=None, recent_min=60):
     }
 
 
+# ---------------- OpenRouter mishearing suggestions ----------------
+
 def openrouter_key():
     try:
         with open(OPENROUTER_KEY_FILE) as f:
@@ -342,8 +559,7 @@ def openrouter_key():
 
 
 def _or_request(key, method, path, payload=None, timeout=20):
-    import urllib.error as _uerr
-    data = _json.dumps(payload).encode() if payload is not None else None
+    data = json.dumps(payload).encode() if payload is not None else None
     for attempt in range(4):
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1" + path, data=data,
@@ -354,8 +570,8 @@ def _or_request(key, method, path, payload=None, timeout=20):
             method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return _json.loads(r.read().decode())
-        except _uerr.HTTPError as e:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < 3:
                 wait = 5
                 try:
@@ -392,22 +608,21 @@ def free_model_candidates(key):
 
 
 def _parse_suggestions(text, term):
-    import re as _re
     cands = []
-    m = _re.search(r"\[.*?\]", text, _re.DOTALL)
+    m = re.search(r"\[.*?\]", text, re.DOTALL)
     if m:
         try:
-            got = _json.loads(m.group(0))
+            got = json.loads(m.group(0))
             if isinstance(got, list):
                 cands = got
         except ValueError:
             pass
     if not cands:
-        cands = _re.findall(r'"([^"]+)"', text)
+        cands = re.findall(r'"([^"]+)"', text)
     if not cands:
         lines = []
         for ln in text.splitlines():
-            lines.extend(_re.split(r"(?<!\S)\d+[.)]\s+", ln))
+            lines.extend(re.split(r"(?<!\S)\d+[.)]\s+", ln))
         cands = [ln.strip("-*• \t\"'") for ln in lines
                  if ln.strip("-*• \t\"'")]
     out = []
@@ -418,7 +633,7 @@ def _parse_suggestions(text, term):
         if (c and c != term.lower() and c not in _EXAMPLE_PHRASES
                 and len(c) <= 30
                 and len(c.split()) <= 4
-                and _re.fullmatch(r"[a-z'’\- ]+", c)
+                and re.fullmatch(r"[a-z'’\- ]+", c)
                 and c not in out):
             out.append(c)
     return out[:8]
@@ -463,35 +678,12 @@ def fetch_mishearings(term):
     raise RuntimeError(f"free models failed ({last})")
 
 
-def write_filters(flt):
-    os.makedirs(os.path.dirname(FILTERS_FILE), exist_ok=True)
-    with open(FILTERS_FILE, "w") as f:
-        __import__("json").dump(flt, f)
-
-
-DICT_HELP = ("Your words. 'term' is the correct spelling. 'also_match' lists "
-             "ways the engine mishears it, fixed automatically.")
-
-BTN = ("color: white; background: rgba(255,255,255,0.12);"
-       " border: 1px solid #555555; border-radius: 6px; padding: 4px;")
-TABLE_STYLE = (
-    "QTableWidget { background: #000000; color: white;"
-    " gridline-color: #333333; border: 1px solid #3d3d3d;"
-    " border-radius: 8px; }"
-    "QHeaderView::section { background: #000000; color: white;"
-    " border: none; padding: 6px; }")
-DIM_LABEL = "color: #aaaaaa; font-size: 11px;"
-FIELD = ("background: #000000; color: white; border: 1px solid #3d3d3d;"
-         " border-radius: 6px; padding: 4px;")
-LIST = ("QListWidget { background: #000000; color: white;"
-        " border: 1px solid #3d3d3d; border-radius: 8px; }"
-        "QListWidget::item:selected { background: #1c1c1c; }")
-
+# ---------------- windows ----------------
 
 class EnginePopup(QWidget):
     """Slim tap card: engine quick-switch, status, stats glance, and one
-    button into the unified Settings window. Plain top-level window: maps
-    fine on Wayland, unlike QMenu.popup()."""
+    button into Settings. Plain top-level window: maps fine on Wayland,
+    unlike QMenu.popup()."""
 
     def __init__(self, on_engine, on_settings):
         super().__init__(
@@ -505,47 +697,30 @@ class EnginePopup(QWidget):
         panel = QWidget(self)
         panel.setObjectName("panel")
         panel.setStyleSheet(
-            "#panel { background: rgba(0, 0, 0, %s);"
-            " border: 1px solid #3d3d3d; border-radius: 12px; }"
-            % POPUP_BG_OPACITY)
+            f"#panel {{ background: {POPOVER}; border: 1px solid {BORDER};"
+            " border-radius: 12px; }")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(panel)
         inner = QVBoxLayout(panel)
-        inner.setContentsMargins(16, 12, 16, 12)
-        inner.setSpacing(6)
+        inner.setContentsMargins(16, 16, 16, 16)
+        inner.setSpacing(8)
 
-        title = QLabel("Squelch")
-        title.setStyleSheet("color: white; font-weight: bold; font-size: 14px;")
-        inner.addWidget(title)
-
+        inner.addWidget(label("Squelch", "title"))
         self.radios = {}
-        for key, label in ENGINES:
-            rb = QRadioButton(label)
-            rb.setStyleSheet("color: white;")
+        for key, text in ENGINES:
+            rb = QRadioButton(text)
             rb.toggled.connect(
                 lambda checked, k=key: checked and self.on_engine(k))
             inner.addWidget(rb)
             self.radios[key] = rb
-
-        self.status = QLabel()
-        self.status.setStyleSheet(DIM_LABEL)
-        self.status.setWordWrap(True)
+        self.status = label("", "dim")
         inner.addWidget(self.status)
-
-        self.stats_line = QLabel()
-        self.stats_line.setStyleSheet(DIM_LABEL)
-        self.stats_line.setWordWrap(True)
+        self.stats_line = label("", "dim")
         inner.addWidget(self.stats_line)
-
-        self.settings_btn = QPushButton("Settings…")
-        self.settings_btn.setStyleSheet(BTN)
-        self.settings_btn.clicked.connect(self.on_settings)
-        inner.addWidget(self.settings_btn)
-
-        hint = QLabel("tap trigger again, Esc, or click away to close")
-        hint.setStyleSheet("color: #777777; font-size: 11px;")
-        inner.addWidget(hint)
+        settings_btn = QPushButton("Settings")
+        settings_btn.clicked.connect(self.on_settings)
+        inner.addWidget(settings_btn)
 
     def refresh(self, engine, status_text):
         for key, rb in self.radios.items():
@@ -555,10 +730,10 @@ class EnginePopup(QWidget):
         self.status.setText(status_text)
         try:
             s = summarize_stats(load_stats())
-            self.stats_line.setText(
-                f"{s['words']:,} words all-time · "
-                f"{s['recent_wpm']:.0f} WPM last hour · "
-                f"{s['avg_lat']:.2f} s avg transcription")
+            line = f"{s['words']:,} words"
+            if s["recent_n"]:
+                line += f" · {s['recent_wpm']:.0f} WPM last hour"
+            self.stats_line.setText(line)
         except Exception:
             self.stats_line.setText("")
         self.adjustSize()
@@ -596,110 +771,93 @@ class EnginePopup(QWidget):
 
 
 class SettingsWindow(QWidget):
-    """Unified low-profile settings: engine/text/dictionary/analytics tabs
-    in one centered window (not fullscreen)."""
+    """General / Setup / Dictionary / Analytics tabs in one glass window."""
 
-    suggested = pyqtSignal(int, object)  # row, [suggestions] (None = failed)
+    suggested = pyqtSignal(str, object)  # term, [suggestions]
     suggest_failed = pyqtSignal(str)
     dl_done = pyqtSignal(str)
-    refresh_needed = pyqtSignal()
 
     def __init__(self, on_engine, on_filters):
         super().__init__(None, Qt.WindowType.Window)
-        self.setWindowTitle("Squelch settings")
+        self.setWindowTitle("Squelch")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.on_engine = on_engine
         self.on_filters = on_filters
         self.suggested.connect(self._apply_suggestions)
         self.suggest_failed.connect(self._suggest_error)
         self.dl_done.connect(self._dl_finished)
-        self.refresh_needed.connect(self.refresh_setup)
-        self.setStyleSheet(
-            "SettingsWindow { background: rgba(0, 0, 0, 0.6); }")
-        self.resize(700, 540)
+        self.setStyleSheet(f"SettingsWindow {{ background: {GLASS}; }}")
+        self.resize(640, 520)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setContentsMargins(16, 16, 16, 16)
         self.tabs = QTabWidget()
-        self.tabs.setStyleSheet(
-            "QTabWidget::pane { background: #000000;"
-            " border: 1px solid #3d3d3d; border-radius: 8px; }"
-            "QTabBar::tab { background: #000000; color: #cccccc;"
-            " padding: 6px 14px; border-top-left-radius: 6px;"
-            " border-top-right-radius: 6px; }"
-            "QTabBar::tab:selected { background: #1c1c1c; color: white; }"
-            "QWidget { color: white; }")
         lay.addWidget(self.tabs, 1)
         self._build_general()
         self._build_setup()
         self._build_dictionary()
         self._build_analytics()
 
-        self.analytics_timer = QTimer(self)
-        self.analytics_timer.setInterval(5000)
-        self.analytics_timer.timeout.connect(
-            lambda: self.isVisible() and (self.refresh_analytics(),
-                                          self.refresh_setup()))
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setInterval(5000)
+        self.refresh_timer.timeout.connect(self._tick)
+
+    def _tick(self):
+        if self.isVisible():
+            self.g_status.setText(engine_status())
+            self.refresh_analytics()
+            self.refresh_setup()
 
     # ---- general tab ----
     def _build_general(self):
         tab = QWidget()
         lay = QVBoxLayout(tab)
-        lay.setSpacing(8)
+        lay.setSpacing(6)
 
-        eng = QLabel("Engine")
-        eng.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
-        lay.addWidget(eng)
+        lay.addWidget(label("Engine", "heading"))
         self.g_radios = {}
-        for key, label in ENGINES:
-            rb = QRadioButton(label)
+        # Each question gets its own group: radios sharing a parent are
+        # otherwise one exclusive set ("Paste" would untick the engine).
+        self.g_group = QButtonGroup(tab)
+        for key, text in ENGINES:
+            rb = QRadioButton(text)
+            self.g_group.addButton(rb)
             rb.toggled.connect(
                 lambda checked, k=key: checked and self.on_engine(k))
             lay.addWidget(rb)
             self.g_radios[key] = rb
-        self.g_status = QLabel()
-        self.g_status.setStyleSheet(DIM_LABEL)
-        self.g_status.setWordWrap(True)
+        self.g_status = label("", "dim")
         lay.addWidget(self.g_status)
 
-        trig = QLabel("Push-to-talk trigger key")
-        trig.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
-        lay.addWidget(trig)
+        lay.addWidget(label("Trigger key", "heading"))
         hkrow = QHBoxLayout()
         self.hk_combo = QComboBox()
-        for key, label in HOTKEYS:
-            self.hk_combo.addItem(label, key)
-        self.hk_combo.setStyleSheet(
-            "background: #000000; color: white; border: 1px solid #3d3d3d;"
-            " border-radius: 6px; padding: 4px;")
+        for key, text in HOTKEYS:
+            self.hk_combo.addItem(text, key)
         hkrow.addWidget(self.hk_combo, 1)
         hk_apply = QPushButton("Apply")
-        hk_apply.setStyleSheet(BTN)
         hk_apply.clicked.connect(self.hotkey_apply)
         hkrow.addWidget(hk_apply)
         lay.addLayout(hkrow)
-        self.hk_status = QLabel()
-        self.hk_status.setStyleSheet(DIM_LABEL)
-        self.hk_status.setWordWrap(True)
+        self.hk_status = label("", "dim")
+        self.hk_status.hide()
         lay.addWidget(self.hk_status)
 
-        ins = QLabel("How dictated text is inserted")
-        ins.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
-        lay.addWidget(ins)
+        lay.addWidget(label("Insert text by", "heading"))
         self.ins_radios = {}
-        for key, label in INSERTION_MODES:
-            rb = QRadioButton(label)
+        self.ins_group = QButtonGroup(tab)
+        for key, text in INSERTION_MODES:
+            rb = QRadioButton(text)
+            self.ins_group.addButton(rb)
             rb.toggled.connect(
-                lambda checked, k=key: checked and self.insertion_set(k))
+                lambda checked, k=key: checked and write_insertion(k))
             lay.addWidget(rb)
             self.ins_radios[key] = rb
 
-        clf = QLabel("Text cleanup")
-        clf.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
-        lay.addWidget(clf)
-        self.cb_defill = QCheckBox("Remove filler words (um, ah, …)")
-        self.cb_numbers = QCheckBox("Write numbers as digits (over ten)")
-        self.cb_all = QCheckBox("Write ALL numbers as digits (incl. 0–10)")
+        lay.addWidget(label("Cleanup", "heading"))
+        self.cb_defill = QCheckBox("Remove filler words")
+        self.cb_numbers = QCheckBox("Numbers over ten as digits")
+        self.cb_all = QCheckBox("All numbers as digits")
         for cb in (self.cb_defill, self.cb_numbers, self.cb_all):
             cb.toggled.connect(lambda _c: self.filters_changed())
             lay.addWidget(cb)
@@ -712,22 +870,18 @@ class SettingsWindow(QWidget):
                          "numbers_all": self.cb_all.isChecked()})
 
     def hotkey_apply(self):
-        key = self.hk_combo.currentData()
-        _ok, msg = apply_hotkey(key)
+        _ok, msg = apply_hotkey(self.hk_combo.currentData())
         self.hk_status.setText(msg)
+        self.hk_status.show()
         self.refresh_hotkey()
 
     def refresh_hotkey(self):
         cur = read_hotkey()
-        for i in range(self.hk_combo.count()):
-            if self.hk_combo.itemData(i) == cur:
-                self.hk_combo.blockSignals(True)
-                self.hk_combo.setCurrentIndex(i)
-                self.hk_combo.blockSignals(False)
-                break
-
-    def insertion_set(self, mode):
-        write_insertion(mode)
+        i = self.hk_combo.findData(cur)
+        if i >= 0:
+            self.hk_combo.blockSignals(True)
+            self.hk_combo.setCurrentIndex(i)
+            self.hk_combo.blockSignals(False)
 
     def refresh_insertion(self):
         cur = read_insertion()
@@ -736,80 +890,61 @@ class SettingsWindow(QWidget):
             rb.setChecked(key == cur)
             rb.blockSignals(False)
 
-    # ---- setup tab (models, services, API key) ----
+    # ---- setup tab (models, mic, services) ----
     def _build_setup(self):
         tab = QWidget()
         lay = QVBoxLayout(tab)
-        lay.setSpacing(8)
+        lay.setSpacing(6)
 
-        ml = QLabel("Speech models")
-        ml.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
-        lay.addWidget(ml)
+        lay.addWidget(label("Models", "heading"))
         self.model_combos = {}
         self.model_sizes = {}
-        for kind, title in (("parakeet", "English engine (Parakeet)"),
-                            ("whisper", "Other-languages engine (Whisper)")):
+        for kind in ("parakeet", "whisper"):
             row = QHBoxLayout()
-            lab = QLabel(title)
-            lab.setStyleSheet("color: white;")
-            row.addWidget(lab, 1)
+            row.addWidget(label(ENGINE_NAMES[kind]), 1)
             combo = QComboBox()
-            combo.setStyleSheet(
-                "background: #000000; color: white;"
-                " border: 1px solid #3d3d3d; border-radius: 6px; padding: 4px;")
             combo.currentIndexChanged.connect(
                 lambda _i, k=kind: self.model_changed(k))
-            row.addWidget(combo, 2)
-            size = QLabel()
-            size.setStyleSheet(DIM_LABEL)
+            row.addWidget(combo, 3)
+            size = label("", "dim")
+            size.setMinimumWidth(70)
             row.addWidget(size)
             lay.addLayout(row)
             self.model_combos[kind] = combo
             self.model_sizes[kind] = size
         dlrow = QHBoxLayout()
-        self.dl_btn = QPushButton("Download models")
-        self.dl_btn.setStyleSheet(BTN)
+        self.dl_btn = QPushButton("Download")
         self.dl_btn.clicked.connect(self.download_models)
         dlrow.addWidget(self.dl_btn)
-        self.dl_status = QLabel()
-        self.dl_status.setStyleSheet(DIM_LABEL)
-        self.dl_status.setWordWrap(True)
+        self.dl_status = label("", "dim", wrap=True)
         dlrow.addWidget(self.dl_status, 1)
         lay.addLayout(dlrow)
 
-        sv = QLabel("Services (start at login)")
-        sv.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
-        lay.addWidget(sv)
+        lay.addWidget(label("Microphone", "heading"))
+        self.mic_combo = QComboBox()
+        self.mic_combo.currentIndexChanged.connect(self.mic_changed)
+        lay.addWidget(self.mic_combo)
+        self._mic_items = None
+
+        lay.addWidget(label("Services", "heading"))
         self.svc_rows = {}
-        for svc, label in (
-                ("squelch-ptt.service", "Dictation daemon"),
-                ("squelch-tray.service", "Tray + settings (this app)"),
-                ("squelch-vram.service", "VRAM supervisor"),
-                ("squelch-ydotoold.service", "Typing daemon")):
+        for svc, text in SERVICES:
             row = QHBoxLayout()
-            lab = QLabel(label)
-            lab.setStyleSheet("color: white;")
-            row.addWidget(lab, 1)
-            st = QLabel()
-            st.setStyleSheet(DIM_LABEL)
+            row.addWidget(label(text), 1)
+            st = label("", "dim")
+            st.setMinimumWidth(70)
             row.addWidget(st)
-            cb = QCheckBox("autostart")
+            cb = QCheckBox("Autostart")
             cb.toggled.connect(
                 lambda checked, s=svc: self.service_toggled(s, checked))
             row.addWidget(cb)
             lay.addLayout(row)
             self.svc_rows[svc] = (st, cb)
-        note = QLabel("Engine services are managed automatically"
-                      " (one loaded at a time, none while gaming).")
-        note.setStyleSheet(DIM_LABEL)
-        note.setWordWrap(True)
-        lay.addWidget(note)
         lay.addStretch(1)
         self.tabs.addTab(tab, "Setup")
 
     def model_changed(self, kind):
-        combo = self.model_combos[kind]
-        path = combo.currentData()
+        path = self.model_combos[kind].currentData()
         if not path:
             return
         models = read_engine_models()
@@ -823,71 +958,95 @@ class SettingsWindow(QWidget):
         models = read_engine_models()
         for kind, combo in self.model_combos.items():
             files = list_model_files(kind)
-            if models.get(kind) not in [p for _n, _s, p in files]:
-                files.append((os.path.basename(models.get(kind, "")) + " (missing)",
-                              0.0, models.get(kind, "")))
+            path = models.get(kind, "")
+            if path not in [p for _n, _s, p in files]:
+                try:
+                    files.append((os.path.basename(path),
+                                  os.path.getsize(path) / 1048576, path))
+                except OSError:
+                    files.append((os.path.basename(path) + " (missing)",
+                                  0.0, path))
             combo.blockSignals(True)
             combo.clear()
             for name, _sz, path in files:
                 combo.addItem(name, path)
-            for i in range(combo.count()):
-                if combo.itemData(i) == models.get(kind):
-                    combo.setCurrentIndex(i)
-                    break
+            i = combo.findData(models.get(kind))
+            if i >= 0:
+                combo.setCurrentIndex(i)
             combo.blockSignals(False)
             cur = [s for n, s, p in files if p == models.get(kind)]
             self.model_sizes[kind].setText(
-                f"{cur[0]:.0f} MB" if cur and cur[0] > 0 else "missing")
+                f"{cur[0]:.0f} MB" if cur and cur[0] > 0 else "Missing")
         missing = [k for k in ("parakeet", "whisper")
                    if not os.path.exists(models.get(k, ""))]
-        self.dl_btn.setEnabled(bool(missing))
-        self.dl_status.setText(
-            "" if not missing
-            else f"missing: {', '.join(missing)} — download takes a few minutes")
+        downloading = self.dl_status.text() == "Downloading…"
+        self.dl_btn.setVisible(bool(missing) or downloading)
+        self.dl_btn.setEnabled(bool(missing) and not downloading)
+        if not downloading and not self.dl_status.text().startswith(
+                "Download failed"):
+            self.dl_status.setText(
+                f"Missing: {', '.join(ENGINE_NAMES[k] for k in missing)}"
+                if missing else "")
 
     def download_models(self):
         self.dl_btn.setEnabled(False)
-        self.dl_status.setText("downloading…")
+        self.dl_status.setText("Downloading…")
         threading.Thread(target=self._download_worker, daemon=True).start()
 
     def _download_worker(self):
-        import subprocess as _sp
-        jobs = [(DEFAULT_MODELS["parakeet"],
-                 "https://huggingface.co/ggml-org/parakeet-GGUF/resolve/main/"
-                 "ggml-parakeet-tdt-0.6b-v3-q8_0.bin"),
-                (DEFAULT_MODELS["whisper"],
-                 "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
-                 "ggml-large-v3-turbo-q5_0.bin")]
         try:
-            for path, url in jobs:
-                if os.path.exists(path):
-                    continue
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                _sp.run(["curl", "-sL", "-C", "-", "-o", path, url],
-                        timeout=1800, check=False)
-            self.dl_done.emit("done — engines load automatically")
+            r = subprocess.run([setup_models_cmd()], capture_output=True,
+                               text=True, timeout=3600)
+            if r.returncode == 0:
+                self.dl_done.emit("Done")
+            else:
+                err = (r.stderr.strip().splitlines() or ["error"])[-1]
+                self.dl_done.emit(f"Download failed: {err[:80]}")
         except Exception as e:
-            self.dl_done.emit(f"download failed: {e}")
-        self.refresh_needed.emit()
+            self.dl_done.emit(f"Download failed: {e}")
 
     def _dl_finished(self, msg):
         self.dl_status.setText(msg)
         self.refresh_models()
 
+    def refresh_mics(self):
+        cur = read_mic()
+        mics = list_mics()
+        items = [("", "Default")] + mics
+        if cur and cur not in [n for n, _d in mics]:
+            items.append((cur, f"{cur} (missing)"))
+        if items == self._mic_items:
+            return  # unchanged: don't reset an open dropdown
+        self._mic_items = items
+        self.mic_combo.blockSignals(True)
+        self.mic_combo.clear()
+        for name, desc in items:
+            self.mic_combo.addItem(desc, name)
+        i = self.mic_combo.findData(cur)
+        self.mic_combo.setCurrentIndex(i if i >= 0 else 0)
+        self.mic_combo.blockSignals(False)
+
+    def mic_changed(self, _i):
+        write_mic(self.mic_combo.currentData() or "")
+
     def service_toggled(self, svc, checked):
-        is_self = svc == "squelch-tray.service"
-        set_service_enabled(svc, checked, is_self=is_self)
+        set_service_enabled(svc, checked,
+                            is_self=svc == "squelch-tray.service")
         self.refresh_services()
 
     def refresh_services(self):
+        states = service_states([s for s, _t in SERVICES])
         for svc, (st, cb) in self.svc_rows.items():
-            active = service_active(svc)
-            st.setText("running" if active else "stopped")
+            active, enabled = states[svc]
+            st.setText("Running" if active else "Stopped")
             cb.blockSignals(True)
-            cb.setChecked(service_enabled(svc))
+            cb.setChecked(enabled)
             cb.blockSignals(False)
 
-    # ---- setup tab (models, services) ----
+    def refresh_setup(self):
+        self.refresh_models()
+        self.refresh_mics()
+        self.refresh_services()
 
     # ---- dictionary tab ----
     def _build_dictionary(self):
@@ -897,14 +1056,11 @@ class SettingsWindow(QWidget):
 
         addrow = QHBoxLayout()
         self.add_field = QLineEdit()
-        self.add_field.setPlaceholderText("Type a word, press Enter…")
-        self.add_field.setStyleSheet(FIELD)
+        self.add_field.setPlaceholderText("Add a word")
         self.add_field.returnPressed.connect(self.dict_add)
         add_btn = QPushButton("Add")
-        add_btn.setStyleSheet(BTN)
         add_btn.clicked.connect(self.dict_add)
-        key_btn = QPushButton("OpenRouter…")
-        key_btn.setStyleSheet(BTN)
+        key_btn = QPushButton("OpenRouter key")
         key_btn.clicked.connect(self.open_key_dialog)
         addrow.addWidget(self.add_field, 1)
         addrow.addWidget(add_btn)
@@ -912,83 +1068,64 @@ class SettingsWindow(QWidget):
         lay.addLayout(addrow)
 
         self.term_list = QListWidget()
-        self.term_list.setStyleSheet(LIST)
         self.term_list.currentRowChanged.connect(self.dict_select)
         lay.addWidget(self.term_list, 1)
 
         detrow = QHBoxLayout()
-        detlab = QLabel("Sounds like:")
-        detlab.setStyleSheet("color: white;")
+        detrow.addWidget(label("Sounds like"))
         self.heard_field = QLineEdit()
-        self.heard_field.setPlaceholderText("comma separated, optional")
-        self.heard_field.setStyleSheet(FIELD)
+        self.heard_field.setPlaceholderText("comma separated")
         self.heard_field.editingFinished.connect(self.heard_save)
         self.suggest_btn = QPushButton("Suggest")
-        self.suggest_btn.setStyleSheet(BTN)
         self.suggest_btn.clicked.connect(self.suggest)
         rm_btn = QPushButton("Remove")
-        rm_btn.setStyleSheet(BTN)
         rm_btn.clicked.connect(self.dict_remove)
-        detrow.addWidget(detlab)
         detrow.addWidget(self.heard_field, 1)
         detrow.addWidget(self.suggest_btn)
         detrow.addWidget(rm_btn)
         lay.addLayout(detrow)
 
-        self.or_status = QLabel()
-        self.or_status.setStyleSheet(DIM_LABEL)
-        self.or_status.setWordWrap(True)
+        self.or_status = label("", "dim", wrap=True)
         lay.addWidget(self.or_status)
         self.tabs.addTab(tab, "Dictionary")
-
         self.dict_entries = []
 
-    def load_dict(self):
-        try:
-            with open(DICT_FILE) as f:
-                entries = _json.load(f).get("entries", [])
-        except (OSError, ValueError, AttributeError):
-            entries = []
-        self.dict_entries = [
-            {"term": str(e.get("term", "")),
-             "also_match": [str(x) for x in e.get("also_match", []) or []]}
-            for e in entries]
+    def selected_term(self):
+        item = self.term_list.currentItem()
+        return item.text() if item is not None else None
+
+    def show_dict(self, entries, select=None):
+        """Fill the list from entries, keeping select (a term) selected."""
+        self.dict_entries = entries
         self.term_list.blockSignals(True)
         self.term_list.clear()
-        for e in self.dict_entries:
+        for e in entries:
             self.term_list.addItem(e["term"])
         self.term_list.blockSignals(False)
-        self.heard_field.clear()
-        self.or_status.setText(
-            f"{len(self.dict_entries)} word(s) in dictionary.")
+        row = next((i for i, e in enumerate(entries)
+                    if select and e["term"].lower() == select.lower()), -1)
+        self.term_list.setCurrentRow(row)
+        self.dict_select(row)
 
-    def save_dict(self, quiet=False):
-        entries = [e for e in self.dict_entries if e["term"].strip()]
-        os.makedirs(os.path.dirname(DICT_FILE), exist_ok=True)
-        with open(DICT_FILE, "w") as f:
-            _json.dump({"_help": DICT_HELP, "entries": entries}, f,
-                       indent=2, ensure_ascii=False)
-        if not quiet:
-            self.or_status.setText(f"Saved {len(entries)} word(s).")
+    def load_dict(self):
+        self.show_dict(load_dict(), self.selected_term())
 
     def dict_add(self):
         term = self.add_field.text().strip()
         if not term:
             return
-        for i, e in enumerate(self.dict_entries):
-            if e["term"].lower() == term.lower():
-                self.term_list.setCurrentRow(i)
-                self.add_field.clear()
-                self.add_field.setFocus()
-                self.or_status.setText("Already in dictionary.")
-                return
-        self.dict_entries.append({"term": term, "also_match": []})
-        self.save_dict(quiet=True)
-        self.load_dict()
-        self.term_list.setCurrentRow(len(self.dict_entries) - 1)
+        added = []
+
+        def change(entries):
+            if find_entry(entries, term) is None:
+                entries.append({"term": term, "also_match": []})
+                added.append(term)
+
+        self.show_dict(update_dict(change), term)
         self.add_field.clear()
         self.add_field.setFocus()
-        self.or_status.setText(f"Added “{term}”.")
+        self.or_status.setText(f"Added “{term}”" if added
+                               else "Already in dictionary")
 
     def dict_select(self, row):
         if 0 <= row < len(self.dict_entries):
@@ -998,41 +1135,45 @@ class SettingsWindow(QWidget):
             self.heard_field.clear()
 
     def heard_save(self):
-        row = self.term_list.currentRow()
-        if 0 <= row < len(self.dict_entries):
-            heard = [h.strip() for h in self.heard_field.text().split(",")]
-            self.dict_entries[row]["also_match"] = [h for h in heard if h]
-            self.save_dict(quiet=True)
+        term = self.selected_term()
+        if term is None:
+            return
+        heard = [h.strip() for h in self.heard_field.text().split(",")
+                 if h.strip()]
+
+        def change(entries):
+            e = find_entry(entries, term)
+            if e is not None:
+                e["also_match"] = heard
+
+        self.show_dict(update_dict(change), term)
 
     def dict_remove(self):
-        row = self.term_list.currentRow()
-        if 0 <= row < len(self.dict_entries):
-            term = self.dict_entries[row]["term"]
-            del self.dict_entries[row]
-            self.save_dict(quiet=True)
-            self.load_dict()
-            self.or_status.setText(f"Removed “{term}”.")
+        term = self.selected_term()
+        if term is None:
+            return
+
+        def change(entries):
+            e = find_entry(entries, term)
+            if e is not None:
+                entries.remove(e)
+
+        self.show_dict(update_dict(change))
+        self.or_status.setText(f"Removed “{term}”")
 
     def open_key_dialog(self):
-        from PyQt6.QtWidgets import QDialog as _QDialog
-        dlg = _QDialog(self)
+        dlg = QDialog(self)
         dlg.setWindowTitle("OpenRouter key")
-        dlg.setStyleSheet("QDialog { background: #000000; }")
+        dlg.setStyleSheet(f"QDialog {{ background: {POPOVER}; }}")
         lay = QVBoxLayout(dlg)
-        lab = QLabel("Powers AI mishearing suggestions.\n"
-                     "Stored owner-only at ~/.config/squelch/openrouter.key")
-        lab.setStyleSheet("color: white;")
-        lab.setWordWrap(True)
-        lay.addWidget(lab)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.addWidget(label("Used by Suggest. Saved owner-only.", "dim"))
         field = QLineEdit()
         field.setEchoMode(QLineEdit.EchoMode.Password)
-        field.setPlaceholderText(
-            "key set — paste a new one to replace" if openrouter_key()
-            else "paste key here")
-        field.setStyleSheet(FIELD)
+        field.setPlaceholderText("Key set" if openrouter_key()
+                                 else "Paste key")
         lay.addWidget(field)
-        st = QLabel()
-        st.setStyleSheet(DIM_LABEL)
+        st = label("", "dim")
         lay.addWidget(st)
         row = QHBoxLayout()
         row.addStretch(1)
@@ -1040,81 +1181,84 @@ class SettingsWindow(QWidget):
         clear_btn = QPushButton("Clear")
         close_btn = QPushButton("Close")
         for b in (set_btn, clear_btn, close_btn):
-            b.setStyleSheet(BTN)
-        row.addWidget(set_btn)
-        row.addWidget(clear_btn)
-        row.addWidget(close_btn)
+            row.addWidget(b)
         lay.addLayout(row)
+
+        def forget_model():
+            try:
+                os.unlink(OPENROUTER_MODEL_FILE)
+            except OSError:
+                pass
 
         def do_set():
             k = field.text().strip()
             if not k:
                 return
-            os.makedirs(os.path.dirname(OPENROUTER_KEY_FILE), exist_ok=True)
-            with open(OPENROUTER_KEY_FILE, "w") as f:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            fd = os.open(OPENROUTER_KEY_FILE,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(k + "\n")
             os.chmod(OPENROUTER_KEY_FILE, 0o600)
-            try:
-                os.unlink(OPENROUTER_MODEL_FILE)
-            except OSError:
-                pass
+            forget_model()
             field.clear()
-            st.setText("Key saved.")
+            field.setPlaceholderText("Key set")
+            st.setText("Saved")
 
         def do_clear():
             try:
                 os.unlink(OPENROUTER_KEY_FILE)
-                st.setText("Key removed.")
+                st.setText("Removed")
             except OSError:
-                st.setText("No key was set.")
-            try:
-                os.unlink(OPENROUTER_MODEL_FILE)
-            except OSError:
-                pass
+                st.setText("No key set")
+            forget_model()
+            field.setPlaceholderText("Paste key")
 
         set_btn.clicked.connect(do_set)
         clear_btn.clicked.connect(do_clear)
         close_btn.clicked.connect(dlg.accept)
         dlg.exec()
+        self.refresh_or_status()
+
+    def refresh_or_status(self):
+        self.or_status.setText("" if openrouter_key()
+                               else "No OpenRouter key: Suggest is off")
 
     def suggest(self):
         """Suggest mishearings for the selected word (one OpenRouter call)."""
-        row = self.term_list.currentRow()
-        if row < 0 or row >= len(self.dict_entries):
-            self.or_status.setText("Select a word first.")
-            return
-        term = self.dict_entries[row]["term"]
-        if not term:
+        term = self.selected_term()
+        if term is None:
+            self.or_status.setText("Select a word first")
             return
         self.suggest_btn.setEnabled(False)
-        self.or_status.setText(f"Asking OpenRouter what “{term}” sounds like…")
-        threading.Thread(target=self._suggest_worker, args=(row, term),
+        self.or_status.setText(f"Asking what “{term}” sounds like…")
+        threading.Thread(target=self._suggest_worker, args=(term,),
                          daemon=True).start()
 
-    def _suggest_worker(self, row, term):
+    def _suggest_worker(self, term):
         try:
-            self.suggested.emit(row, fetch_mishearings(term))
+            self.suggested.emit(term, fetch_mishearings(term))
         except Exception as e:
             self.suggest_failed.emit(str(e)[:160])
 
-    def _apply_suggestions(self, row, suggs):
+    def _apply_suggestions(self, term, suggs):
         self.suggest_btn.setEnabled(True)
-        if suggs is None or row >= len(self.dict_entries):
-            return
-        term = self.dict_entries[row]["term"].lower()
-        have = self.dict_entries[row]["also_match"]
-        have_l = {h.lower() for h in have}
-        added = [s for s in suggs
-                 if s.lower() not in have_l and s.lower() != term]
-        if added:
-            self.dict_entries[row]["also_match"] = have + added
-            self.save_dict(quiet=True)
-            if self.term_list.currentRow() == row:
-                self.heard_field.setText(
-                    ", ".join(self.dict_entries[row]["also_match"]))
-        self.or_status.setText(
-            f"Added {len(added)} mishearing(s)."
-            if added else "Nothing new suggested.")
+        added = []
+
+        def change(entries):
+            e = find_entry(entries, term)
+            if e is None:
+                return
+            have = {h.lower() for h in e["also_match"]}
+            for s in suggs:
+                if s.lower() not in have and s.lower() != term.lower():
+                    e["also_match"].append(s)
+                    have.add(s.lower())
+                    added.append(s)
+
+        self.show_dict(update_dict(change), self.selected_term())
+        self.or_status.setText(f"Added {len(added)}" if added
+                               else "Nothing new")
 
     def _suggest_error(self, msg):
         self.suggest_btn.setEnabled(True)
@@ -1128,37 +1272,30 @@ class SettingsWindow(QWidget):
         tiles = QHBoxLayout()
         tiles.setSpacing(12)
         self.tiles = {}
-        for key, caption in (("words", "words (all time)"),
-                             ("wpm", "avg WPM (all time)"),
-                             ("lat", "avg transcription"),
-                             ("utts", "utterances")):
+        for key, caption in (("words", "words"),
+                             ("wpm", "WPM"),
+                             ("lat", "transcription"),
+                             ("utts", "dictations")):
             box = QVBoxLayout()
-            num = QLabel("—")
-            num.setStyleSheet(
-                "color: white; font-weight: bold; font-size: 22px;")
-            cap = QLabel(caption)
-            cap.setStyleSheet("color: #aaaaaa; font-size: 11px;")
-            cap.setWordWrap(True)
+            num = label("—", "num")
             box.addWidget(num)
-            box.addWidget(cap)
+            box.addWidget(label(caption, "dim"))
             tiles.addLayout(box, 1)
             self.tiles[key] = num
         lay.addLayout(tiles)
-        self.a_recent = QLabel()
-        self.a_recent.setStyleSheet("color: white; font-size: 12px;")
-        self.a_recent.setWordWrap(True)
+        self.a_recent = label("", "dim", wrap=True)
         lay.addWidget(self.a_recent)
         self.a_table = QTableWidget(0, 4)
         self.a_table.setHorizontalHeaderLabels(
-            ["Day", "Words", "Utterances", "Audio (min)"])
+            ["Day", "Words", "Dictations", "Minutes"])
         hdr = self.a_table.horizontalHeader()
         for i in range(4):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+        self.a_table.verticalHeader().setVisible(False)
         self.a_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         self.a_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.a_table.setStyleSheet(TABLE_STYLE)
         lay.addWidget(self.a_table, 1)
         self.tabs.addTab(tab, "Analytics")
 
@@ -1168,19 +1305,17 @@ class SettingsWindow(QWidget):
         self.tiles["wpm"].setText(f"{s['wpm']:.0f}")
         self.tiles["lat"].setText(f"{s['avg_lat']:.2f} s")
         self.tiles["utts"].setText(f"{s['utterances']:,}")
-        utt_word = "utterance" if s['recent_n'] == 1 else "utterances"
         self.a_recent.setText(
             f"Last hour: {s['recent_wpm']:.0f} WPM · "
-            f"{s['recent_words']:,} words ({s['recent_n']} {utt_word}) · "
-            f"transcription avg (last 10): {s['recent_lat']:.2f} s")
+            f"{s['recent_words']:,} words · "
+            f"last 10 avg {s['recent_lat']:.2f} s"
+            if s["recent_n"] else "Nothing in the last hour")
         self.a_table.setRowCount(0)
         for d, w, u, a in s["days"]:
             r = self.a_table.rowCount()
             self.a_table.insertRow(r)
-            self.a_table.setItem(r, 0, QTableWidgetItem(d))
-            self.a_table.setItem(r, 1, QTableWidgetItem(f"{w:,}"))
-            self.a_table.setItem(r, 2, QTableWidgetItem(f"{u:,}"))
-            self.a_table.setItem(r, 3, QTableWidgetItem(f"{a:.1f}"))
+            for col, val in enumerate((d, f"{w:,}", f"{u:,}", f"{a:.1f}")):
+                self.a_table.setItem(r, col, QTableWidgetItem(val))
 
     # ---- open / refresh ----
     def refresh_general(self):
@@ -1189,7 +1324,7 @@ class SettingsWindow(QWidget):
             rb.blockSignals(True)
             rb.setChecked(key == cur)
             rb.blockSignals(False)
-        self.g_status.setText("services:  " + service_status())
+        self.g_status.setText(engine_status())
         flt = read_filters()
         for cb, name in ((self.cb_defill, "defiller"),
                          (self.cb_numbers, "numbers"),
@@ -1198,18 +1333,12 @@ class SettingsWindow(QWidget):
             cb.setChecked(flt[name])
             cb.blockSignals(False)
 
-    def refresh_setup(self):
-        self.refresh_models()
-        self.refresh_services()
-
     def open(self, tab=0):
         self.refresh_general()
         self.refresh_hotkey()
         self.refresh_insertion()
         self.load_dict()
-        self.or_status.setText(
-            "OpenRouter: ready" if openrouter_key()
-            else "OpenRouter: no key — suggestions unavailable")
+        self.refresh_or_status()
         self.refresh_analytics()
         self.refresh_setup()
         self.tabs.setCurrentIndex(tab)
@@ -1221,8 +1350,8 @@ class SettingsWindow(QWidget):
             geo = screen.availableGeometry()
             self.move(geo.x() + (geo.width() - self.width()) // 2,
                       geo.y() + (geo.height() - self.height()) // 3)
-        if not self.analytics_timer.isActive():
-            self.analytics_timer.start()
+        if not self.refresh_timer.isActive():
+            self.refresh_timer.start()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -1232,8 +1361,8 @@ class SettingsWindow(QWidget):
 
 
 class MenuKeyWatcher:
-    """Passive listener on kanata's output device: a Menu tap (F23) pops the
-    STT menu at the cursor. No grabs — dictation daemon reads alongside."""
+    """Passive listener on kanata's output device: a trigger tap (F23)
+    pops the tap card. No grabs — the dictation daemon reads alongside."""
 
     def __init__(self, on_tap):
         self.on_tap = on_tap
@@ -1245,10 +1374,11 @@ class MenuKeyWatcher:
         self.discover()
 
     def find_device(self):
-        import glob as _glob
-        for path in sorted(_glob.glob("/dev/input/event*")):
+        for path in sorted(os.listdir("/dev/input")):
+            if not path.startswith("event"):
+                continue
             try:
-                d = evdev.InputDevice(path)
+                d = evdev.InputDevice(os.path.join("/dev/input", path))
             except OSError:
                 continue
             if "kanata" not in d.name.lower():
@@ -1296,7 +1426,7 @@ def fallback_icon():
     pm.fill(QColor(0, 0, 0, 0))
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QColor(0x35, 0x84, 0xe4))
+    p.setBrush(QColor(STEEL_FOCUS))
     p.setPen(QColor(0, 0, 0, 0))
     p.drawRoundedRect(20, 6, 24, 32, 12, 12)          # mic head
     p.drawRect(30, 38, 4, 12)                          # stem
@@ -1310,6 +1440,7 @@ def main():
     app.setApplicationName("Squelch")
     app.setDesktopFileName("squelch")
     app.setQuitOnLastWindowClosed(False)
+    app.setStyleSheet(APP_STYLE)
 
     icon = QIcon.fromTheme("audio-input-microphone")
     if icon.isNull():
@@ -1321,8 +1452,8 @@ def main():
     group = QActionGroup(menu)
     group.setExclusive(True)
     actions = {}
-    for key, label in ENGINES:
-        a = QAction(label, menu, checkable=True)
+    for key, text in ENGINES:
+        a = QAction(text, menu, checkable=True)
         a.setData(key)
         a.triggered.connect(lambda _=False, k=key: switch(k))
         group.addAction(a)
@@ -1333,11 +1464,11 @@ def main():
     status_action.setEnabled(False)
     menu.addAction(status_action)
     menu.addSeparator()
-    settings_action = QAction("Settings…", menu)
+    settings_action = QAction("Settings", menu)
     settings_action.triggered.connect(lambda: open_settings())
     menu.addAction(settings_action)
     menu.addSeparator()
-    quit_action = QAction("Quit tray (dictation keeps working)", menu)
+    quit_action = QAction("Quit tray", menu)
     quit_action.triggered.connect(app.quit)
     menu.addAction(quit_action)
 
@@ -1349,26 +1480,22 @@ def main():
         cur = read_engine()
         for key, a in actions.items():
             a.setChecked(key == cur)
-        label = dict(ENGINES)[cur]
-        tray.setToolTip(f"Squelch — {label}")
+        tray.setToolTip(f"Squelch · {ENGINE_NAMES[cur]}")
 
     def on_show():
         refresh()
-        status_action.setText("services:  " + service_status())
+        status_action.setText(engine_status())
 
     menu.aboutToShow.connect(on_show)
     tray.setContextMenu(menu)
 
-    settings = SettingsWindow(on_engine=lambda key: (switch(key), refresh()),
-                              on_filters=write_filters)
+    settings = SettingsWindow(on_engine=switch, on_filters=write_filters)
 
     def open_settings(tab=0):
         popup.hide()  # single-window policy: settings closes the tap card
         settings.open(tab)
 
-    popup = EnginePopup(
-        on_engine=lambda key: (switch(key), refresh()),
-        on_settings=open_settings)
+    popup = EnginePopup(on_engine=switch, on_settings=open_settings)
 
     tap = {"pending": False}
     tap_timer = QTimer()
@@ -1384,7 +1511,7 @@ def main():
         elif popup.isVisible():
             popup.hide()
         else:
-            popup.show_at(read_engine(), service_status())
+            popup.show_at(read_engine(), engine_status())
 
     tap_timer.timeout.connect(on_tap_timeout)
 
@@ -1398,7 +1525,7 @@ def main():
             tap["pending"] = True
             tap_timer.start()
 
-    watcher = MenuKeyWatcher(on_menu_tap)
+    app.watcher = MenuKeyWatcher(on_menu_tap)  # keep it alive
     refresh()
     tray.show()
     sys.exit(app.exec())

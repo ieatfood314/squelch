@@ -1,6 +1,6 @@
 # Maintainer: Aidan Heeney <aidan.heeney@proton.me>
 pkgname=squelch
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc='Push-to-talk speech-to-text on GPU: Parakeet/Whisper, mic-array beamforming, Menu-key dictation'
 arch=('x86_64')
@@ -8,9 +8,9 @@ url='https://github.com/ieatfood314/squelch'
 license=('MIT')
 depends=('python' 'python-evdev' 'python-numpy' 'python-pyqt6' 'ydotool'
          'wl-clipboard' 'libnotify' 'pipewire' 'vulkan-icd-loader' 'kanata'
-         'playerctl' 'polkit')
+         'playerctl' 'polkit' 'qt6-tools')
 makedepends=('git' 'cmake' 'vulkan-headers' 'spirv-headers')
-optdepends=('python-huggingface_hub: alternative model downloads')
+optdepends=('aspell-en: learn your vocabulary for Whisper')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "whisper.cpp::git+https://github.com/ggml-org/whisper.cpp.git#commit=0c7be696371069e0baa2515ed7aa08d5a5473aa6")
 sha256sums=('62383fc426515fb07dbb7c4722c8ff19a7bc6b5ee91f2a40b497384b96bb2c6c'
@@ -41,7 +41,7 @@ package() {
     src/squelch-tray src/squelch-vram src/squelch-setup-models \
     src/squelch-mic-reset -t "$pkgdir/usr/bin/"
   install -Dm644 systemd/*.service -t "$pkgdir/usr/lib/systemd/user/"
-  install -Dm644 systemd/system/squelch-mic-reset.service -t \
+  install -Dm644 systemd/system/squelch-mic-reset@.service -t \
     "$pkgdir/usr/lib/systemd/system/"
   install -Dm644 polkit/50-squelch.rules -t \
     "$pkgdir/usr/share/polkit-1/rules.d/"

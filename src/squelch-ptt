@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """STT push-to-talk daemon: hold F24 (from kanata Menu tap-hold) to record
-from the Logitech C920's stereo mic pair, beamform + clean, transcribe with
-the local whisper-server (Vulkan GPU), and paste the result via clipboard +
-Shift+Insert (layout-proof: raw keycode typing gets mangled by Colemak).
+from the mic picked in Settings (default: PipeWire's default source),
+beamform + clean, transcribe with the resident Parakeet or Whisper server
+(Vulkan GPU), and paste the result via clipboard + Shift+Insert, or Ctrl+V
+in browsers (layout-proof: raw keycode typing gets mangled by Colemak).
 
 Usage:
   squelch-ptt                run the daemon (systemd user service does this)
-  squelch-ptt --process F    DSP + transcribe file F, print result (no typing)
+  squelch-ptt --process F    DSP + transcribe file F, print result (no typing,
+                             no stats or archive; F is left alone)
   squelch-ptt --probe-mic    record 1.5 s, report whether the mic delivers audio
   squelch-ptt --reset-mic    power-cycle the mic's USB port and re-probe
 """
 import glob
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -31,15 +34,20 @@ import numpy as np
 SERVER_URL = "http://127.0.0.1:1893/inference"      # whisper (multilingual/FR)
 PARAKEET_URL = "http://127.0.0.1:1894/inference"    # parakeet (English default)
 ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
+STATE_FILE = os.path.expanduser("~/.config/squelch/state.json")
 FILTERS_FILE = os.path.expanduser("~/.config/squelch/filters.json")
 DICT_FILE = os.path.expanduser("~/.config/squelch/dictionary.json")
 STATS_FILE = os.path.expanduser("~/.config/squelch/stats.jsonl")
 INSERTION_FILE = os.path.expanduser("~/.config/squelch/insertion.json")
 TRANSCRIPTS_FILE = os.path.expanduser("~/.config/squelch/transcripts.jsonl")
 VOCAB_FILE = os.path.expanduser("~/.config/squelch/vocab.json")
+MIC_FILE = os.path.expanduser("~/.config/squelch/mic")
+# One line: a directory to archive every utterance to (raw + clean audio and
+# the transcript). No file, no archive.
+ARCHIVE_FILE = os.path.expanduser("~/.config/squelch/archive")
 SPOOL_DIR = os.path.expanduser("~/.config/squelch/spool")
-NAS_ROOT = "/mnt/nas/Aidan/squelch"
-_nas_state = {"ok": False, "checked": 0.0}
+SPOOL_MAX_UTTERANCES = 100
+_archive_state = {"ok": False, "checked": 0.0, "root": None}
 _spool_lock = threading.Lock()
 _spool_counter = 0
 
@@ -47,13 +55,13 @@ _spool_counter = 0
 def fix_wayland_env():
     """Point wl-copy/wl-paste at a Wayland socket that actually exists.
 
-    The packaged unit hardcodes wayland-0, which is wrong by the time the
-    daemon starts (the session socket is imported after default.target and
-    often renumbered across boots), so fall back to the newest existing
-    socket in XDG_RUNTIME_DIR if the configured one is missing.
+    The daemon starts with default.target, before the session imports
+    WAYLAND_DISPLAY (and the socket is often renumbered across boots), so
+    fall back to the newest existing socket in XDG_RUNTIME_DIR if the
+    configured one is missing.
     """
     display = os.environ.get("WAYLAND_DISPLAY", "")
-    runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     if display and os.path.exists(os.path.join(runtime, display)):
         return
     sockets = [s for s in glob.glob(os.path.join(runtime, "wayland-*"))
@@ -80,37 +88,60 @@ def log_stats(entry):
         log("stats write failed:", e)
 
 
-# ---------------- NAS archive (training data keepsake) ----------------
+# ---------------- utterance archive (opt-in training data keepsake) ----------------
 
-def nas_available():
-    """True if the NAS archive is writable (cached a few minutes either way)."""
+def archive_root():
+    """The archive directory from ~/.config/squelch/archive, or None."""
+    try:
+        with open(ARCHIVE_FILE) as f:
+            root = os.path.expanduser(f.read().strip())
+        return root or None
+    except OSError:
+        return None
+
+
+def archive_available(root):
+    """True if the archive is writable (cached a few minutes either way)."""
     now = time.time()
-    if now - _nas_state["checked"] < 300 and _nas_state.get("seen", False):
-        return _nas_state["ok"]
+    st = _archive_state
+    if st["root"] == root and now - st["checked"] < 300:
+        return st["ok"]
     ok = False
     try:
-        os.makedirs(os.path.join(NAS_ROOT, "raw"), exist_ok=True)
-        os.makedirs(os.path.join(NAS_ROOT, "clean"), exist_ok=True)
-        ok = os.access(os.path.join(NAS_ROOT, "raw"), os.W_OK)
+        os.makedirs(os.path.join(root, "raw"), exist_ok=True)
+        os.makedirs(os.path.join(root, "clean"), exist_ok=True)
+        ok = os.access(os.path.join(root, "raw"), os.W_OK)
     except OSError as e:
-        log("nas unavailable:", e)
-    _nas_state.update(ok=ok, checked=now, seen=True)
+        log("archive unavailable:", e)
+    st.update(ok=ok, checked=now, root=root)
     return ok
 
 
+def trim_spool():
+    """Keep the newest SPOOL_MAX_UTTERANCES utterances while the archive is
+    away, dropping whole utterances (wavs + metadata) oldest first."""
+    try:
+        names = os.listdir(SPOOL_DIR)
+    except OSError:
+        return
+    bases = sorted({n.split(".", 1)[0] for n in names})
+    for base in bases[:max(0, len(bases) - SPOOL_MAX_UTTERANCES)]:
+        for n in names:
+            if n.split(".", 1)[0] == base:
+                try:
+                    os.unlink(os.path.join(SPOOL_DIR, n))
+                except OSError:
+                    pass
+
+
 def archive_utterance(raw_wav, clean_wav, meta):
-    """Spool wavs locally now (fast), upload to NAS in background."""
-    if os.environ.get("STT_NO_STATS"):
+    """Spool wavs locally now (fast), upload to the archive in background."""
+    if os.environ.get("STT_NO_STATS") or archive_root() is None:
         return
     global _spool_counter
     try:
         os.makedirs(SPOOL_DIR, exist_ok=True)
-        names = sorted(os.listdir(SPOOL_DIR))
-        while len(names) > 300:  # keep spool bounded if NAS is away
-            try:
-                os.unlink(os.path.join(SPOOL_DIR, names.pop(0)))
-            except OSError:
-                break
+        trim_spool()
         stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(meta["ts"]))
         _spool_counter += 1
         base = f"{stamp}-{os.getpid()}-{_spool_counter}"
@@ -129,7 +160,8 @@ def upload_spool():
     if not _spool_lock.acquire(blocking=False):
         return  # another uploader is working
     try:
-        if not nas_available():
+        root = archive_root()
+        if root is None or not archive_available(root):
             return
         try:
             names = sorted(os.listdir(SPOOL_DIR))
@@ -146,11 +178,11 @@ def upload_spool():
                 for ext, sub in ((".raw.wav", "raw"), (".clean.wav", "clean")):
                     src = os.path.join(SPOOL_DIR, base + ext)
                     if os.path.exists(src):
-                        d = os.path.join(NAS_ROOT, sub, day)
+                        d = os.path.join(root, sub, day)
                         os.makedirs(d, exist_ok=True)
                         shutil.copy(src, os.path.join(d, base + ext))
                         os.unlink(src)
-                with open(os.path.join(NAS_ROOT, "transcripts.jsonl"),
+                with open(os.path.join(root, "transcripts.jsonl"),
                           "a") as f:
                     f.write(json.dumps({
                         "ts": meta["ts"], "engine": meta.get("engine"),
@@ -203,16 +235,11 @@ def read_vocab():
         return _vocab_cache["auto"]
     try:
         with open(VOCAB_FILE) as f:
-            auto = _json_load_list(f)
-    except (OSError, ValueError):
+            auto = [str(x) for x in json.load(f).get("auto_terms", [])]
+    except (OSError, ValueError, AttributeError):
         return []
     _vocab_cache.update(mtime=mt, auto=auto)
     return auto
-
-
-def _json_load_list(f):
-    import json as _j
-    return [str(x) for x in _j.load(f).get("auto_terms", [])]
 
 
 def aspell_unknown(words):
@@ -272,6 +299,8 @@ def mine_vocab():
 
 def maybe_adapt_vocab(text):
     global _adapt_counter
+    if os.environ.get("STT_NO_STATS"):
+        return
     log_transcript(text)
     if not text:
         return
@@ -282,6 +311,8 @@ def maybe_adapt_vocab(text):
         mine_vocab()
     except Exception as e:
         log("vocab mining failed:", e)
+
+
 ENGINE_PORTS = {"parakeet": 1894, "whisper": 1893}
 _last_notify = {}
 
@@ -309,9 +340,14 @@ def engine_available():
         return True
     except OSError:
         return False
+
+
 SR = 16000
 MIN_HOLD_S = 0.20
-MAX_HOLD_S = 30.0
+# Recording stops here even if the key stays down (stuck key, forgotten
+# hold). Parakeet's VRAM grows with clip length: +0.5 GB at 2 min, +2.7 GB
+# at 5 min, so cap it rather than spike the GPU.
+MAX_HOLD_S = 120.0
 F24 = evdev.ecodes.KEY_F24  # 194, emitted by kanata while Menu is held
 
 
@@ -321,36 +357,82 @@ def log(*a):
 
 # ---------------- mic discovery ----------------
 
-# The C920's ALSA source (not its "(V4L2)" twin, and not the PS Eye, which
-# wedges its mic across suspend and is no longer used).
-MIC_MATCH = "C920"
 MIC_CHANNELS = 2
 # Idle room after cleanup sits well under these (C920 at its +50 dB
 # hardware gain: raw peak ~1800, rms ~350); real speech at the desk is far
 # louder. Below both, the clip is silence and whisper would hallucinate.
 QUIET_PEAK = 3000.0
 QUIET_RMS = 500.0
+USB_ID_RE = re.compile(r"^\d+-\d+(\.\d+)*$")
+# The last USB device seen behind the mic, so a reset can still find its
+# port after the mic has dropped out of PipeWire.
+_last_mic_usb = {"id": None}
 
 
-def find_mic_target():
-    """Resolve the C920 mic's PipeWire node name dynamically."""
+def configured_mic():
+    """Node name (or a name/description substring) from
+    ~/.config/squelch/mic, or None for PipeWire's default source."""
+    try:
+        with open(MIC_FILE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def usb_id_of(props):
+    """USB device id (e.g. 3-1.2.3) behind an ALSA source, or None."""
+    m = re.search(r":(\d+)$", str(props.get("api.alsa.path", "")))
+    card = props.get("alsa.card") or (m.group(1) if m else None)
+    if card is None:
+        return None
+    dev = os.path.realpath(f"/sys/class/sound/card{card}/device")
+    name = os.path.basename(dev)
+    if ":" in name:  # an interface (3-1.2.3:1.2); its parent is the device
+        name = os.path.basename(os.path.dirname(dev))
+    return name if USB_ID_RE.match(name) else None
+
+
+def find_mic():
+    """{"target": node name or None, "usb": USB id or None} for the mic to
+    record from, or None if the configured mic is missing. Target None
+    means PipeWire's default source."""
+    want = configured_mic()
     try:
         out = subprocess.run(
             ["pw-dump"], capture_output=True, timeout=10).stdout
-        for node in json.loads(out):
-            try:
-                props = node.get("info", {}).get("props", {})
-            except AttributeError:
-                continue
-            name = str(props.get("node.name", ""))
-            desc = str(props.get("node.description", ""))
-            if (MIC_MATCH in name or MIC_MATCH in desc) and \
-                    name.startswith("alsa_input.") and \
-                    props.get("media.class") == "Audio/Source":
-                return name
+        objs = json.loads(out)
     except Exception as e:
         log("mic discovery failed:", e)
-    return None
+        return None if want else {"target": None, "usb": None}
+    sources, default = [], None
+    for o in objs:
+        if not isinstance(o, dict):
+            continue
+        info = o.get("info") or {}
+        if o.get("type", "").endswith(":Metadata"):
+            for item in o.get("metadata") or []:
+                if item.get("key") == "default.audio.source":
+                    v = item.get("value")
+                    default = v.get("name") if isinstance(v, dict) else None
+        props = info.get("props") or {}
+        if props.get("media.class") == "Audio/Source":
+            sources.append(props)
+    pick = None
+    if want:
+        pick = next((p for p in sources if p.get("node.name") == want), None)
+        if pick is None:
+            pick = next((p for p in sources
+                         if want in str(p.get("node.name", ""))
+                         or want in str(p.get("node.description", ""))), None)
+        if pick is None:
+            return None
+    elif default:
+        pick = next((p for p in sources if p.get("node.name") == default),
+                    None)
+    usb = usb_id_of(pick) if pick else None
+    if usb:
+        _last_mic_usb["id"] = usb
+    return {"target": pick.get("node.name") if want else None, "usb": usb}
 
 
 # ---------------- DSP: mic-pair beamform + monitor-diffraction comp ----------------
@@ -371,9 +453,10 @@ def gcc_phat_lag(sig, ref, max_shift=8):
     return best_lag
 
 
-def beamform_and_clean(path_in, path_out, sr=SR):
+def beamform_and_clean(path_in, path_out, sr=SR, max_s=None):
     """Delay-and-sum the raw capsules, HP filter, HF shelf to compensate
-    monitor-edge diffraction loss, gate room noise, normalize, trim."""
+    monitor-edge diffraction loss, gate room noise, normalize, trim.
+    Only the first max_s seconds are used when given."""
     with wave.open(path_in, "rb") as w:
         nch, rate, nframes = (w.getnchannels(), w.getframerate(),
                               w.getnframes())
@@ -384,6 +467,8 @@ def beamform_and_clean(path_in, path_out, sr=SR):
     if rate != sr:
         raise ValueError(f"unexpected rate {rate}")
     a = a.reshape(-1, nch)
+    if max_s:
+        a = a[:int(max_s * sr)]
     a -= a.mean(axis=0, keepdims=True)
 
     if nch > 1:
@@ -597,12 +682,15 @@ def clean_text(text):
     return text
 
 
-FILLER_RE = re.compile(r"\b(u+h+|u+m+|e+r+|a+h+|e+h+|h+m+|m+m+)\b",
-                       re.IGNORECASE)
+# Whole words only, and not inside hyphenated words ("uh-huh", "mm-hmm").
+# Plain "mm" is left alone: it's also millimetres.
+FILLER_RE = re.compile(
+    r"(?<![\w-])(u+h+|u+m+|e+r+|a+h+|e+h+|h+m+|m{3,})(?![\w-])",
+    re.IGNORECASE)
 
 
 def defiller(text):
-    """Drop filler sounds (um, uh, er, ah, eh, hmm, mm) and tidy up."""
+    """Drop filler sounds (um, uh, er, ah, eh, hmm, mmm) and tidy up."""
     t = FILLER_RE.sub("", text)
     t = re.sub(r"([,.!?;:])(\s*\1)+", r"\1", t)  # collapse doubled punctuation
     t = re.sub(r"\s+([,.!?;:])", r"\1", t)  # no space before punctuation
@@ -660,7 +748,7 @@ def _parse_scaled(words):
 
 def _parse_plain(words):
     """Greedy tens+ones chunks for runs without scales. Returns a list of
-    (original words, value); handles years: 'twenty twenty four' -> 20, 24."""
+    (original words, value): 'twenty twenty four' -> 20, 24."""
     chunks, cur_words, cur = [], [], 0
     has_tens, has_ones, started = False, False, False
     for orig in words:
@@ -677,7 +765,7 @@ def _parse_plain(words):
             chunks.append((cur_words, cur))
             cur, cur_words = v, [orig]
             has_tens, has_ones = True, False
-        elif has_tens and not has_ones:
+        elif has_tens and not has_ones and 1 <= v <= 9:
             cur += v
             has_ones = True
             cur_words.append(orig)
@@ -689,14 +777,32 @@ def _parse_plain(words):
     return chunks
 
 
+def _year(chunks):
+    """'nineteen ninety nine' / 'twenty twenty six' chunk pairs -> 1999 /
+    2026, else None. Only 17xx-20xx, so times like 'twelve thirty' stay."""
+    if len(chunks) != 2:
+        return None
+    (w0, hi), (_w1, lo) = chunks
+    if len(w0) == 1 and 17 <= hi <= 20 and 10 <= lo <= 99:
+        return hi * 100 + lo
+    return None
+
+
 def numbers_to_digits(text, all_digits=False):
     """'four thousand eight hundred and twenty one' -> '4821'. By default
     only values over ten become digits (zero..ten stay words); with
     all_digits every number does — except a lone 'a', which stays an
-    article."""
+    article. 'one hundred fifty million' -> '150 million'; a scale word
+    with no number words ('150 million') is left alone."""
 
     def is_lone_a(words):
         return len(words) == 1 and words[0].lower() == "a"
+
+    def value_of(words):
+        if any(w.lower() in _NUM_SCALES for w in words):
+            return _parse_scaled(words)
+        chunks = _parse_plain([w for w in words if w.lower() != "and"])
+        return chunks[0][1] if chunks and len(chunks) == 1 else None
 
     def repl(m):
         span = m.group(0)
@@ -712,7 +818,19 @@ def numbers_to_digits(text, all_digits=False):
             return span
         if re.search(r"hundred|thousand|million|billion", core,
                      re.IGNORECASE):
-            words = re.split(r"[\s-]+", core)
+            words = [w for w in re.split(r"[\s-]+", core) if w]
+            low = [w.lower() for w in words]
+            if not any(_tok_val(w) is not None for w in low):
+                return span  # bare scale word, e.g. after digits
+            if low[-1] in ("million", "billion") and not any(
+                    w in ("million", "billion") for w in low[:-1]):
+                head = words[:-1]
+                if is_lone_a([w for w in head if w.lower() != "and"]):
+                    return span  # "a million"
+                mult = value_of(head)
+                if mult is None:
+                    return span
+                return pre + f"{mult} {words[-1]}" + post
             v = _parse_scaled(words)
             if v is None:
                 return span
@@ -733,6 +851,10 @@ def numbers_to_digits(text, all_digits=False):
             chunks = _parse_plain(words)
             if chunks is None:
                 return span
+            year = _year(chunks)
+            if year is not None:
+                out.append(str(year))
+                continue
             out.append(" ".join(
                 str(v) if (v > 10 or (all_digits and not is_lone_a(ws)))
                 else " ".join(ws)
@@ -760,16 +882,17 @@ def insertion_mode():
 
 
 def type_ydotool(text):
-    os.environ.setdefault("YDOTOOLD_SOCKET", "/run/user/1000/.ydotool_socket")
     try:
         r = subprocess.run(["ydotool", "type", "--", text],
                            capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             log("typed via ydotool:", text[:80])
-        else:
-            log("ydotool type failed:", (r.stderr or "").strip()[:200])
+            return
+        log("ydotool type failed:", (r.stderr or "").strip()[:200])
     except Exception as e:
         log("ydotool type error:", e)
+    notify_stt("Typing failed", "Is squelch-ydotoold running?",
+               urgency="normal")
 
 
 def clipboard_only(text):
@@ -779,10 +902,10 @@ def clipboard_only(text):
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=10, check=True)
         log("copied to clipboard:", text[:80])
-        notify_stt("Squelch: copied",
-                   (text[:120] + "…") if len(text) > 120 else text)
+        notify_stt("Copied", (text[:120] + "…") if len(text) > 120 else text)
     except Exception as e:
         log("clipboard copy failed:", e)
+        notify_stt("Copy failed", str(e)[:120], urgency="normal")
 
 
 def output_text(text):
@@ -800,6 +923,7 @@ def output_text(text):
 # QWERTY and Colemak, so the keycode still means "v".
 CTRL_V_CLASSES = ("zen", "firefox", "librewolf", "floorp", "chromium",
                   "google-chrome", "brave-browser", "vivaldi-stable", "opera")
+CTRL_V_PREFIXES = ("crx_",)  # Chromium/Brave installed web apps
 PASTE_SHIFT_INSERT = ["42:1", "110:1", "110:0", "42:0"]  # LEFTSHIFT, INSERT
 PASTE_CTRL_V = ["29:1", "47:1", "47:0", "29:0"]          # LEFTCTRL, V
 
@@ -859,10 +983,9 @@ def paste_text(text):
     text. Shift+Insert uses no letter keys, so it pastes correctly under any
     layout. The previous clipboard content is saved and restored.
     """
-    os.environ.setdefault("YDOTOOLD_SOCKET", "/run/user/1000/.ydotool_socket")
     fix_wayland_env()
     wclass = active_window_class()
-    if wclass in CTRL_V_CLASSES:
+    if wclass in CTRL_V_CLASSES or (wclass or "").startswith(CTRL_V_PREFIXES):
         chord, chord_name = PASTE_CTRL_V, "Ctrl+V"
     else:
         chord, chord_name = PASTE_SHIFT_INSERT, "Shift+Insert"
@@ -878,6 +1001,8 @@ def paste_text(text):
                        timeout=10, check=True)
     except Exception as e:
         log("clipboard write failed:", e)
+        notify_stt("Paste failed", "Couldn't reach the clipboard.",
+                   urgency="normal")
         return
     time.sleep(0.25)
     try:
@@ -885,9 +1010,13 @@ def paste_text(text):
                            capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             log("paste keystroke failed:", (r.stderr or "").strip()[:200])
+            notify_stt("Paste failed", "Text is on the clipboard.",
+                       urgency="normal")
             return
     except Exception as e:
         log("paste keystroke error:", e)
+        notify_stt("Paste failed", "Text is on the clipboard.",
+                   urgency="normal")
         return
     log(f"pasted via clipboard+{chord_name} ({wclass or 'unknown'}):",
         text[:80])
@@ -947,10 +1076,21 @@ def resume_players(names):
 
 
 def start_recording(target, path):
-    return subprocess.Popen(
-        ["pw-record", "--target", target, "--rate", str(SR),
-         "--channels", str(MIC_CHANNELS), "--format", "s16", path],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """pw-record from target (None: the default source)."""
+    cmd = ["pw-record", "--rate", str(SR), "--channels", str(MIC_CHANNELS),
+           "--format", "s16", path]
+    if target:
+        cmd[1:1] = ["--target", target]
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+
+
+def stop_recording(proc):
+    try:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
 
 
 def raw_frames(path):
@@ -973,19 +1113,15 @@ def capture_dead(path, seconds):
 
 def probe_mic(seconds=1.5):
     """Record a throwaway clip; True if the mic delivers real-time audio."""
-    target = find_mic_target()
-    if target is None:
+    mic = find_mic()
+    if mic is None:
         return False
     fd, path = tempfile.mkstemp(suffix="-probe.wav")
     os.close(fd)
     try:
-        proc = start_recording(target, path)
+        proc = start_recording(mic["target"], path)
         time.sleep(seconds)
-        try:
-            proc.send_signal(signal.SIGTERM)
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
+        stop_recording(proc)
         return not capture_dead(path, seconds)
     finally:
         try:
@@ -1004,40 +1140,41 @@ def mic_resetting():
 def recover_mic(reason):
     """A USB mic's audio can wedge across suspend (video keeps working) and
     only losing power clears it. Have the root helper power-cycle its USB
-    port, then re-probe; if that didn't take (port can't switch power),
-    tell the user to replug instead of eating dictations as "no speech"."""
+    port, then re-probe; if that didn't take (port can't switch power, or
+    the mic isn't USB), tell the user to replug instead of eating
+    dictations as "no speech"."""
     if not _mic_reset_lock.acquire(blocking=False):
         return
     try:
-        log(f"mic dead ({reason}), power-cycling its USB port")
-        notify_stt("Squelch: mic wedged, resetting",
-                   "Power-cycling the webcam. Try again in ~15 seconds.",
-                   urgency="normal")
+        mic = find_mic()
+        usb = (mic or {}).get("usb") or _last_mic_usb["id"]
+        if usb is None:
+            log(f"mic dead ({reason}), not a USB device: can't reset it")
+            notify_stt("Mic not responding", "Check the mic in Settings.",
+                       urgency="critical")
+            return
+        log(f"mic dead ({reason}), power-cycling USB device {usb}")
+        notify_stt("Resetting mic", "Try again in 15 s.", urgency="normal")
         try:
             r = subprocess.run(
                 ["systemctl", "start", "--no-ask-password",
-                 "squelch-mic-reset.service"],
+                 f"squelch-mic-reset@{usb}.service"],
                 capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 log("squelch-mic-reset failed:", r.stderr.strip())
         except Exception as e:
             log("squelch-mic-reset failed:", e)
         deadline = time.time() + 15
-        while find_mic_target() is None and time.time() < deadline:
+        while find_mic() is None and time.time() < deadline:
             time.sleep(1)
-        time.sleep(1)
+        time.sleep(2)  # PipeWire needs a moment before the node records
         if probe_mic():
             log("mic recovered")
-            notify_stt("Squelch: mic is back",
-                       "The webcam was reset. Dictation works again.",
+            notify_stt("Mic is back", "Dictation works again.",
                        urgency="normal")
         else:
             log("mic still dead after port power-cycle")
-            notify_stt("Squelch: replug the webcam",
-                       "Its mic is dead and power-cycling the USB port "
-                       "didn't fix it. Unplug and replug the camera. To make "
-                       "this automatic, plug it into a dock or hub port: "
-                       "motherboard ports usually can't cut power.",
+            notify_stt("Mic still dead", "Unplug it and plug it back in.",
                        urgency="critical")
     finally:
         _mic_reset_lock.release()
@@ -1074,7 +1211,7 @@ def find_kanata_device():
     override = os.environ.get("STT_INPUT_DEVICE")
     if override:  # debugging hook: listen on an arbitrary device instead
         return evdev.InputDevice(override)
-    for path in sorted(__import__("glob").glob("/dev/input/event*")):
+    for path in sorted(glob.glob("/dev/input/event*")):
         try:
             d = evdev.InputDevice(path)
         except OSError:
@@ -1089,18 +1226,38 @@ def find_kanata_device():
     return None
 
 
-def process_utterance(raw_path):
+def notify_engine_down():
+    if engine_available():
+        return False
+    notify_stt("Squelch paused",
+               "Models are unloaded while a game is fullscreen."
+               if gaming() else "Speech engine isn't running.")
+    return True
+
+
+def gaming():
+    try:
+        with open(STATE_FILE) as f:
+            return bool(json.load(f).get("gaming"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def process_utterance(raw_path, record=True, max_s=None):
+    """DSP + transcribe + clean up text. record=False skips stats, the
+    archive and vocabulary learning (for --process). Deletes raw_path."""
     t0 = time.time()
     with tempfile.NamedTemporaryFile(suffix="-clean.wav",
                                      delete=False) as f:
         clean_path = f.name
+    stats = log_stats if record else (lambda _entry: None)
     try:
-        info = beamform_and_clean(raw_path, clean_path)
+        info = beamform_and_clean(raw_path, clean_path, max_s=max_s)
         if info is None:
             log("utterance empty after cleanup, skipping")
-            log_stats({"outcome": "skipped", "engine": current_engine(),
-                       "audio_s": 0.0, "words": 0, "transcribe_s": 0.0,
-                       "dsp_s": round(time.time() - t0, 3)})
+            stats({"outcome": "skipped", "engine": current_engine(),
+                   "audio_s": 0.0, "words": 0, "transcribe_s": 0.0,
+                   "dsp_s": round(time.time() - t0, 3)})
             return ""
         log(f"cleaned {info['seconds']:.2f}s in {time.time()-t0:.2f}s")
         t1 = time.time()
@@ -1109,12 +1266,13 @@ def process_utterance(raw_path):
             text = transcribe(clean_path, engine)
         except Exception as e:
             log(f"[{engine}] transcribe failed: {e}")
-            notify_stt("STT engine unavailable",
-                       "Speech models are unloaded (game mode?) — recording discarded.")
-            log_stats({"outcome": "failed", "engine": engine,
-                       "audio_s": round(info["seconds"], 2), "words": 0,
-                       "transcribe_s": 0.0,
-                       "dsp_s": round(time.time() - t0, 3)})
+            if not notify_engine_down():
+                notify_stt("Transcription failed", str(e)[:120],
+                           urgency="normal")
+            stats({"outcome": "failed", "engine": engine,
+                   "audio_s": round(info["seconds"], 2), "words": 0,
+                   "transcribe_s": 0.0,
+                   "dsp_s": round(time.time() - t0, 3)})
             return ""
         transcribe_s = time.time() - t1
         do_defill, do_numbers, do_all = text_filters()
@@ -1124,16 +1282,17 @@ def process_utterance(raw_path):
             text = numbers_to_digits(text, all_digits=do_all)
         text = apply_dictionary(text)
         log(f"[{engine}] transcribed in {transcribe_s:.2f}s: {text[:120]!r}")
-        meta = {"ts": t0, "engine": engine,
-                "audio_s": round(info["seconds"], 2),
-                "words": len(text.split()), "text": text}
-        archive_utterance(raw_path, clean_path, meta)
-        maybe_adapt_vocab(text)
-        log_stats({"outcome": "ok" if text else "empty", "engine": engine,
-                   "audio_s": round(info["seconds"], 2),
-                   "words": len(text.split()),
-                   "transcribe_s": round(transcribe_s, 3),
-                   "dsp_s": round(time.time() - t0, 3)})
+        if record:
+            meta = {"ts": t0, "engine": engine,
+                    "audio_s": round(info["seconds"], 2),
+                    "words": len(text.split()), "text": text}
+            archive_utterance(raw_path, clean_path, meta)
+            maybe_adapt_vocab(text)
+        stats({"outcome": "ok" if text else "empty", "engine": engine,
+               "audio_s": round(info["seconds"], 2),
+               "words": len(text.split()),
+               "transcribe_s": round(transcribe_s, 3),
+               "dsp_s": round(time.time() - t0, 3)})
         return text
     finally:
         for p in (raw_path, clean_path):
@@ -1143,9 +1302,41 @@ def process_utterance(raw_path):
                 pass
 
 
+def utterance_worker(jobs):
+    """Transcribe and insert utterances in order, off the key-reading loop,
+    so a new hold starts recording at once even while the last one is
+    still being pasted."""
+    while True:
+        rec_path, held = jobs.get()
+        try:
+            text = process_utterance(rec_path, max_s=MAX_HOLD_S)
+            if held > MAX_HOLD_S:
+                notify_stt("Dictation cut short",
+                           f"Only the first {MAX_HOLD_S / 60:.0f} minutes "
+                           "were kept.", urgency="normal")
+            if text:
+                if os.environ.get("STT_DRY_RUN"):
+                    log(f"DRYRUN would type: {text[:120]!r}")
+                else:
+                    output_text(text + " ")
+            else:
+                log("no speech, typing nothing")
+        except Exception as e:
+            log("utterance failed:", e)
+
+
+def discard(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def main():
-    busy = False
     threading.Thread(target=watch_resume, daemon=True).start()
+    jobs = queue.Queue()
+    threading.Thread(target=utterance_worker, args=(jobs,),
+                     daemon=True).start()
     while True:
         dev = find_kanata_device()
         if dev is None:
@@ -1153,95 +1344,77 @@ def main():
             time.sleep(2)
             continue
         log(f"listening on {dev.path} ({dev.name})")
-        rec_proc = None
-        rec_path = None
-        rec_paused = []
-        press_t = 0.0
+        rec = None  # {"proc", "path", "paused", "t", "cap"} while holding
         try:
             for ev in dev.read_loop():
                 if ev.type != evdev.ecodes.EV_KEY or ev.code != F24:
                     continue
-                if ev.value == 1:  # hold started (kanata fires F24 on Menu hold)
-                    if busy:
-                        log("busy, ignoring press")
-                        continue
-                    if not engine_available():
+                if ev.value == 1 and rec is None:  # hold started
+                    if notify_engine_down():
                         log("engine unavailable, ignoring press")
-                        notify_stt("STT engine unavailable",
-                                   "Speech models are unloaded (game mode?)")
                         continue
                     if mic_resetting():
                         log("mic reset in progress, ignoring press")
                         continue
                     paused = playing_players()
                     pause_players(paused)
-                    target = find_mic_target()
-                    if target is None:
+                    mic = find_mic()
+                    if mic is None:
                         log("mic not found, ignoring press")
                         resume_players(paused)
                         recover_mic_async("not found")
                         continue
-                    fd, rec_path = tempfile.mkstemp(suffix="-raw.wav")
+                    fd, path = tempfile.mkstemp(suffix="-raw.wav")
                     os.close(fd)
-                    rec_proc = start_recording(target, rec_path)
-                    rec_paused = paused
-                    press_t = time.time()
+                    proc = start_recording(mic["target"], path)
+                    # A stuck or forgotten key stops recording at the cap.
+                    cap = threading.Timer(MAX_HOLD_S, stop_recording, [proc])
+                    cap.daemon = True
+                    cap.start()
+                    rec = {"proc": proc, "path": path, "paused": paused,
+                           "t": time.time(), "cap": cap}
                     log("recording...")
-                elif ev.value == 0 and rec_proc is not None:  # released
-                    held = time.time() - press_t
-                    try:
-                        rec_proc.send_signal(signal.SIGTERM)
-                        rec_proc.wait(timeout=5)
-                    except Exception:
-                        rec_proc.kill()
-                    rec_proc = None
-                    resume_players(rec_paused)
-                    rec_paused = []
+                elif ev.value == 0 and rec is not None:  # released
+                    held = time.time() - rec["t"]
+                    rec["cap"].cancel()
+                    stop_recording(rec["proc"])
+                    resume_players(rec["paused"])
+                    path, rec = rec["path"], None
                     if held < MIN_HOLD_S:
                         log(f"tap ({held:.2f}s), ignoring")
-                        try:
-                            os.unlink(rec_path)
-                        except OSError:
-                            pass
+                        discard(path)
                         continue
-                    if held > MAX_HOLD_S:
-                        log("over max hold, discarding")
-                        try:
-                            os.unlink(rec_path)
-                        except OSError:
-                            pass
-                        continue
-                    if capture_dead(rec_path, held):
-                        log(f"recording got {raw_frames(rec_path)} frames "
+                    if capture_dead(path, min(held, MAX_HOLD_S)):
+                        log(f"recording got {raw_frames(path)} frames "
                             f"in {held:.1f}s (mic wedged?)")
                         recover_mic_async("short capture")
-                        try:
-                            os.unlink(rec_path)
-                        except OSError:
-                            pass
-                        rec_path = None
+                        discard(path)
                         continue
-                    busy = True
-                    try:
-                        text = process_utterance(rec_path)
-                        if text:
-                            if os.environ.get("STT_DRY_RUN"):
-                                log(f"DRYRUN would type: {text[:120]!r}")
-                            else:
-                                output_text(text + " ")
-                        else:
-                            log("no speech, typing nothing")
-                    finally:
-                        busy = False
-                        rec_path = None
+                    if held > MAX_HOLD_S:
+                        log(f"held {held:.0f}s, keeping the first "
+                            f"{MAX_HOLD_S:.0f}s")
+                    jobs.put((path, held))
         except OSError as e:
             log(f"device lost ({e}), re-discovering")
+            if rec is not None:
+                rec["cap"].cancel()
+                stop_recording(rec["proc"])
+                resume_players(rec["paused"])
+                discard(rec["path"])
             time.sleep(1)
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--process":
-        text = process_utterance(sys.argv[2])
+        # Work on a copy: process_utterance deletes what it's given.
+        fd, tmp = tempfile.mkstemp(suffix="-raw.wav")
+        os.close(fd)
+        try:
+            shutil.copyfile(sys.argv[2], tmp)
+            text = process_utterance(tmp, record=False)
+        except (OSError, ValueError, wave.Error, EOFError) as e:
+            discard(tmp)
+            sys.exit(f"can't process {sys.argv[2]}: {e}")
         print("RESULT:", text)
     elif sys.argv[1:] == ["--probe-mic"]:
         ok = probe_mic()

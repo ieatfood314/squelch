@@ -1,10 +1,12 @@
 // Let squelch-ptt (a user service, so not in a logind session) start the
-// root oneshot that power-cycles the webcam's USB port. The unit takes no
-// arguments and only touches that one port.
+// root oneshot that power-cycles its mic's USB port. Only wheel users, and
+// the helper refuses anything that isn't a USB audio device.
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        action.lookup("unit") == "squelch-mic-reset.service" &&
-        action.lookup("verb") == "start") {
+        /^squelch-mic-reset@[0-9]+-[0-9]+(\.[0-9]+)*\.service$/.test(
+            action.lookup("unit")) &&
+        action.lookup("verb") == "start" &&
+        subject.isInGroup("wheel")) {
         return polkit.Result.YES;
     }
 });

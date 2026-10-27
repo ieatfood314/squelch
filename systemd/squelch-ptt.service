@@ -1,7 +1,6 @@
 [Unit]
-Description=STT push-to-talk (trigger hold -> mic array -> GPU -> paste)
-After=squelch-whisper.service pipewire.service kanata.service
-Wants=squelch-whisper.service
+Description=STT push-to-talk (trigger hold -> mic -> GPU -> paste)
+After=pipewire.service
 
 [Service]
 ExecStart=/usr/bin/squelch-ptt
@@ -10,7 +9,7 @@ RestartSec=2
 Nice=-5
 # WAYLAND_DISPLAY comes from the imported session env; squelch-ptt also
 # discovers the live socket itself so paste works even when started early.
-Environment=YDOTOOLD_SOCKET=/run/user/1000/.ydotool_socket
+# The engines are started by squelch-vram, not here.
 
 [Install]
 WantedBy=default.target

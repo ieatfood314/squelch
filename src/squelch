@@ -12,6 +12,7 @@
 
 No restarts needed: the daemon picks up dictionary changes immediately.
 """
+import fcntl
 import json
 import os
 import sys
@@ -19,6 +20,10 @@ import sys
 DICT_FILE = os.path.expanduser("~/.config/squelch/dictionary.json")
 TRAY_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                          "squelch-tray")
+
+
+DICT_HELP = ("Your words. 'term' is the correct spelling. 'also_match' lists "
+             "ways the engine mishears it, fixed automatically.")
 
 
 def load():
@@ -29,11 +34,20 @@ def load():
         return []
 
 
-def save(entries):
+def update(change):
+    """Read fresh, apply change(entries), save atomically, all under the
+    lock the tray uses too, so neither clobbers the other's edits."""
     os.makedirs(os.path.dirname(DICT_FILE), exist_ok=True)
-    with open(DICT_FILE, "w") as f:
-        json.dump({"_help": "Your words.", "entries": entries},
-                  f, indent=2, ensure_ascii=False)
+    with open(DICT_FILE + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        entries = load()
+        result = change(entries)
+        tmp = f"{DICT_FILE}.tmp-{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump({"_help": DICT_HELP, "entries": entries},
+                      f, indent=2, ensure_ascii=False)
+        os.replace(tmp, DICT_FILE)
+    return result
 
 
 def find(entries, term):
@@ -74,11 +88,6 @@ def ai_suggest(term):
 
 
 def cmd_add(term, heard, use_ai):
-    entries = load()
-    e = find(entries, term)
-    if e is None:
-        e = {"term": term, "also_match": []}
-        entries.append(e)
     if use_ai and not heard:
         if not has_key():
             print("(no OpenRouter key — adding without suggestions)")
@@ -91,8 +100,15 @@ def cmd_add(term, heard, use_ai):
             except Exception as ex:
                 print(f"suggestion failed ({ex}) — adding term only")
                 heard = []
-    added = merge_heard(e, heard)
-    save(entries)
+
+    def change(entries):
+        e = find(entries, term)
+        if e is None:
+            e = {"term": term, "also_match": []}
+            entries.append(e)
+        return e, merge_heard(e, heard)
+
+    e, added = update(change)
     print(f"{e['term']}: {len(e.get('also_match', []))} mishearing(s)"
           + (f" (+{added} new)" if added else " (nothing new)"))
 
@@ -108,13 +124,16 @@ def cmd_list():
 
 
 def cmd_remove(term):
-    entries = load()
-    e = find(entries, term)
+    def change(entries):
+        e = find(entries, term)
+        if e is not None:
+            entries.remove(e)
+        return e
+
+    e = update(change)
     if e is None:
         print(f"not in dictionary: {term}")
         return 1
-    entries.remove(e)
-    save(entries)
     print(f"removed: {e.get('term')}")
     return 0
 
