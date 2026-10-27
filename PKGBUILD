@@ -1,6 +1,6 @@
 # Maintainer: Aidan Heeney <aidan.heeney@proton.me>
 pkgname=squelch
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=1
 pkgdesc='Push-to-talk speech-to-text on GPU: Parakeet/Whisper, mic-array beamforming, Menu-key dictation'
 arch=('x86_64')
@@ -13,13 +13,13 @@ makedepends=('git' 'cmake' 'vulkan-headers' 'spirv-headers')
 optdepends=('aspell-en: learn your vocabulary for Whisper')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "whisper.cpp::git+https://github.com/ggml-org/whisper.cpp.git#commit=0c7be696371069e0baa2515ed7aa08d5a5473aa6")
-sha256sums=('62383fc426515fb07dbb7c4722c8ff19a7bc6b5ee91f2a40b497384b96bb2c6c'
+sha256sums=('921276d5f788db4cee746a04168d65bd6e3b42eb323d02c80c63e129df904b65'
             'SKIP')
 options=('!debug')
 
 build() {
   cmake -S "$srcdir/whisper.cpp" -B "$srcdir/build" \
-    -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+    -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_SKIP_RPATH=ON
   cmake --build "$srcdir/build" --config Release -j"$(nproc)" \
     --target whisper-server whisper-cli parakeet-cli
 }

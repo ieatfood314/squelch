@@ -117,7 +117,9 @@ class GameWatch:
         runtime = os.environ.get("XDG_RUNTIME_DIR",
                                  f"/run/user/{os.getuid()}")
         self.script_path = os.path.join(runtime, SCRIPT_NAME + ".js")
+        self.following = threading.Event()
         threading.Thread(target=self._follow, daemon=True).start()
+        self.following.wait(5)
 
     def _follow(self):
         while True:
@@ -127,6 +129,8 @@ class GameWatch:
                      "_COMM=kwin_wayland", "-o", "cat"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     text=True)
+                time.sleep(0.5)  # let journalctl reach the journal's end
+                self.following.set()
                 for line in p.stdout:
                     if line.startswith(TAG + " "):
                         rest = line[len(TAG):].strip().strip("[]")
@@ -162,16 +166,18 @@ class GameWatch:
                                        "not_games": json.dumps(NOT_GAMES)})
             self._qdbus("/Scripting", "org.kde.kwin.Scripting.unloadScript",
                         SCRIPT_NAME)
+            # Reset before running: the script reports straight away, and
+            # resetting after could wipe that first (and only) report.
+            self._update([])
+            with self.lock:
+                self.reported = False
+            self.loaded_at = time.monotonic()
             sid = self._qdbus("/Scripting",
                               "org.kde.kwin.Scripting.loadScript",
                               self.script_path, SCRIPT_NAME)
             if not sid or not sid.lstrip("-").isdigit() or int(sid) < 0:
                 raise RuntimeError(f"loadScript returned {sid!r}")
             self._qdbus(f"/Scripting/Script{sid}", "org.kde.kwin.Script.run")
-            with self.lock:
-                self.reported = False
-                self.apps = []
-            self.loaded_at = time.monotonic()
             log("fullscreen watcher loaded into KWin")
         except Exception as e:
             log("can't load the KWin script (assuming no game):", e)
