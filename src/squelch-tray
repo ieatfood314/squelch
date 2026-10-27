@@ -24,7 +24,8 @@ from PyQt6.QtCore import (QSocketNotifier, QTimer, Qt, pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor,
                          QGuiApplication, QIcon, QPainter, QPixmap)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication,
-                             QButtonGroup, QCheckBox, QComboBox, QDialog, QHBoxLayout, QHeaderView,
+                             QButtonGroup, QCheckBox, QComboBox, QDialog,
+                             QDoubleSpinBox, QHBoxLayout, QHeaderView,
                              QLabel, QLineEdit, QListWidget, QMenu,
                              QPushButton, QRadioButton, QSystemTrayIcon,
                              QTabWidget, QTableWidget, QTableWidgetItem,
@@ -40,6 +41,11 @@ INSERTION_FILE = os.path.join(CONFIG_DIR, "insertion.json")
 HOTKEY_FILE = os.path.join(CONFIG_DIR, "hotkey")
 ENGINES_ENV = os.path.join(CONFIG_DIR, "engines.env")
 MIC_FILE = os.path.join(CONFIG_DIR, "mic")
+VRAM_FILE = os.path.join(CONFIG_DIR, "vram.json")
+DEFAULT_HEADROOM_GB = 1.0
+# Same limits squelch-ptt applies: Parakeet's cap comes from free VRAM,
+# Whisper only has the stuck-key ceiling.
+STUCK_KEY_S, MIN_CAP_S = 900.0, 30.0
 KANATA_CFG = os.path.expanduser("~/.config/kanata/kanata.kbd")
 HOTKEYS = (("menu", "Menu"),
            ("caps", "Caps Lock"),
@@ -96,9 +102,12 @@ QPushButton {{ background: transparent; border: 1px solid {BORDER};
 QPushButton:hover, QPushButton:focus {{ border-color: {STEEL_FOCUS}; }}
 QPushButton:pressed {{ background: {STEEL}; }}
 QPushButton:disabled {{ color: {FAINT}; }}
-QLineEdit, QComboBox {{ background: rgba(0, 0, 0, 0.5);
+QLineEdit, QComboBox, QDoubleSpinBox {{ background: rgba(0, 0, 0, 0.5);
     border: 1px solid {BORDER}; border-radius: 6px; padding: 4px 6px; }}
-QLineEdit:focus, QComboBox:focus {{ border-color: {STEEL_FOCUS}; }}
+QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {{
+    border-color: {STEEL_FOCUS}; }}
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 0;
+    border: none; }}
 QComboBox QAbstractItemView {{ background: {POPOVER};
     selection-background-color: {STEEL}; border: 1px solid {BORDER}; }}
 QListWidget, QTableWidget {{ background: rgba(0, 0, 0, 0.5);
@@ -244,6 +253,37 @@ def write_mic(name):
             os.unlink(MIC_FILE)
         except OSError:
             pass
+
+
+def read_headroom_gb():
+    d = read_json(VRAM_FILE, {})
+    try:
+        return max(0.0, float(d.get("headroom_gb", DEFAULT_HEADROOM_GB)))
+    except (AttributeError, TypeError, ValueError):
+        return DEFAULT_HEADROOM_GB
+
+
+def write_headroom_gb(gb):
+    atomic_write(VRAM_FILE, json.dumps({"headroom_gb": round(gb, 2)}))
+
+
+def duration(seconds):
+    return (f"{seconds:.0f} s" if seconds < 120
+            else f"{seconds / 60:.1f} min".replace(".0 min", " min"))
+
+
+def longest_dictation():
+    """What squelch-ptt would allow right now, or "" if unknown."""
+    if read_engine() != "parakeet":
+        return duration(STUCK_KEY_S)
+    url = (f"http://127.0.0.1:{ENGINE_PORTS['parakeet']}/limits"
+           f"?headroom_mb={read_headroom_gb() * 1024:.0f}")
+    try:
+        with urllib.request.urlopen(url, timeout=1) as r:
+            fit = float(json.loads(r.read())["max_seconds"])
+    except Exception:
+        return ""
+    return duration(min(STUCK_KEY_S, max(MIN_CAP_S, fit)))
 
 
 def list_mics():
@@ -920,6 +960,20 @@ class SettingsWindow(QWidget):
         dlrow.addWidget(self.dl_status, 1)
         lay.addLayout(dlrow)
 
+        vrow = QHBoxLayout()
+        vrow.addWidget(label("VRAM headroom"), 1)
+        self.headroom = QDoubleSpinBox()
+        self.headroom.setRange(0.0, 8.0)
+        self.headroom.setSingleStep(0.25)
+        self.headroom.setDecimals(2)
+        self.headroom.setSuffix(" GB")
+        self.headroom.valueChanged.connect(self.headroom_changed)
+        vrow.addWidget(self.headroom)
+        self.longest = label("", "dim")
+        self.longest.setMinimumWidth(170)
+        vrow.addWidget(self.longest)
+        lay.addLayout(vrow)
+
         lay.addWidget(label("Microphone", "heading"))
         self.mic_combo = QComboBox()
         self.mic_combo.currentIndexChanged.connect(self.mic_changed)
@@ -981,6 +1035,7 @@ class SettingsWindow(QWidget):
                    if not os.path.exists(models.get(k, ""))]
         downloading = self.dl_status.text() == "Downloading…"
         self.dl_btn.setVisible(bool(missing) or downloading)
+        self.dl_status.setVisible(bool(missing) or downloading)
         self.dl_btn.setEnabled(bool(missing) and not downloading)
         if not downloading and not self.dl_status.text().startswith(
                 "Download failed"):
@@ -1007,7 +1062,23 @@ class SettingsWindow(QWidget):
 
     def _dl_finished(self, msg):
         self.dl_status.setText(msg)
+        self.dl_status.show()
         self.refresh_models()
+
+    def headroom_changed(self, gb):
+        write_headroom_gb(gb)
+        self.refresh_longest()
+
+    def refresh_headroom(self):
+        self.headroom.blockSignals(True)
+        self.headroom.setValue(read_headroom_gb())
+        self.headroom.blockSignals(False)
+        self.refresh_longest()
+
+    def refresh_longest(self):
+        longest = longest_dictation()
+        self.longest.setText(f"Longest dictation {longest}" if longest
+                             else "")
 
     def refresh_mics(self):
         cur = read_mic()
@@ -1045,6 +1116,7 @@ class SettingsWindow(QWidget):
 
     def refresh_setup(self):
         self.refresh_models()
+        self.refresh_longest()
         self.refresh_mics()
         self.refresh_services()
 
@@ -1340,6 +1412,7 @@ class SettingsWindow(QWidget):
         self.load_dict()
         self.refresh_or_status()
         self.refresh_analytics()
+        self.refresh_headroom()
         self.refresh_setup()
         self.tabs.setCurrentIndex(tab)
         self.show()

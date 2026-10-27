@@ -66,9 +66,15 @@ detect). Game fullscreen unloads models automatically; dictating then shows
 one notification instead of failing silently. So do failed pastes and
 transcriptions.
 
-A dictation can run up to 2 minutes. Holding longer keeps the first 2
-minutes and tells you it was cut (Parakeet's VRAM use grows with clip
-length, so a stuck key can't balloon it).
+How long one dictation can run depends on free VRAM. Parakeet's working
+memory grows with the square of clip length (about 0.5 GB for 2 min,
+1.6 GB for 4 min, 4.6 GB for 6 min), so at each press Squelch allows the
+longest clip that still leaves the VRAM headroom free (Settings → Setup,
+default 1 GB; the longest dictation it allows right now is shown next to
+it). On an 8 GB card that's about 6 minutes. After a long clip the server
+reloads (0.2 s) to hand that memory back. Whisper works in 30 s windows,
+so it only has a 15-minute stuck-key ceiling. Holding past the cap keeps
+the first part and tells you it was cut.
 
 Optional archive for future training: put a directory in
 `~/.config/squelch/archive` (e.g. `echo ~/squelch-archive >
@@ -107,7 +113,7 @@ ports without it you get a "replug it" notification. `squelch-ptt
 - `polkit/` — lets wheel users' squelch-ptt start the mic-reset unit · `kanata/snippet.kbd` — Menu tap-hold wiring
 
 Runtime state lives in `~/.config/squelch/` (engine, filters, dictionary,
-mic, archive, stats, key). Models in `~/.local/share/whisper.cpp/models` and
+mic, archive, vram.json, stats, key). Models in `~/.local/share/whisper.cpp/models` and
 `~/.local/share/parakeet`.
 
 ## Uninstall

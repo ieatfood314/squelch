@@ -9,7 +9,7 @@ Usage:
   squelch-ptt                run the daemon (systemd user service does this)
   squelch-ptt --process F    DSP + transcribe file F, print result (no typing,
                              no stats or archive; F is left alone)
-  squelch-ptt --probe-mic    record 1.5 s, report whether the mic delivers audio
+  squelch-ptt --probe-mic    record 2.5 s, report whether the mic delivers audio
   squelch-ptt --reset-mic    power-cycle the mic's USB port and re-probe
 """
 import glob
@@ -344,10 +344,17 @@ def engine_available():
 
 SR = 16000
 MIN_HOLD_S = 0.20
-# Recording stops here even if the key stays down (stuck key, forgotten
-# hold). Parakeet's VRAM grows with clip length: +0.5 GB at 2 min, +2.7 GB
-# at 5 min, so cap it rather than spike the GPU.
-MAX_HOLD_S = 120.0
+# Recording stops at a cap even if the key stays down. Parakeet's working
+# VRAM grows with the square of clip length, so its cap is the longest clip
+# that fits in free VRAM while leaving the headroom from Settings free (the
+# server works that out). Whisper runs in 30 s windows, so only the
+# stuck-key ceiling applies to it.
+VRAM_FILE = os.path.expanduser("~/.config/squelch/vram.json")
+DEFAULT_HEADROOM_GB = 1.0
+STUCK_KEY_S = 900.0     # ceiling for any engine (a stuck or forgotten key)
+MIN_CAP_S = 30.0        # always allowed, even with VRAM tight
+FALLBACK_CAP_S = 120.0  # Parakeet up but free VRAM unknown
+PARAKEET_LIMITS_URL = "http://127.0.0.1:1894/limits"
 F24 = evdev.ecodes.KEY_F24  # 194, emitted by kanata while Menu is held
 
 
@@ -1101,17 +1108,19 @@ def raw_frames(path):
         return 0
 
 
-# pw-record takes ~0.1-0.2 s to attach; a healthy mic fills the rest. A
-# wedged mic delivers a few percent of real time, or nothing at all.
-CAPTURE_LATENCY_S = 0.3
+# A healthy mic loses ~0.3 s while pw-record wakes it from suspend, and a
+# C920 up to ~1.1 s on its first stream after a long idle or a power-cycle.
+# A wedged mic delivers a few percent of real time, or nothing at all. So
+# only judge clips of JUDGE_MIN_S or more, and only below a quarter of real
+# time; short holds right after idle used to trip a needless reset.
+JUDGE_MIN_S = 2.0
 
 
 def capture_dead(path, seconds):
-    expected = (seconds - CAPTURE_LATENCY_S) * SR
-    return expected > 0 and raw_frames(path) < 0.5 * expected
+    return seconds >= JUDGE_MIN_S and raw_frames(path) < 0.25 * seconds * SR
 
 
-def probe_mic(seconds=1.5):
+def probe_mic(seconds=2.5):
     """Record a throwaway clip; True if the mic delivers real-time audio."""
     mic = find_mic()
     if mic is None:
@@ -1302,18 +1311,47 @@ def process_utterance(raw_path, record=True, max_s=None):
                 pass
 
 
+def headroom_mb():
+    """VRAM to leave free, from ~/.config/squelch/vram.json (GB)."""
+    try:
+        with open(VRAM_FILE) as f:
+            gb = float(json.load(f).get("headroom_gb", DEFAULT_HEADROOM_GB))
+        return max(0.0, gb) * 1024
+    except (OSError, ValueError, TypeError, AttributeError):
+        return DEFAULT_HEADROOM_GB * 1024
+
+
+def max_hold_s(engine):
+    """Longest recording to allow for engine right now."""
+    if engine != "parakeet":
+        return STUCK_KEY_S
+    try:
+        url = f"{PARAKEET_LIMITS_URL}?headroom_mb={headroom_mb():.0f}"
+        with urllib.request.urlopen(url, timeout=1) as r:
+            fit = float(json.loads(r.read())["max_seconds"])
+    except Exception as e:
+        log("free VRAM unknown, using the fallback cap:", e)
+        return FALLBACK_CAP_S
+    return min(STUCK_KEY_S, max(MIN_CAP_S, fit))
+
+
+def duration(seconds):
+    return (f"{seconds:.0f} s" if seconds < 120
+            else f"{seconds / 60:.1f} min".replace(".0 min", " min"))
+
+
 def utterance_worker(jobs):
     """Transcribe and insert utterances in order, off the key-reading loop,
     so a new hold starts recording at once even while the last one is
     still being pasted."""
     while True:
-        rec_path, held = jobs.get()
+        rec_path, held, cap_s = jobs.get()
         try:
-            text = process_utterance(rec_path, max_s=MAX_HOLD_S)
-            if held > MAX_HOLD_S:
+            text = process_utterance(rec_path, max_s=cap_s)
+            if held > cap_s:
                 notify_stt("Dictation cut short",
-                           f"Only the first {MAX_HOLD_S / 60:.0f} minutes "
-                           "were kept.", urgency="normal")
+                           f"Kept the first {duration(cap_s)}.",
+                           urgency="normal")
             if text:
                 if os.environ.get("STT_DRY_RUN"):
                     log(f"DRYRUN would type: {text[:120]!r}")
@@ -1367,33 +1405,33 @@ def main():
                     fd, path = tempfile.mkstemp(suffix="-raw.wav")
                     os.close(fd)
                     proc = start_recording(mic["target"], path)
-                    # A stuck or forgotten key stops recording at the cap.
-                    cap = threading.Timer(MAX_HOLD_S, stop_recording, [proc])
+                    cap_s = max_hold_s(current_engine())
+                    cap = threading.Timer(cap_s, stop_recording, [proc])
                     cap.daemon = True
                     cap.start()
                     rec = {"proc": proc, "path": path, "paused": paused,
-                           "t": time.time(), "cap": cap}
-                    log("recording...")
+                           "t": time.time(), "cap": cap, "cap_s": cap_s}
+                    log(f"recording... (cap {duration(cap_s)})")
                 elif ev.value == 0 and rec is not None:  # released
                     held = time.time() - rec["t"]
                     rec["cap"].cancel()
                     stop_recording(rec["proc"])
                     resume_players(rec["paused"])
-                    path, rec = rec["path"], None
+                    path, cap_s, rec = rec["path"], rec["cap_s"], None
                     if held < MIN_HOLD_S:
                         log(f"tap ({held:.2f}s), ignoring")
                         discard(path)
                         continue
-                    if capture_dead(path, min(held, MAX_HOLD_S)):
+                    if capture_dead(path, min(held, cap_s)):
                         log(f"recording got {raw_frames(path)} frames "
                             f"in {held:.1f}s (mic wedged?)")
                         recover_mic_async("short capture")
                         discard(path)
                         continue
-                    if held > MAX_HOLD_S:
+                    if held > cap_s:
                         log(f"held {held:.0f}s, keeping the first "
-                            f"{MAX_HOLD_S:.0f}s")
-                    jobs.put((path, held))
+                            f"{cap_s:.0f}s")
+                    jobs.put((path, held, cap_s))
         except OSError as e:
             log(f"device lost ({e}), re-discovering")
             if rec is not None:

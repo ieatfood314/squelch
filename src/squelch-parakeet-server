@@ -5,16 +5,21 @@ Keeps ggml-parakeet-tdt-0.6b-v3 in VRAM and exposes a whisper-server-like
 HTTP API on 127.0.0.1:1894:
   POST /inference  multipart (file=<wav>, response_format=json) -> {"text": ...}
   GET  /health     -> 200 ok
+  GET  /limits?headroom_mb=N -> {"free_mb", "total_mb", "max_seconds"}:
+                   the longest clip whose working memory fits in free VRAM
+                   while leaving N MB free
 
 Only stdlib + numpy + the already-built libparakeet/libggml shared libs.
 """
 import ctypes
 import json
+import math
 import os
 import threading
 import time
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
@@ -23,6 +28,16 @@ MODEL = os.environ.get("SQUELCH_PARAKEET_MODEL") or os.path.expanduser(
     "~/.local/share/parakeet/ggml-parakeet-tdt-0.6b-v3-q8_0.bin")
 HOST, PORT = "127.0.0.1", 1894
 N_THREADS = 6
+# Working VRAM on top of the loaded model grows with the square of clip
+# length (attention): measured on an RX 5700 at +71 MB for 1 min, +0.46 GB
+# for 2 min, +1.6 GB for 4 min, +4.6 GB for 6 min, i.e. at most about
+# 0.035 MB per second squared. Past free VRAM it spills to system RAM and
+# runs about half as fast.
+MB_PER_S2 = 0.036
+# ggml keeps a clip's buffers until a bigger one needs more, so a long
+# dictation would sit on gigabytes while idle. Reload the context after
+# any clip that grew it past this, to hand the memory back.
+RELEASE_MB = 256
 
 
 def log(*a):
@@ -66,6 +81,17 @@ ggml = _load("libggml.so.0")
 ggml.ggml_backend_load_all.restype = None
 ggml.ggml_backend_load_all.argtypes = []
 ggml.ggml_backend_load_all()
+ggml.ggml_backend_dev_count.restype = ctypes.c_size_t
+ggml.ggml_backend_dev_count.argtypes = []
+ggml.ggml_backend_dev_get.restype = ctypes.c_void_p
+ggml.ggml_backend_dev_get.argtypes = [ctypes.c_size_t]
+ggml.ggml_backend_dev_type.restype = ctypes.c_int
+ggml.ggml_backend_dev_type.argtypes = [ctypes.c_void_p]
+ggml.ggml_backend_dev_memory.restype = None
+ggml.ggml_backend_dev_memory.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+    ctypes.POINTER(ctypes.c_size_t)]
+GGML_BACKEND_DEVICE_TYPE_GPU = 1
 
 lib = _load("libparakeet.so.1")
 lib.parakeet_context_default_params.restype = CtxParams
@@ -84,16 +110,55 @@ lib.parakeet_full_get_segment_text.argtypes = [ctypes.c_void_p, ctypes.c_int]
 lib.parakeet_free.restype = None
 lib.parakeet_free.argtypes = [ctypes.c_void_p]
 
+GPU_DEVICE = 0
+
+
+def load_context():
+    t0 = time.time()
+    cp = lib.parakeet_context_default_params()
+    cp.use_gpu = True
+    cp.gpu_device = GPU_DEVICE
+    ctx = lib.parakeet_init_from_file_with_params(MODEL.encode(), cp)
+    if not ctx:
+        raise SystemExit("failed to load parakeet model")
+    log(f"model ready in {time.time()-t0:.1f}s")
+    return ctx
+
+
+def gpu_memory_mb():
+    """(free, total) MB of the GPU we run on, as Vulkan reports it (memory
+    budget: other processes' use counts), or None without a GPU."""
+    gpus = 0
+    for i in range(ggml.ggml_backend_dev_count()):
+        dev = ggml.ggml_backend_dev_get(i)
+        if ggml.ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU:
+            continue
+        if gpus == GPU_DEVICE:
+            free, total = ctypes.c_size_t(), ctypes.c_size_t()
+            ggml.ggml_backend_dev_memory(dev, ctypes.byref(free),
+                                         ctypes.byref(total))
+            return free.value / 2**20, total.value / 2**20
+        gpus += 1
+    return None
+
+
+def working_mb(seconds):
+    return MB_PER_S2 * seconds * seconds
+
+
 log("loading model:", MODEL)
-t0 = time.time()
-cp = lib.parakeet_context_default_params()
-cp.use_gpu = True
-cp.gpu_device = 0
-CTX = lib.parakeet_init_from_file_with_params(MODEL.encode(), cp)
-if not CTX:
-    raise SystemExit("failed to load parakeet model")
-log(f"model ready in {time.time()-t0:.1f}s")
+CTX = load_context()
 LOCK = threading.Lock()
+
+
+def release_buffers():
+    """Reload the context so the oversized compute buffers go away.
+    Requests wait on LOCK meanwhile instead of failing."""
+    global CTX
+    with LOCK:
+        lib.parakeet_free(CTX)
+        CTX = None
+        CTX = load_context()
 
 
 def wav_to_float_mono(wav_bytes):
@@ -111,7 +176,7 @@ def wav_to_float_mono(wav_bytes):
 def transcribe(pcm):
     fp = lib.parakeet_full_default_params(0)  # PARAKEET_SAMPLING_GREEDY
     fp.n_threads = N_THREADS
-    arr = (ctypes.c_float * len(pcm))(*pcm)
+    arr = pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float))  # no copy
     t0 = time.time()
     with LOCK:  # not thread safe for same context
         rc = lib.parakeet_full(CTX, fp, arr, len(pcm))
@@ -133,13 +198,37 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def send_json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path == "/health":
+        url = urlparse(self.path)
+        if url.path == "/health":
             body = b"ok"
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif url.path == "/limits":
+            mem = gpu_memory_mb()
+            if mem is None:
+                self.send_json(503, {"error": "no GPU"})
+                return
+            free, total = mem
+            try:
+                headroom = float(parse_qs(url.query).get(
+                    "headroom_mb", ["1024"])[0])
+            except ValueError:
+                headroom = 1024.0
+            budget = max(0.0, free - headroom)
+            self.send_json(200, {
+                "free_mb": round(free), "total_mb": round(total),
+                "max_seconds": round(math.sqrt(budget / MB_PER_S2), 1)})
         else:
             self.send_response(404)
             self.end_headers()
@@ -163,20 +252,13 @@ class Handler(BaseHTTPRequestHandler):
             pcm = wav_to_float_mono(wav)
             text, dt = transcribe(pcm)
             log(f"transcribed {len(pcm)/16000:.2f}s audio in {dt:.2f}s: {text[:100]!r}")
-            body = json.dumps({"text": text}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_json(200, {"text": text})
+            if working_mb(len(pcm) / 16000) > RELEASE_MB:
+                log("long clip, reloading to free its VRAM")
+                threading.Thread(target=release_buffers, daemon=True).start()
         except Exception as e:
             log("inference error:", e)
-            body = json.dumps({"error": str(e)}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_json(500, {"error": str(e)})
 
 
 if __name__ == "__main__":
