@@ -7,6 +7,7 @@ stays loaded. Quitting the tray does NOT stop dictation.
 """
 import datetime
 import fcntl
+import glob
 import json
 import os
 import re
@@ -50,9 +51,6 @@ DEFAULT_HEADROOM_GB = 1.0
 # Whisper only has the stuck-key ceiling.
 STUCK_KEY_S, MIN_CAP_S = 900.0, 30.0
 KANATA_CFG = os.path.expanduser("~/.config/kanata/kanata.kbd")
-HOTKEYS = (("menu", "Menu"),
-           ("caps", "Caps Lock"),
-           ("scrlck", "Scroll Lock"))
 INSERTION_MODES = (
     ("paste", "Paste"),
     ("type", "Type keys (QWERTY only)"),
@@ -76,7 +74,14 @@ _NON_CHAT = ("embed", "tts", "whisper", "dall-e", "diffusion", "vision",
              "rerank", "moderation", "transcribe", "image", "audio")
 # nonsense example used in the prompt; never accepted as a suggestion
 _EXAMPLE_PHRASES = ("rye task", "wry tusk")
-F23 = evdev.ecodes.KEY_F23
+F23, F24 = evdev.ecodes.KEY_F23, evdev.ecodes.KEY_F24
+ESC = evdev.ecodes.KEY_ESC
+DEFAULT_HOTKEY = evdev.ecodes.KEY_COMPOSE  # Menu
+# A trigger press shorter than this is a tap, as in squelch-ptt and
+# kanata's tap-hold
+HOLD_DELAY_S = 0.25
+LEGACY_HOTKEYS = {"menu": "KEY_COMPOSE", "caps": "KEY_CAPSLOCK",
+                  "scrlck": "KEY_SCROLLLOCK"}
 ENGINES = [
     ("parakeet", "Parakeet · English"),
     ("whisper", "Whisper · other languages"),
@@ -450,9 +455,122 @@ def resolve_mishearing(term, heard, accept):
                                               ensure_ascii=False))
 
 
-# ---------------- kanata trigger key ----------------
+# ---------------- trigger key ----------------
 
-TRIGGER_RE = re.compile(r"\(\s*tap-hold\s+\d+\s+\d+\s+f23\s+f24\s*\)")
+# Keys with a kanata name: evdev name and kanata's name | label | kanata's
+# other spellings (so an existing defsrc is recognised). Letters, digits,
+# F-keys and numpad digits follow a rule and aren't listed. Any other key
+# still works without kanata.
+_KEY_TABLE = r"""
+GRAVE grv             | `               | Backquote ` grave
+MINUS min             | -               | Minus -
+EQUAL eql             | =               | Equal =
+BACKSPACE bspc        | Backspace       | Backspace bks
+TAB tab               | Tab             | Tab
+LEFTBRACE lbrc        | [               | BracketLeft [
+RIGHTBRACE rbrc       | ]               | BracketRight ]
+CAPSLOCK caps         | Caps Lock       | CapsLock
+SEMICOLON scln        | ;               | Semicolon ;
+APOSTROPHE apo        | '               | Quote apos '
+ENTER ret             | Enter           | Enter return ent enter
+LEFTSHIFT lsft        | Left Shift      | lshift ShiftLeft lshft shft sft
+COMMA comm            | ,               | Comma ,
+DOT .                 | .               | Period
+SLASH /               | /               | Slash
+BACKSLASH bksl        | \               | Backslash \
+CLEAR kp=             | Clear           | clr
+KPENTER kprt          | Numpad Enter    | NumpadEnter
+KPSLASH kp/           | Numpad /        | NumpadDivide
+KPPLUS kp+            | Numpad +        | NumpadAdd
+KPASTERISK kp*        | Numpad *        | NumpadMultiply
+KPEQUAL NumpadEqual   | Numpad =        |
+KPMINUS kp-           | Numpad -        | NumpadSubtract
+KPDOT kp.             | Numpad .        | NumpadDecimal
+KPCOMMA kp,           | Numpad ,        | NumpadComma
+KPLEFTPAREN leftparen | Numpad (        | NumpadLeftParen lpar kp(
+KPRIGHTPAREN rightparen| Numpad )        | NumpadRightParen rpar kp)
+SYSRQ prnt            | Print Screen    | ssrq sys PrintScreen prtsc
+102ND 102d            | ISO \           | IntlBackslash lsgt nubs nonusbslash <
+SCROLLLOCK scrlck     | Scroll Lock     | ScrollLock slck
+PAUSE pause           | Pause           | Pause break brk
+RIGHTSHIFT rsft       | Right Shift     | rshift ShiftRight RightShift rshft
+LEFTCTRL lctl         | Left Ctrl       | lctrl ControlLeft ctl
+LEFTALT lalt          | Left Alt        | AltLeft alt
+SPACE spc             | Space           | Space
+RIGHTALT ralt         | Right Alt       | AltRight altgr
+COMPOSE menu          | Menu            | ContextMenu comp cmps cmp apps
+LEFTMETA lmet         | Left Meta       | lmeta MetaLeft met
+RIGHTMETA rmet        | Right Meta      | rmeta MetaRight
+RIGHTCTRL rctl        | Right Ctrl      | rctrl ControlRight
+DELETE del            | Delete          | Delete
+INSERT ins            | Insert          | Insert
+BACK bck              | Back            | BrowserBack
+FORWARD fwd           | Forward         | BrowserForward
+PAGEUP pgup           | Page Up         | PageUp
+PAGEDOWN pgdn         | Page Down       | PageDown
+UP up                 | Up              | ArrowUp
+DOWN down             | Down            | ArrowDown
+LEFT left             | Left            | ArrowLeft lft
+RIGHT right           | Right           | ArrowRight rght
+HOME home             | Home            | Home
+END end               | End             | End
+NUMLOCK nlck          | Num Lock        | NumLock nlk
+MUTE mute             | Mute            | VolumeMute
+VOLUMEUP volu         | Volume Up       | VolumeUp
+VOLUMEDOWN voldwn     | Volume Down     | VolumeDown vold
+EJECTCD eject         | Eject           | EjectCD
+BRIGHTNESSUP brup     | Brightness Up   | bru
+BRIGHTNESSDOWN brdown | Brightness Down | brdwn brdn
+KBDILLUMUP blup       | Backlight Up    |
+KBDILLUMDOWN bldn     | Backlight Down  |
+NEXTSONG next         | Next Track      | MediaTrackNext
+PLAYPAUSE pp          | Play/Pause      | MediaPlayPause
+PREVIOUSSONG prev     | Previous Track  | MediaTrackPrevious
+FN fn                 | Fn              |
+KATAKANAHIRAGANA kana | Kana            | katakanahiragana
+HIRAGANA hiragana     | Hiragana        |
+KATAKANA katakana     | Katakana        |
+HENKAN henk           | Henkan          | cnv conv hnk henkan
+MUHENKAN mhnk         | Muhenkan        | ncnv muhenkan
+RO ro                 | Ro              | IntlRo
+HOMEPAGE hmpg         | Home Page       | homepage
+MEDIA mdia            | Media           | media
+MAIL mail             | Mail            | LaunchMail
+EMAIL email           | Email           |
+CALC calc             | Calculator      |
+PLAYER plyr           | Player          | player
+"""
+
+
+def _key_tables():
+    keys, codes = {}, {}  # evdev code -> (kanata name, label); name -> code
+    for row in _KEY_TABLE.strip().splitlines():
+        head, lab, aliases = (c.strip() for c in row.split("|"))
+        ev, name = head.split()
+        code = evdev.ecodes.ecodes["KEY_" + ev]
+        keys[code] = (name, lab)
+        for n in (name, *aliases.split()):
+            codes[n] = code
+    regular = [(c, c, c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"]
+    regular += [(d, d, d) for d in "0123456789"]
+    regular += [(f"F{n}", f"f{n}", f"F{n}") for n in range(1, 25)]
+    regular += [(f"KP{n}", f"kp{n}", f"Numpad {n}") for n in range(10)]
+    for ev, name, lab in regular:
+        code = evdev.ecodes.ecodes["KEY_" + ev.upper()]
+        keys[code] = (name, lab)
+        codes[name] = code
+    return keys, codes
+
+
+KEYS, KANATA_CODES = _key_tables()
+
+
+def key_label(code):
+    if code in KEYS:
+        return KEYS[code][1]
+    name = evdev.ecodes.KEY.get(code, f"KEY_{code}")
+    name = name[0] if isinstance(name, list) else name
+    return name.removeprefix("KEY_").replace("_", " ").title()
 
 
 def _kanata_forms(text):
@@ -497,6 +615,9 @@ def _kanata_forms(text):
     return forms
 
 
+TRIGGER_RE = re.compile(r"\(\s*tap-hold\s+\d+\s+\d+\s+f23\s+f24\s*\)")
+
+
 def find_trigger(text):
     """(defsrc key the Squelch tap-hold sits on, its (start, end) span in
     the text, all defsrc keys), or None."""
@@ -521,44 +642,83 @@ def find_trigger(text):
     return None
 
 
-def read_hotkey():
-    try:
-        with open(KANATA_CFG) as f:
-            found = find_trigger(f.read())
-        if found and found[0] in dict(HOTKEYS):
-            return found[0]
-    except OSError:
-        pass
-    try:
-        with open(HOTKEY_FILE) as f:
-            h = f.read().strip().lower()
-        return h if h in dict(HOTKEYS) else "menu"
-    except OSError:
-        return "menu"
-
-
-def apply_hotkey(newkey):
-    """Move kanata's Squelch tap-hold to another physical key.
-    Returns (ok, short message)."""
+def kanata_trigger():
+    """(find_trigger() result, config text) when kanata is installed and
+    its config carries the Squelch tap-hold; else the trigger is read
+    straight from the keyboard and the result is None."""
+    if shutil.which("kanata") is None:
+        return None, None
     try:
         with open(KANATA_CFG) as f:
             text = f.read()
     except OSError:
-        return False, "No kanata config"
-    found = find_trigger(text)
-    if found is None:
-        return False, "Trigger not found in kanata config"
-    old, (s, e), keys = found
-    name = dict(HOTKEYS)[newkey]
-    if old == newkey:
-        atomic_write(HOTKEY_FILE, newkey + "\n")
+        return None, None
+    return find_trigger(text), text
+
+
+def read_hotkey_file():
+    try:
+        with open(HOTKEY_FILE) as f:
+            name = f.read().strip()
+    except OSError:
+        return DEFAULT_HOTKEY
+    name = LEGACY_HOTKEYS.get(name, name)
+    code = evdev.ecodes.ecodes.get(name)
+    if name.startswith("KEY_") and isinstance(code, int):
+        return code
+    return DEFAULT_HOTKEY
+
+
+def write_hotkey_file(code):
+    name = evdev.ecodes.KEY[code]
+    name = name[0] if isinstance(name, list) else name
+    atomic_write(HOTKEY_FILE, name + "\n")
+
+
+def read_hotkey():
+    """evdev code of the trigger key. The kanata tap-hold wins when there
+    is one, and the hotkey file is brought in line with it so squelch-ptt
+    doesn't also listen on a second key."""
+    found, _text = kanata_trigger()
+    code = KANATA_CODES.get(found[0]) if found else None
+    if code is None:
+        return read_hotkey_file()
+    if read_hotkey_file() != code:
+        try:
+            write_hotkey_file(code)
+        except OSError:
+            pass
+    return code
+
+
+def apply_hotkey(code):
+    """Make `code` the trigger key. With kanata the Squelch tap-hold moves
+    to that key; without it squelch-ptt reads the key itself.
+    Returns (ok, short message)."""
+    if code in (F23, F24):  # pressed the current kanata trigger
         return True, "Already set"
-    if newkey in keys:
+    name = key_label(code)
+    found, text = kanata_trigger()
+    if found is None:
+        if read_hotkey_file() == code:
+            return True, "Already set"
+        try:
+            write_hotkey_file(code)
+        except OSError as ex:
+            return False, f"Write failed: {ex}"
+        return True, f"Trigger is now {name}"
+    old, (s, e), src = found
+    if KANATA_CODES.get(old) == code:
+        write_hotkey_file(code)
+        return True, "Already set"
+    if code not in KEYS:
+        return False, f"kanata can't use {name}"
+    if code in {KANATA_CODES.get(k) for k in src}:
         return False, f"{name} is already mapped in kanata"
     backup = KANATA_CFG + ".bak-squelch"
     try:
         shutil.copy(KANATA_CFG, backup)
-        atomic_write(KANATA_CFG, text[:s] + newkey + text[e:])
+        atomic_write(KANATA_CFG, text[:s] + KEYS[code][0] + text[e:])
     except OSError as ex:
         return False, f"Write failed: {ex}"
     chk = subprocess.run(["kanata", "--check", "--cfg", KANATA_CFG],
@@ -569,7 +729,7 @@ def apply_hotkey(newkey):
         except OSError:
             pass
         return False, "kanata rejected it, config restored"
-    atomic_write(HOTKEY_FILE, newkey + "\n")
+    write_hotkey_file(code)
     rst = subprocess.run(["sudo", "-n", "systemctl", "restart", "kanata"],
                          capture_output=True, text=True, timeout=30)
     if rst.returncode != 0:
@@ -953,6 +1113,46 @@ class EnginePopup(QWidget):
             super().keyPressEvent(event)
 
 
+class KeyCapture(QObject):
+    """While active, swallows every key and reports the first one once
+    it's released (so kanata never restarts under a held key). Codes are
+    evdev ones: what squelch-ptt will see on the keyboard."""
+
+    def __init__(self, on_key):
+        super().__init__()
+        self.on_key = on_key
+        self.active = False
+        self.code = None
+
+    def start(self):
+        self.active, self.code = True, None
+        QApplication.instance().installEventFilter(self)
+
+    def stop(self):
+        if self.active:
+            self.active = False
+            QApplication.instance().removeEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t == QEvent.Type.ShortcutOverride:
+            event.accept()
+            return True
+        if t not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            return False
+        if event.isAutoRepeat():
+            return True
+        # XKB keycodes are evdev codes + 8, on Wayland and X11 alike
+        code = event.nativeScanCode() - 8
+        if t == QEvent.Type.KeyPress and self.code is None and code > 0:
+            self.code = code
+        elif t == QEvent.Type.KeyRelease and code == self.code:
+            self.stop()
+            # off the event filter before kanata --check blocks the loop
+            QTimer.singleShot(0, lambda c=code: self.on_key(c))
+        return True
+
+
 class SettingsWindow(QWidget):
     """General / Appearance / Setup / Dictionary / Analytics tabs in one
     glass window."""
@@ -1026,14 +1226,13 @@ class SettingsWindow(QWidget):
 
         lay.addWidget(label("Trigger key", "heading"))
         hkrow = QHBoxLayout()
-        self.hk_combo = QComboBox()
-        for key, text in HOTKEYS:
-            self.hk_combo.addItem(text, key)
-        hkrow.addWidget(self.hk_combo, 1)
-        hk_apply = QPushButton("Apply")
-        hk_apply.clicked.connect(self.hotkey_apply)
-        hkrow.addWidget(hk_apply)
+        self.hk_key = label("")
+        hkrow.addWidget(self.hk_key, 1)
+        self.hk_btn = QPushButton("Change")
+        self.hk_btn.clicked.connect(self.hotkey_toggle)
+        hkrow.addWidget(self.hk_btn)
         lay.addLayout(hkrow)
+        self.hk_capture = KeyCapture(self.hotkey_captured)
         self.hk_status = label("", "dim")
         self.hk_status.hide()
         lay.addWidget(self.hk_status)
@@ -1157,19 +1356,36 @@ class SettingsWindow(QWidget):
                          "numbers": self.cb_numbers.isChecked(),
                          "numbers_all": self.cb_all.isChecked()})
 
-    def hotkey_apply(self):
-        _ok, msg = apply_hotkey(self.hk_combo.currentData())
+    def hotkey_toggle(self):
+        if self.hk_capture.active:
+            self.hotkey_stop()
+            return
+        self.hk_btn.setText("Press a key")
+        self.hk_status.hide()
+        self.hk_capture.start()
+
+    def hotkey_stop(self):
+        self.hk_capture.stop()
+        self.hk_btn.setText("Change")
+
+    def hotkey_captured(self, code):
+        self.hotkey_stop()
+        if code == ESC:
+            return
+        _ok, msg = apply_hotkey(code)
         self.hk_status.setText(msg)
         self.hk_status.show()
         self.refresh_hotkey()
+        app = QApplication.instance()
+        if getattr(app, "watcher", None) is not None:
+            app.watcher.rescan()
 
     def refresh_hotkey(self):
-        cur = read_hotkey()
-        i = self.hk_combo.findData(cur)
-        if i >= 0:
-            self.hk_combo.blockSignals(True)
-            self.hk_combo.setCurrentIndex(i)
-            self.hk_combo.blockSignals(False)
+        self.hk_key.setText(key_label(read_hotkey()))
+
+    def hideEvent(self, event):
+        self.hotkey_stop()
+        super().hideEvent(event)
 
     def refresh_insertion(self):
         cur = read_insertion()
@@ -1757,65 +1973,76 @@ class SettingsWindow(QWidget):
             super().keyPressEvent(event)
 
 
-class MenuKeyWatcher:
-    """Passive listener on kanata's output device: a trigger tap (F23)
-    pops the tap card. No grabs — the dictation daemon reads alongside."""
+class TriggerWatcher:
+    """Passive listener on every keyboard that can send the trigger: a
+    kanata tap (F23) or a quick press of the trigger key itself pops the
+    tap card. No grabs — the dictation daemon reads alongside."""
 
     def __init__(self, on_tap):
         self.on_tap = on_tap
-        self.dev = None
-        self.notifier = None
+        self.devs = {}       # path -> (InputDevice, QSocketNotifier)
+        self.skipped = set()
+        self.code = read_hotkey()
+        self.down = None     # (path, time) of a trigger press
         self.timer = QTimer()
         self.timer.setInterval(2000)
         self.timer.timeout.connect(self.discover)
+        self.timer.start()
         self.discover()
 
-    def find_device(self):
-        for path in sorted(os.listdir("/dev/input")):
-            if not path.startswith("event"):
-                continue
-            try:
-                d = evdev.InputDevice(os.path.join("/dev/input", path))
-            except OSError:
-                continue
-            if "kanata" not in d.name.lower():
-                continue
-            try:
-                if F23 in d.capabilities().get(evdev.ecodes.EV_KEY, []):
-                    return d
-            except OSError:
-                continue
-        return None
+    def rescan(self):
+        """Trigger key changed: reopen everything for the new one."""
+        for path in list(self.devs):
+            self.drop(path)
+        self.skipped.clear()
+        self.code = read_hotkey()
+        self.discover()
 
     def discover(self):
-        if self.dev is not None:
-            return
-        d = self.find_device()
-        if d is None:
-            if not self.timer.isActive():
-                self.timer.start()
-            return
-        self.timer.stop()
-        self.dev = d
-        self.notifier = QSocketNotifier(
-            d.fd, QSocketNotifier.Type.Read)
-        self.notifier.activated.connect(self.on_activity)
+        paths = set(glob.glob("/dev/input/event*"))
+        self.skipped &= paths
+        for path in sorted(paths - set(self.devs) - self.skipped):
+            try:
+                d = evdev.InputDevice(path)
+                keys = d.capabilities().get(evdev.ecodes.EV_KEY, [])
+            except OSError:
+                continue
+            if "ydotoold" in d.name.lower() or (
+                    self.code not in keys and F23 not in keys):
+                d.close()
+                self.skipped.add(path)
+                continue
+            n = QSocketNotifier(d.fd, QSocketNotifier.Type.Read)
+            n.activated.connect(lambda _fd, p=path: self.on_activity(p))
+            self.devs[path] = (d, n)
 
-    def on_activity(self):
+    def on_activity(self, path):
+        d = self.devs[path][0]
         try:
-            for ev in self.dev.read():
-                if (ev.type == evdev.ecodes.EV_KEY and ev.code == F23
-                        and ev.value == 1):
-                    self.on_tap()
+            events = list(d.read())
         except OSError:
-            self.teardown()
-            self.timer.start()
+            self.drop(path)
+            return
+        for ev in events:
+            if ev.type != evdev.ecodes.EV_KEY:
+                continue
+            if ev.code == F23 and ev.value == 1:
+                self.on_tap()
+            elif ev.code == self.code and ev.value == 1:
+                self.down = (path, time.time())
+            elif ev.code == self.code and ev.value == 0 and self.down:
+                if (self.down[0] == path
+                        and time.time() - self.down[1] < HOLD_DELAY_S):
+                    self.on_tap()
+                self.down = None
 
-    def teardown(self):
-        if self.notifier is not None:
-            self.notifier.setEnabled(False)
-            self.notifier = None
-        self.dev = None
+    def drop(self, path):
+        d, n = self.devs.pop(path)
+        n.setEnabled(False)
+        try:
+            d.close()
+        except OSError:
+            pass
 
 
 def fallback_icon():
@@ -1913,6 +2140,8 @@ def main():
     tap_timer.timeout.connect(on_tap_timeout)
 
     def on_menu_tap():
+        if settings.hk_capture.active:
+            return  # pressing the trigger to pick it again
         if tap["pending"]:
             # double tap: straight to settings, tap card stays closed
             tap["pending"] = False
@@ -1922,7 +2151,7 @@ def main():
             tap["pending"] = True
             tap_timer.start()
 
-    app.watcher = MenuKeyWatcher(on_menu_tap)  # keep it alive
+    app.watcher = TriggerWatcher(on_menu_tap)  # keep it alive
     refresh()
     tray.show()
     sys.exit(app.exec())

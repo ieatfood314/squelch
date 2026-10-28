@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""STT push-to-talk daemon: hold F24 (from kanata Menu tap-hold) to record
+"""STT push-to-talk daemon: hold the trigger key (Menu unless Settings says
+otherwise; F24 when kanata's Squelch tap-hold sits on it) to record
 from the mic picked in Settings (default: PipeWire's default source),
 beamform + clean, transcribe with the resident Parakeet or Whisper server
 (Vulkan GPU), and paste the result via clipboard + Shift+Insert, or Ctrl+V
@@ -18,6 +19,7 @@ import json
 import os
 import queue
 import re
+import select
 import shutil
 import signal
 import socket
@@ -43,6 +45,7 @@ INSERTION_FILE = os.path.expanduser("~/.config/squelch/insertion.json")
 TRANSCRIPTS_FILE = os.path.expanduser("~/.config/squelch/transcripts.jsonl")
 VOCAB_FILE = os.path.expanduser("~/.config/squelch/vocab.json")
 MIC_FILE = os.path.expanduser("~/.config/squelch/mic")
+HOTKEY_FILE = os.path.expanduser("~/.config/squelch/hotkey")
 # One line: a directory to archive every utterance to (raw + clean audio and
 # the transcript). No file, no archive.
 ARCHIVE_FILE = os.path.expanduser("~/.config/squelch/archive")
@@ -564,7 +567,14 @@ STUCK_KEY_S = 900.0     # ceiling for any engine (a stuck or forgotten key)
 MIN_CAP_S = 30.0        # always allowed, even with VRAM tight
 FALLBACK_CAP_S = 120.0  # Parakeet up but free VRAM unknown
 PARAKEET_LIMITS_URL = "http://127.0.0.1:1894/limits"
-F24 = evdev.ecodes.KEY_F24  # 194, emitted by kanata while Menu is held
+F24 = evdev.ecodes.KEY_F24  # emitted by kanata while the trigger is held
+# A trigger key read straight from the keyboard counts as held once it's
+# down this long, the same hold timeout kanata's tap-hold uses; shorter is
+# a tap (the tray's popup).
+HOLD_DELAY_S = 0.25
+# what the hotkey file held before it stored evdev names
+LEGACY_HOTKEYS = {"menu": "KEY_COMPOSE", "caps": "KEY_CAPSLOCK",
+                  "scrlck": "KEY_SCROLLLOCK"}
 
 
 def log(*a):
@@ -1425,23 +1435,78 @@ def watch_resume():
 
 # ---------------- main loop ----------------
 
-def find_kanata_device():
-    override = os.environ.get("STT_INPUT_DEVICE")
-    if override:  # debugging hook: listen on an arbitrary device instead
-        return evdev.InputDevice(override)
-    for path in sorted(glob.glob("/dev/input/event*")):
-        try:
-            d = evdev.InputDevice(path)
-        except OSError:
-            continue
-        if "kanata" not in d.name.lower():
-            continue
-        try:
-            if F24 in d.capabilities().get(evdev.ecodes.EV_KEY, []):
-                return d
-        except OSError:
-            continue
-    return None
+def hotkey_code():
+    """evdev code of the trigger key from ~/.config/squelch/hotkey."""
+    try:
+        with open(HOTKEY_FILE) as f:
+            name = f.read().strip()
+    except OSError:
+        name = ""
+    name = LEGACY_HOTKEYS.get(name, name)
+    code = evdev.ecodes.ecodes.get(name)
+    if name.startswith("KEY_") and isinstance(code, int):
+        return code
+    return evdev.ecodes.KEY_COMPOSE
+
+
+class Keyboards:
+    """Every input device that can send the trigger key (or kanata's F24),
+    read without grabbing. Rescanned for hotplug and hotkey changes."""
+
+    def __init__(self):
+        self.devs = {}       # path -> InputDevice
+        self.skipped = set()  # paths that can't send our keys
+        self.code = None
+
+    def scan(self):
+        """Pick up new devices; True if the trigger key changed (every
+        device is reopened then)."""
+        code = hotkey_code()
+        changed = code != self.code
+        if changed:
+            if self.code is not None:
+                log(f"trigger key is now {evdev.ecodes.KEY.get(code, code)}")
+            self.close()
+            self.code = code
+        override = os.environ.get("STT_INPUT_DEVICE")
+        paths = [override] if override else glob.glob("/dev/input/event*")
+        for path in paths:
+            if path in self.devs or path in self.skipped:
+                continue
+            try:
+                d = evdev.InputDevice(path)
+                keys = d.capabilities().get(evdev.ecodes.EV_KEY, [])
+            except OSError:
+                continue
+            # ydotoold's virtual keyboard is our own paste
+            if not override and ("ydotoold" in d.name.lower() or
+                                 (code not in keys and F24 not in keys)):
+                d.close()
+                self.skipped.add(path)
+                continue
+            self.devs[path] = d
+            log(f"listening on {path} ({d.name})")
+        # a path can come back as another device after an unplug
+        self.skipped &= set(paths)
+        return changed
+
+    def drop(self, path):
+        d = self.devs.pop(path, None)
+        if d is not None:
+            log(f"lost {path}")
+            try:
+                d.close()
+            except OSError:
+                pass
+
+    def close(self):
+        for d in self.devs.values():
+            try:
+                d.close()
+            except OSError:
+                pass
+        self.devs.clear()
+        self.skipped.clear()
 
 
 def notify_engine_down():
@@ -1579,76 +1644,131 @@ def discard(path):
         pass
 
 
+def start_hold(code):
+    """Start recording for a held trigger; None if we can't."""
+    if notify_engine_down():
+        log("engine unavailable, ignoring press")
+        return None
+    if mic_resetting():
+        log("mic reset in progress, ignoring press")
+        return None
+    paused = playing_players()
+    pause_players(paused)
+    mic = find_mic()
+    if mic is None:
+        log("mic not found, ignoring press")
+        resume_players(paused)
+        recover_mic_async("not found")
+        return None
+    fd, path = tempfile.mkstemp(suffix="-raw.wav")
+    os.close(fd)
+    proc = start_recording(mic["target"], path)
+    cap_s = max_hold_s(current_engine())
+    cap = threading.Timer(cap_s, stop_recording, [proc])
+    cap.daemon = True
+    cap.start()
+    log(f"recording... (cap {duration(cap_s)})")
+    return {"proc": proc, "path": path, "paused": paused, "code": code,
+            "t": time.time(), "cap": cap, "cap_s": cap_s}
+
+
+def end_hold(rec, jobs):
+    held = time.time() - rec["t"]
+    rec["cap"].cancel()
+    stop_recording(rec["proc"])
+    resume_players(rec["paused"])
+    path, cap_s = rec["path"], rec["cap_s"]
+    if held < MIN_HOLD_S:
+        log(f"tap ({held:.2f}s), ignoring")
+        discard(path)
+        return
+    if capture_dead(path, min(held, cap_s)):
+        log(f"recording got {raw_frames(path)} frames "
+            f"in {held:.1f}s (mic wedged?)")
+        recover_mic_async("short capture")
+        discard(path)
+        return
+    if held > cap_s:
+        log(f"held {held:.0f}s, keeping the first {cap_s:.0f}s")
+    jobs.put((path, held, cap_s))
+
+
+def abandon_hold(rec):
+    rec["cap"].cancel()
+    stop_recording(rec["proc"])
+    resume_players(rec["paused"])
+    discard(rec["path"])
+
+
 def main():
     threading.Thread(target=watch_resume, daemon=True).start()
     jobs = queue.Queue()
     threading.Thread(target=utterance_worker, args=(jobs,),
                      daemon=True).start()
+    kbd = Keyboards()
+    rec = None       # the recording while the trigger is held
+    pending = None   # (path, press time) of a direct trigger press
+    last_scan = 0.0
+    lonely = False   # logged that no keyboard has the key
     while True:
-        dev = find_kanata_device()
-        if dev is None:
-            log("kanata device not found, retrying in 2s")
-            time.sleep(2)
-            continue
-        log(f"listening on {dev.path} ({dev.name})")
-        rec = None  # {"proc", "path", "paused", "t", "cap"} while holding
+        now = time.time()
+        if now - last_scan >= 2:
+            if kbd.scan():
+                pending = None
+                if rec is not None:  # its key's release won't come now
+                    abandon_hold(rec)
+                    rec = None
+            last_scan = now
+            if not kbd.devs and not lonely:
+                log("no keyboard with the trigger key yet")
+            lonely = not kbd.devs
+        if pending and now - pending[1] >= HOLD_DELAY_S:
+            if rec is None:
+                rec = start_hold(kbd.code)
+                if rec is not None:
+                    rec["dev"] = pending[0]
+            pending = None
+        timeout = 2.0
+        if pending:
+            timeout = max(0.0, pending[1] + HOLD_DELAY_S - now)
+        by_fd = {d.fd: path for path, d in kbd.devs.items()}
         try:
-            for ev in dev.read_loop():
-                if ev.type != evdev.ecodes.EV_KEY or ev.code != F24:
+            ready, _, _ = select.select(list(by_fd), [], [], timeout)
+        except (OSError, ValueError):
+            ready = []  # a device vanished mid-select; rescan
+            last_scan = 0.0
+        for fd in ready:
+            path = by_fd[fd]
+            try:
+                events = list(kbd.devs[path].read())
+            except (OSError, KeyError):
+                kbd.drop(path)
+                if rec is not None and rec.get("dev") == path:
+                    abandon_hold(rec)
+                    rec = None
+                if pending and pending[0] == path:
+                    pending = None
+                continue
+            for ev in events:
+                if ev.type != evdev.ecodes.EV_KEY:
                     continue
-                if ev.value == 1 and rec is None:  # hold started
-                    if notify_engine_down():
-                        log("engine unavailable, ignoring press")
-                        continue
-                    if mic_resetting():
-                        log("mic reset in progress, ignoring press")
-                        continue
-                    paused = playing_players()
-                    pause_players(paused)
-                    mic = find_mic()
-                    if mic is None:
-                        log("mic not found, ignoring press")
-                        resume_players(paused)
-                        recover_mic_async("not found")
-                        continue
-                    fd, path = tempfile.mkstemp(suffix="-raw.wav")
-                    os.close(fd)
-                    proc = start_recording(mic["target"], path)
-                    cap_s = max_hold_s(current_engine())
-                    cap = threading.Timer(cap_s, stop_recording, [proc])
-                    cap.daemon = True
-                    cap.start()
-                    rec = {"proc": proc, "path": path, "paused": paused,
-                           "t": time.time(), "cap": cap, "cap_s": cap_s}
-                    log(f"recording... (cap {duration(cap_s)})")
-                elif ev.value == 0 and rec is not None:  # released
-                    held = time.time() - rec["t"]
-                    rec["cap"].cancel()
-                    stop_recording(rec["proc"])
-                    resume_players(rec["paused"])
-                    path, cap_s, rec = rec["path"], rec["cap_s"], None
-                    if held < MIN_HOLD_S:
-                        log(f"tap ({held:.2f}s), ignoring")
-                        discard(path)
-                        continue
-                    if capture_dead(path, min(held, cap_s)):
-                        log(f"recording got {raw_frames(path)} frames "
-                            f"in {held:.1f}s (mic wedged?)")
-                        recover_mic_async("short capture")
-                        discard(path)
-                        continue
-                    if held > cap_s:
-                        log(f"held {held:.0f}s, keeping the first "
-                            f"{cap_s:.0f}s")
-                    jobs.put((path, held, cap_s))
-        except OSError as e:
-            log(f"device lost ({e}), re-discovering")
-            if rec is not None:
-                rec["cap"].cancel()
-                stop_recording(rec["proc"])
-                resume_players(rec["paused"])
-                discard(rec["path"])
-            time.sleep(1)
+                if ev.code == F24:  # kanata already timed the hold
+                    if ev.value == 1 and rec is None:
+                        rec = start_hold(F24)
+                        if rec is not None:
+                            rec["dev"] = path
+                    elif ev.value == 0 and rec and rec["code"] == F24:
+                        end_hold(rec, jobs)
+                        rec = None
+                elif ev.code == kbd.code:
+                    if ev.value == 1 and rec is None and pending is None:
+                        pending = (path, time.time())
+                    elif ev.value == 0:
+                        if pending and pending[0] == path:
+                            pending = None  # a tap
+                        elif rec and rec["code"] == kbd.code:
+                            end_hold(rec, jobs)
+                            rec = None
 
 
 if __name__ == "__main__":

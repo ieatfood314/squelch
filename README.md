@@ -26,7 +26,7 @@ no cloud, no accounts.
 - **Everything survives reboot** via systemd user services
 
 Tested on EndeavourOS / KDE Plasma 6 / Wayland, AMD RX 5700,
-Logitech C920 webcam (stereo mic), kanata. PipeWire required; KWin fullscreen
+Logitech C920 webcam (stereo mic), with and without kanata. PipeWire required; KWin fullscreen
 detection and tray applet assume Plasma, other Wayland compositors need
 small tweaks.
 
@@ -55,15 +55,31 @@ community conversion for the same whisper.cpp engine
 ([JoaoZaokk/parakeet-tdt-0.6b-v2-ggml](https://huggingface.co/JoaoZaokk/parakeet-tdt-0.6b-v2-ggml)),
 pinned by SHA-256.
 
-Then wire up a trigger key — Menu by default (needs [kanata](https://github.com/jtroo/kanata)) —
-see [kanata/snippet.kbd](kanata/snippet.kbd), validate with
-`kanata --check`, restart kanata — and start everything:
+Squelch reads the trigger key straight from your keyboard, so your user
+needs to be in the `input` group (log out and back in after):
+
+```
+sudo usermod -aG input $USER
+```
+
+Then start everything:
 
 ```
 systemctl --user enable --now squelch-ptt squelch-tray squelch-vram squelch-ydotoold
 ```
 
-Focus a text field, hold your trigger key, speak, release.
+Focus a text field, hold Menu, speak, release.
+
+### Trigger key
+
+Any key works: Settings → General → Change, then press it. Read straight
+from the keyboard, the key also keeps doing its normal job (Caps Lock
+still toggles caps), so pick one you don't otherwise use, like Menu,
+Scroll Lock, Pause or F13–F24. To stop the key's own action too, bind it
+with [kanata](https://github.com/jtroo/kanata) instead: add the tap-hold
+from [kanata/snippet.kbd](kanata/snippet.kbd), check it with
+`kanata --check` and restart kanata. Once that binding is in your kanata
+config, Change moves it to the new key for you.
 
 ## Usage
 
@@ -72,7 +88,7 @@ Focus a text field, hold your trigger key, speak, release.
 | Dictate | hold trigger key, speak, release |
 | Settings (engine, trigger, insertion, cleanup, appearance, dictionary, analytics, setup) | tap trigger, double-tap for Settings, or tray menu |
 | Engine switch | settings popup, General tab, or right-click tray icon |
-| Trigger key (Menu/Caps Lock/Scroll Lock) | settings → General (rewrites kanata binding) |
+| Trigger key (any key) | settings → General → Change, then press the key |
 | Insertion (paste/type/clipboard-only) | settings → General |
 | Accent color, background opacity, text size, font | settings → Appearance |
 | Speech models (picking one that isn't downloaded yet downloads it) | settings → Setup |
@@ -139,10 +155,10 @@ ports without it you get a "replug it" notification. `squelch-ptt
 - `src/squelch` — dictionary CLI · `src/squelch-setup-models` — model downloads
 - `src/squelch-mic-reset` — root helper: power-cycle a USB mic's port
 - `systemd/` — user units · `systemd/system/` — mic-reset template unit
-- `polkit/` — lets wheel users' squelch-ptt start the mic-reset unit · `kanata/snippet.kbd` — Menu tap-hold wiring
+- `polkit/` — lets wheel users' squelch-ptt start the mic-reset unit · `kanata/snippet.kbd` — optional kanata tap-hold for the trigger
 
 Runtime state lives in `~/.config/squelch/` (engine, filters, dictionary,
-mic, archive, vram.json, stats, key). Models in `~/.local/share/whisper.cpp/models` and
+mic, hotkey, archive, vram.json, stats, key). Models in `~/.local/share/whisper.cpp/models` and
 `~/.local/share/parakeet`.
 
 ## Uninstall
