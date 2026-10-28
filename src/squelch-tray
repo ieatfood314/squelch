@@ -903,7 +903,11 @@ class SettingsWindow(QWidget):
     dl_done = pyqtSignal(str)
 
     def __init__(self, on_engine, on_filters):
-        super().__init__(None, Qt.WindowType.Window)
+        # no title bar: it closes on click-off, Esc or a Menu tap, and
+        # there's nothing to move or resize
+        super().__init__(
+            None,
+            Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setWindowTitle("Squelch")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.on_engine = on_engine
@@ -911,11 +915,19 @@ class SettingsWindow(QWidget):
         self.suggested.connect(self._apply_suggestions)
         self.suggest_failed.connect(self._suggest_error)
         self.dl_done.connect(self._dl_finished)
-        self.setStyleSheet(f"SettingsWindow {{ background: {GLASS}; }}")
         self.resize(640, 520)
         CloseOnClickOff(self, self.close)
 
-        lay = QVBoxLayout(self)
+        # the glass and its edge live on a child panel: a translucent
+        # top-level doesn't paint its own stylesheet background
+        panel = QWidget(self)
+        panel.setObjectName("glass")
+        panel.setStyleSheet(
+            f"#glass {{ background: {GLASS}; border: 1px solid {BORDER}; }}")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(panel)
+        lay = QVBoxLayout(panel)
         lay.setContentsMargins(16, 16, 16, 16)
         self.tabs = QTabWidget()
         lay.addWidget(self.tabs, 1)
