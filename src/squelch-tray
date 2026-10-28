@@ -20,7 +20,8 @@ import urllib.request
 
 import evdev
 
-from PyQt6.QtCore import (QSocketNotifier, QTimer, Qt, pyqtSignal)
+from PyQt6.QtCore import (QEvent, QObject, QSocketNotifier, QTimer, Qt,
+                          pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor,
                          QGuiApplication, QIcon, QPainter, QPixmap)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication,
@@ -788,6 +789,31 @@ def fetch_mishearings(term):
 
 # ---------------- windows ----------------
 
+class CloseOnClickOff(QObject):
+    """Runs `close` once focus leaves Squelch entirely (a click on another
+    window or the desktop). Moving between our own windows, like Settings
+    and its key dialog, doesn't count. Keyed off the window's own
+    deactivation, so a window the compositor never activated isn't closed
+    out from under you."""
+
+    def __init__(self, window, close):
+        super().__init__(window)
+        self.window = window
+        self.close = close
+        window.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.Type.ActivationChange
+                and not obj.isActiveWindow()):
+            # focus can pass through "no window" while moving between ours
+            QTimer.singleShot(150, self._close_if_left)
+        return False
+
+    def _close_if_left(self):
+        if self.window.isVisible() and QApplication.activeWindow() is None:
+            self.close()
+
+
 class EnginePopup(QWidget):
     """Slim tap card: engine quick-switch, status, stats glance, and one
     button into Settings. Plain top-level window: maps fine on Wayland,
@@ -829,6 +855,7 @@ class EnginePopup(QWidget):
         settings_btn = QPushButton("Settings")
         settings_btn.clicked.connect(self.on_settings)
         inner.addWidget(settings_btn)
+        CloseOnClickOff(self, self.hide)
 
     def refresh(self, engine, status_text):
         for key, rb in self.radios.items():
@@ -861,16 +888,6 @@ class EnginePopup(QWidget):
         self.raise_()
         self.activateWindow()
 
-    def focusOutEvent(self, event):
-        super().focusOutEvent(event)
-        # clicks on our own radios keep us the active window; anything
-        # else hides us shortly after
-        QTimer.singleShot(150, self._hide_if_inactive)
-
-    def _hide_if_inactive(self):
-        if self.isVisible() and QApplication.activeWindow() is not self:
-            self.hide()
-
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             self.hide()
@@ -896,6 +913,7 @@ class SettingsWindow(QWidget):
         self.dl_done.connect(self._dl_finished)
         self.setStyleSheet(f"SettingsWindow {{ background: {GLASS}; }}")
         self.resize(640, 520)
+        CloseOnClickOff(self, self.close)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 16, 16, 16)
@@ -1426,6 +1444,12 @@ class SettingsWindow(QWidget):
         set_btn.clicked.connect(do_set)
         clear_btn.clicked.connect(do_clear)
         close_btn.clicked.connect(dlg.accept)
+
+        def click_off():
+            dlg.reject()
+            self.close()
+
+        CloseOnClickOff(dlg, click_off)
         dlg.exec()
         self.refresh_or_status()
 
