@@ -253,7 +253,15 @@ def write_state(gaming, want, model_ok=True, model="", games=()):
 def main():
     log("supervisor starting")
     watch = GameWatch()
-    gaming = False
+    # Trust the first report as is: the settle time is for changes, and
+    # waiting it out at startup would load a model into a running game.
+    watch.ensure_script()
+    deadline = time.monotonic() + 3
+    while not watch.reported and time.monotonic() < deadline:
+        time.sleep(0.1)
+    gaming = bool(watch.snapshot()[0])
+    if gaming:
+        log("game fullscreen at startup:", ", ".join(watch.snapshot()[0]))
     known_models = engine_models()  # don't restart a running engine at boot
     while True:
         try:
