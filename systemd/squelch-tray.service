@@ -9,7 +9,9 @@ StartLimitBurst=5
 
 [Service]
 ExecStart=/usr/bin/squelch-tray
-Restart=always
+# Not always: "Quit tray" and handing off to a tray started from the app
+# menu both exit cleanly and should stay stopped.
+Restart=on-failure
 RestartSec=3
 # WAYLAND_DISPLAY/XDG_RUNTIME_DIR come from the imported session env
 # (After=graphical-session.target); hardcoding the socket name breaks when

@@ -34,10 +34,31 @@ small tweaks.
 
 ```
 yay -S squelch
-squelch-setup-models     # downloads ~1.2 GB of models, resumable
 ```
 
-That gets the two default models. Smaller and larger ones are in
+Then open **Squelch** from the app menu. Settings opens on Setup with a
+Get started list: keyboard access (adds you to the `input` group, restart
+after), the speech models (~1.2 GB), autostart, and the trigger key.
+Focus a text field, hold the trigger key, speak, release.
+
+From a terminal instead:
+
+```
+sudo usermod -aG input $USER
+```
+
+```
+squelch-setup-models
+```
+
+```
+systemctl --user enable --now squelch-ptt squelch-tray squelch-vram squelch-ydotoold
+```
+
+The `input` group is needed because Squelch reads the trigger key
+straight from your keyboard and types through uinput.
+
+Setup gets the two default models. Smaller and larger ones are in
 Settings → Setup, or `squelch-setup-models --list`:
 
 | Engine | Model | Size | For |
@@ -55,21 +76,6 @@ community conversion for the same whisper.cpp engine
 ([JoaoZaokk/parakeet-tdt-0.6b-v2-ggml](https://huggingface.co/JoaoZaokk/parakeet-tdt-0.6b-v2-ggml)),
 pinned by SHA-256.
 
-Squelch reads the trigger key straight from your keyboard, so your user
-needs to be in the `input` group (log out and back in after):
-
-```
-sudo usermod -aG input $USER
-```
-
-Then start everything:
-
-```
-systemctl --user enable --now squelch-ptt squelch-tray squelch-vram squelch-ydotoold
-```
-
-Focus a text field, hold Menu, speak, release.
-
 ### Trigger key
 
 Any key works: Settings → General → Change, then press it. Read straight
@@ -86,14 +92,14 @@ config, Change moves it to the new key for you.
 | Action | How |
 |---|---|
 | Dictate | hold trigger key, speak, release |
-| Settings (engine, trigger, insertion, cleanup, appearance, dictionary, analytics, setup) | tap trigger, double-tap for Settings, or tray menu |
+| Settings (engine, trigger, insertion, cleanup, appearance, dictionary, analytics, setup) | tap trigger, double-tap for Settings, Squelch in the app menu, or tray menu |
 | Engine switch | settings popup, General tab, or right-click tray icon |
 | Trigger key (any key) | settings → General → Change, then press the key |
 | Insertion (paste/type/clipboard-only) | settings → General |
 | Accent color, background opacity, text size, font | settings → Appearance |
 | Speech models (picking one that isn't downloaded yet downloads it) | settings → Setup |
 | Microphone (default: PipeWire's default source) | settings → Setup |
-| Download models, autostart services, API key | settings → Setup (no terminal needed) |
+| Download models, autostart services, keyboard access, API key | settings → Setup (no terminal needed; until it's all done, the app menu opens Setup with a Get started list) |
 | Dictionary: `squelch WORD [mishearings…]` | AI suggests what it sounds like when an OpenRouter key is configured (`~/.config/squelch/openrouter.key`, chmod 600); `--no-ai` skips that |
 | Dictionary editor | settings → Dictionary tab (Add/Suggest/Remove) |
 | Learned mishearings | settings → Dictionary tab, under Possible mishearings (Add/Ignore) |

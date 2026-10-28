@@ -1,8 +1,10 @@
 [Desktop Entry]
 Name=Squelch
-Comment=Push-to-talk speech-to-text (hold trigger key to dictate)
-Exec=/usr/bin/squelch-tray
+GenericName=Dictation
+Comment=Push-to-talk speech-to-text settings
+Exec=/usr/bin/squelch-tray --settings
 Icon=audio-input-microphone
 Terminal=false
 Type=Application
 Categories=Utility;
+Keywords=dictation;speech;voice;transcribe;stt;

@@ -8,8 +8,10 @@ stays loaded. Quitting the tray does NOT stop dictation.
 import datetime
 import fcntl
 import glob
+import grp
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -25,6 +27,7 @@ from PyQt6.QtCore import (QEvent, QObject, QSocketNotifier, QTimer, Qt,
                           pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor,
                          QGuiApplication, QIcon, QPainter, QPixmap)
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication,
                              QButtonGroup, QCheckBox, QComboBox, QDialog,
                              QDoubleSpinBox, QHBoxLayout, QHeaderView,
@@ -87,6 +90,11 @@ ENGINES = [
     ("whisper", "Whisper · other languages"),
 ]
 ENGINE_NAMES = {"parakeet": "Parakeet", "whisper": "Whisper"}
+# Later launches (the app menu) hand off to the running tray through this
+INSTANCE_SOCKET = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+    f"squelch-tray-{os.getuid()}")
+SETUP_TAB = 2
 SERVICES = (("squelch-ptt.service", "Dictation"),
             ("squelch-tray.service", "Tray"),
             ("squelch-vram.service", "VRAM supervisor"),
@@ -691,6 +699,10 @@ def read_hotkey():
     return code
 
 
+def trigger_label():
+    return key_label(read_hotkey())
+
+
 def apply_hotkey(code):
     """Make `code` the trigger key. With kanata the Squelch tap-hold moves
     to that key; without it squelch-ptt reads the key itself.
@@ -789,6 +801,45 @@ def set_service_enabled(svc, enable, is_self=False):
         except Exception:
             return False
     return True
+
+
+def keyboard_access():
+    """'ok', 'restart' (added to the input group, not in effect yet) or
+    'no'. Reading the trigger key and typing both need the input group."""
+    try:
+        g = grp.getgrnam("input")
+    except KeyError:
+        return "ok"
+    if g.gr_gid in os.getgroups():
+        return "ok"
+    if pwd.getpwuid(os.getuid()).pw_name in g.gr_mem:
+        return "restart"
+    return "no"
+
+
+def grant_keyboard_access():
+    """Add the user to the input group (asks for the password)."""
+    user = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        r = subprocess.run(["pkexec", "usermod", "-aG", "input", user],
+                           capture_output=True, timeout=300)
+    except Exception:
+        return False
+    return r.returncode == 0
+
+
+def models_ready():
+    return os.path.exists(read_engine_models().get(read_engine(), ""))
+
+
+def services_ready():
+    return all(enabled for _a, enabled in
+               service_states([s for s, _t in SERVICES]).values())
+
+
+def setup_done():
+    return (keyboard_access() == "ok" and models_ready()
+            and services_ready())
 
 
 def setup_models_cmd():
@@ -1160,6 +1211,7 @@ class SettingsWindow(QWidget):
     suggested = pyqtSignal(str, object)  # term, [suggestions]
     suggest_failed = pyqtSignal(str)
     dl_done = pyqtSignal(str)
+    access_done = pyqtSignal(bool)
 
     def __init__(self, on_engine, on_filters):
         # no title bar: it closes on click-off, Esc or a Menu tap, and
@@ -1174,6 +1226,7 @@ class SettingsWindow(QWidget):
         self.suggested.connect(self._apply_suggestions)
         self.suggest_failed.connect(self._suggest_error)
         self.dl_done.connect(self._dl_finished)
+        self.access_done.connect(self._access_finished)
         CloseOnClickOff(self, self.close)
 
         # the glass and its edge live on a child panel: a translucent
@@ -1400,6 +1453,31 @@ class SettingsWindow(QWidget):
         lay = QVBoxLayout(tab)
         lay.setSpacing(6)
 
+        # first-run checklist; hidden once everything is done
+        self.start_box = QWidget()
+        slay = QVBoxLayout(self.start_box)
+        slay.setContentsMargins(0, 0, 0, 0)
+        slay.setSpacing(6)
+        slay.addWidget(label("Get started", "heading"))
+        self.start_rows = {}
+        for key, text, button, action in (
+                ("access", "Keyboard access", "Allow", self.allow_access),
+                ("models", "Speech model", "Download", self.download_models),
+                ("services", "Autostart", "Turn on", self.services_on),
+                ("trigger", "Trigger key", "Change", self.trigger_change)):
+            row = QHBoxLayout()
+            row.addWidget(label(text), 1)
+            st = label("", "dim")
+            st.setMinimumWidth(70)
+            row.addWidget(st)
+            btn = QPushButton(button)
+            btn.clicked.connect(action)
+            row.addWidget(btn)
+            slay.addLayout(row)
+            self.start_rows[key] = (st, btn)
+        self._granting = False
+        lay.addWidget(self.start_box)
+
         lay.addWidget(label("Models", "heading"))
         self.model_combos = {}
         self.model_sizes = {}
@@ -1463,6 +1541,53 @@ class SettingsWindow(QWidget):
         lay.addStretch(1)
         self.tabs.addTab(tab, "Setup")
 
+    def allow_access(self):
+        self._granting = True
+        self.refresh_start()
+        threading.Thread(
+            target=lambda: self.access_done.emit(grant_keyboard_access()),
+            daemon=True).start()
+
+    def _access_finished(self, _ok):
+        self._granting = False
+        self.refresh_start()
+
+    def trigger_change(self):
+        """Over to General, already waiting for the key."""
+        self.tabs.setCurrentIndex(0)
+        if not self.hk_capture.active:
+            self.hotkey_toggle()
+
+    def services_on(self):
+        for svc, _t in SERVICES:
+            set_service_enabled(svc, True,
+                                is_self=svc == "squelch-tray.service")
+        self.refresh_services()
+        self.refresh_start()
+
+    def refresh_start(self):
+        access = keyboard_access()
+        models = models_ready()
+        services = services_ready()
+        self.start_box.setVisible(
+            not (access == "ok" and models and services))
+        busy = self._downloading is not None
+        rows = {
+            "access": ("Waiting" if self._granting else
+                       {"ok": "Done", "restart": "Restart to finish",
+                        "no": "Needed"}[access],
+                       access == "no" and not self._granting),
+            "models": ("Done" if models else
+                       "Downloading" if busy else "Missing",
+                       not models and not busy),
+            "services": ("Done" if services else "Off", not services),
+            "trigger": (trigger_label(), True),
+        }
+        for key, (text, show_btn) in rows.items():
+            st, btn = self.start_rows[key]
+            st.setText(text)
+            btn.setVisible(show_btn)
+
     def model_changed(self, kind):
         path = self.model_combos[kind].currentData()
         if not path:
@@ -1519,6 +1644,7 @@ class SettingsWindow(QWidget):
                 "Download failed"):
             self.dl_status.setText(
                 f"Missing: {', '.join(ENGINE_NAMES[k] for k in missing)}")
+        self.refresh_start()
 
     def download_models(self):
         """Download button: the selected models that are missing."""
@@ -1945,6 +2071,9 @@ class SettingsWindow(QWidget):
             cb.blockSignals(False)
 
     def open(self, tab=0):
+        """tab None: Setup until it's done, else General."""
+        if tab is None:
+            tab = 0 if setup_done() else SETUP_TAB
         self.refresh_general()
         self.refresh_hotkey()
         self.refresh_insertion()
@@ -2045,6 +2174,40 @@ class TriggerWatcher:
             pass
 
 
+def tell_running_tray(msg):
+    """Hand `msg` to the tray that's already running; False if none is."""
+    sock = QLocalSocket()
+    sock.connectToServer(INSTANCE_SOCKET)
+    if not sock.waitForConnected(1000):
+        return False
+    sock.write(msg.encode() + b"\n")
+    sock.waitForBytesWritten(1000)
+    sock.disconnectFromServer()
+    return True
+
+
+class LaunchListener(QObject):
+    """Lets later launches reach this tray instead of starting another."""
+
+    def __init__(self, on_message):
+        super().__init__()
+        self.on_message = on_message
+        self.server = QLocalServer(self)
+        QLocalServer.removeServer(INSTANCE_SOCKET)  # left by a crash
+        self.server.listen(INSTANCE_SOCKET)
+        self.server.newConnection.connect(self._accept)
+
+    def _accept(self):
+        while self.server.hasPendingConnections():
+            sock = self.server.nextPendingConnection()
+            sock.readyRead.connect(lambda s=sock: self._read(s))
+            sock.disconnected.connect(sock.deleteLater)
+
+    def _read(self, sock):
+        while sock.canReadLine():
+            self.on_message(bytes(sock.readLine()).decode().strip())
+
+
 def fallback_icon():
     pm = QPixmap(64, 64)
     pm.fill(QColor(0, 0, 0, 0))
@@ -2060,7 +2223,15 @@ def fallback_icon():
 
 
 def main():
+    # --settings (the app menu entry) opens Settings, in the tray that's
+    # already running if there is one
+    want_settings = "--settings" in sys.argv[1:]
     app = QApplication(sys.argv)
+    # pass on the launcher's activation token, so Wayland lets the
+    # running tray raise its window
+    token = os.environ.get("XDG_ACTIVATION_TOKEN", "")
+    if tell_running_tray(f"settings {token}" if want_settings else "ping"):
+        return
     app.setApplicationName("Squelch")
     app.setDesktopFileName("squelch")
     app.setQuitOnLastWindowClosed(False)
@@ -2151,9 +2322,19 @@ def main():
             tap["pending"] = True
             tap_timer.start()
 
+    def on_launch(msg):
+        cmd, _sep, token = msg.partition(" ")
+        if cmd == "settings":
+            if token:
+                os.environ["XDG_ACTIVATION_TOKEN"] = token
+            open_settings(None)
+
     app.watcher = TriggerWatcher(on_menu_tap)  # keep it alive
+    app.listener = LaunchListener(on_launch)
     refresh()
     tray.show()
+    if want_settings:
+        QTimer.singleShot(0, lambda: open_settings(None))
     sys.exit(app.exec())
 
 
