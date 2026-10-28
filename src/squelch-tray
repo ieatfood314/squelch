@@ -28,8 +28,8 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication,
                              QButtonGroup, QCheckBox, QComboBox, QDialog,
                              QDoubleSpinBox, QHBoxLayout, QHeaderView,
                              QLabel, QLineEdit, QListWidget, QMenu,
-                             QPushButton, QRadioButton, QSystemTrayIcon,
-                             QTabWidget, QTableWidget, QTableWidgetItem,
+                             QPushButton, QRadioButton, QSlider,
+                             QSystemTrayIcon, QTabWidget, QTableWidget, QTableWidgetItem,
                              QVBoxLayout, QWidget)
 
 CONFIG_DIR = os.path.expanduser("~/.config/squelch")
@@ -44,6 +44,7 @@ HOTKEY_FILE = os.path.join(CONFIG_DIR, "hotkey")
 ENGINES_ENV = os.path.join(CONFIG_DIR, "engines.env")
 MIC_FILE = os.path.join(CONFIG_DIR, "mic")
 VRAM_FILE = os.path.join(CONFIG_DIR, "vram.json")
+APPEARANCE_FILE = os.path.join(CONFIG_DIR, "appearance.json")
 DEFAULT_HEADROOM_GB = 1.0
 # Same limits squelch-ptt applies: Parakeet's cap comes from free VRAM,
 # Whisper only has the stuck-key ceiling.
@@ -91,31 +92,63 @@ SERVICES = (("squelch-ptt.service", "Dictation"),
 # so the settings window is real glass; the tap card is a popover.
 FG, MUTED, FAINT = "#FFFFFF", "#7d8a99", "#4a5666"
 STEEL, STEEL_FOCUS, BORDER = "#31475F", "#6f93b8", "#1d2731"
-GLASS = "rgba(0, 0, 0, 0.40)"
 POPOVER = "rgba(6, 8, 11, 0.92)"
-APP_STYLE = f"""
-* {{ font-family: "JetBrains Mono", monospace; color: {FG}; }}
-QLabel#title {{ font-weight: bold; font-size: 14px; }}
+# Appearance tab choices. Accents are Earthrise's muted palette:
+# (key, name, fill for selections, bright for focus and indicators).
+ACCENTS = (("steel", "Steel blue", STEEL, STEEL_FOCUS),
+           ("green", "Green", "#3e554d", "#7fa493"),
+           ("cyan", "Cyan", "#3e5a67", "#88b2c4"),
+           ("violet", "Violet", "#514d62", "#9a93b5"),
+           ("sand", "Sand", "#726448", "#d0b681"),
+           ("red", "Red", "#6d3b2f", "#c87059"))
+TEXT_SIZES = (("small", "Small", 0.85),
+              ("normal", "Normal", 1.0),
+              ("large", "Large", 1.2))
+FONTS = (("mono", "Monospace"), ("system", "System"))
+DEFAULT_LOOK = {"accent": "steel", "opacity": 40, "size": "normal",
+                "font": "mono"}
+SETTINGS_SIZE = (640, 520)
+
+
+def glass(opacity):
+    return f"rgba(0, 0, 0, {opacity / 100:.2f})"
+
+
+def text_scale(look):
+    return {k: f for k, _n, f in TEXT_SIZES}[look["size"]]
+
+
+def app_style(look):
+    accents = {k: (fill, focus) for k, _n, fill, focus in ACCENTS}
+    fill, focus = accents[look["accent"]]
+    scale = text_scale(look)
+    base = QApplication.font().pointSizeF()
+    base = base if base > 0 else 10.0
+    family = ('font-family: "JetBrains Mono", monospace; '
+              if look["font"] == "mono" else "")
+    return f"""
+* {{ {family}font-size: {base * scale:.1f}pt; color: {FG}; }}
+QLabel#title {{ font-weight: bold; font-size: {round(14 * scale)}px; }}
 QLabel#heading {{ font-weight: bold; margin-top: 8px; }}
-QLabel#dim {{ color: {MUTED}; font-size: 11px; }}
-QLabel#num {{ font-weight: bold; font-size: 22px; }}
+QLabel#dim {{ color: {MUTED}; font-size: {round(11 * scale)}px; }}
+QLabel#num {{ font-weight: bold; font-size: {round(22 * scale)}px; }}
 QPushButton {{ background: transparent; border: 1px solid {BORDER};
     border-radius: 6px; padding: 5px 12px; }}
-QPushButton:hover, QPushButton:focus {{ border-color: {STEEL_FOCUS}; }}
-QPushButton:pressed {{ background: {STEEL}; }}
+QPushButton:hover, QPushButton:focus {{ border-color: {focus}; }}
+QPushButton:pressed {{ background: {fill}; }}
 QPushButton:disabled {{ color: {FAINT}; }}
 QLineEdit, QComboBox, QDoubleSpinBox {{ background: rgba(0, 0, 0, 0.5);
     border: 1px solid {BORDER}; border-radius: 6px; padding: 4px 6px; }}
 QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {{
-    border-color: {STEEL_FOCUS}; }}
+    border-color: {focus}; }}
 QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 0;
     border: none; }}
 QComboBox QAbstractItemView {{ background: {POPOVER};
-    selection-background-color: {STEEL}; border: 1px solid {BORDER}; }}
+    selection-background-color: {fill}; border: 1px solid {BORDER}; }}
 QListWidget, QTableWidget {{ background: rgba(0, 0, 0, 0.5);
     border: 1px solid {BORDER}; border-radius: 8px; gridline-color: {BORDER}; }}
 QListWidget::item:selected, QTableWidget::item:selected {{
-    background: {STEEL}; }}
+    background: {fill}; }}
 QHeaderView, QHeaderView::section, QTableCornerButton::section {{
     background: transparent; color: {MUTED}; border: none; padding: 6px; }}
 QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 8px;
@@ -123,15 +156,20 @@ QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 8px;
 QTabBar::tab {{ background: transparent; color: {MUTED};
     padding: 6px 14px; border-top-left-radius: 6px;
     border-top-right-radius: 6px; }}
-QTabBar::tab:selected {{ background: {STEEL}; color: {FG}; }}
+QTabBar::tab:selected {{ background: {fill}; color: {FG}; }}
 QCheckBox::indicator, QRadioButton::indicator {{ width: 12px; height: 12px;
-    border: 1px solid {STEEL_FOCUS}; background: transparent; }}
+    border: 1px solid {focus}; background: transparent; }}
 QRadioButton::indicator {{ border-radius: 7px; }}
 QCheckBox::indicator {{ border-radius: 3px; }}
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
-    background: {STEEL_FOCUS}; }}
+    background: {focus}; }}
+QSlider::groove:horizontal {{ height: 4px; background: {BORDER};
+    border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {focus}; border-radius: 2px; }}
+QSlider::handle:horizontal {{ background: {FG}; width: 12px;
+    margin: -4px 0; border-radius: 6px; }}
 QMenu {{ background: {POPOVER}; border: 1px solid {BORDER}; }}
-QMenu::item:selected {{ background: {STEEL}; }}
+QMenu::item:selected {{ background: {fill}; }}
 """
 
 
@@ -267,6 +305,26 @@ def read_headroom_gb():
 
 def write_headroom_gb(gb):
     atomic_write(VRAM_FILE, json.dumps({"headroom_gb": round(gb, 2)}))
+
+
+def read_appearance():
+    d = read_json(APPEARANCE_FILE, {})
+    if not isinstance(d, dict):
+        d = {}
+    look = dict(DEFAULT_LOOK)
+    for key, choices in (("accent", ACCENTS), ("size", TEXT_SIZES),
+                         ("font", FONTS)):
+        if d.get(key) in [c[0] for c in choices]:
+            look[key] = d[key]
+    try:
+        look["opacity"] = min(100, max(0, int(d.get("opacity", 40))))
+    except (TypeError, ValueError):
+        pass
+    return look
+
+
+def write_appearance(look):
+    atomic_write(APPEARANCE_FILE, json.dumps(look))
 
 
 def duration(seconds):
@@ -896,7 +954,8 @@ class EnginePopup(QWidget):
 
 
 class SettingsWindow(QWidget):
-    """General / Setup / Dictionary / Analytics tabs in one glass window."""
+    """General / Appearance / Setup / Dictionary / Analytics tabs in one
+    glass window."""
 
     suggested = pyqtSignal(str, object)  # term, [suggestions]
     suggest_failed = pyqtSignal(str)
@@ -915,23 +974,21 @@ class SettingsWindow(QWidget):
         self.suggested.connect(self._apply_suggestions)
         self.suggest_failed.connect(self._suggest_error)
         self.dl_done.connect(self._dl_finished)
-        self.resize(640, 520)
         CloseOnClickOff(self, self.close)
 
         # the glass and its edge live on a child panel: a translucent
         # top-level doesn't paint its own stylesheet background
-        panel = QWidget(self)
-        panel.setObjectName("glass")
-        panel.setStyleSheet(
-            f"#glass {{ background: {GLASS}; border: 1px solid {BORDER}; }}")
+        self.glass = QWidget(self)
+        self.glass.setObjectName("glass")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(panel)
-        lay = QVBoxLayout(panel)
+        outer.addWidget(self.glass)
+        lay = QVBoxLayout(self.glass)
         lay.setContentsMargins(16, 16, 16, 16)
         self.tabs = QTabWidget()
         lay.addWidget(self.tabs, 1)
         self._build_general()
+        self._build_appearance()
         self._build_setup()
         self._build_dictionary()
         self._build_analytics()
@@ -1001,6 +1058,99 @@ class SettingsWindow(QWidget):
             lay.addWidget(cb)
         lay.addStretch(1)
         self.tabs.addTab(tab, "General")
+
+    # ---- appearance tab ----
+    def _build_appearance(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(6)
+
+        lay.addWidget(label("Accent", "heading"))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.accent_group = QButtonGroup(tab)
+        self.accent_btns = {}
+        for key, name, _fill, focus in ACCENTS:
+            b = QPushButton()
+            b.setCheckable(True)
+            b.setToolTip(name)
+            b.setFixedSize(24, 24)
+            b.setStyleSheet(
+                f"QPushButton {{ background: {focus}; padding: 0;"
+                " border: 2px solid transparent; border-radius: 12px; }"
+                f" QPushButton:hover {{ border-color: {MUTED}; }}"
+                f" QPushButton:checked {{ border-color: {FG}; }}")
+            b.clicked.connect(lambda _c, k=key: self.look_changed(accent=k))
+            self.accent_group.addButton(b)
+            row.addWidget(b)
+            self.accent_btns[key] = b
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        lay.addWidget(label("Background opacity", "heading"))
+        row = QHBoxLayout()
+        self.opacity = QSlider(Qt.Orientation.Horizontal)
+        self.opacity.setRange(0, 100)
+        self.opacity.setSingleStep(5)
+        self.opacity.setPageStep(10)
+        self.opacity.valueChanged.connect(
+            lambda v: self.look_changed(opacity=v))
+        row.addWidget(self.opacity, 1)
+        self.opacity_pct = label("", "dim")
+        self.opacity_pct.setMinimumWidth(40)
+        self.opacity_pct.setAlignment(Qt.AlignmentFlag.AlignRight
+                                      | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self.opacity_pct)
+        lay.addLayout(row)
+
+        lay.addWidget(label("Text", "heading"))
+        self.look_combos = {}
+        for key, name, choices in (("size", "Size", TEXT_SIZES),
+                                   ("font", "Font", FONTS)):
+            row = QHBoxLayout()
+            row.addWidget(label(name), 1)
+            combo = QComboBox()
+            for c in choices:
+                combo.addItem(c[1], c[0])
+            combo.currentIndexChanged.connect(
+                lambda _i, k=key, c=combo:
+                self.look_changed(**{k: c.currentData()}))
+            row.addWidget(combo, 3)
+            lay.addLayout(row)
+            self.look_combos[key] = combo
+        lay.addStretch(1)
+        self.tabs.addTab(tab, "Appearance")
+
+    def look_changed(self, **change):
+        look = read_appearance()
+        look.update(change)
+        write_appearance(look)
+        self.apply_look(look)
+
+    def apply_look(self, look):
+        """Restyle everything live: app stylesheet, glass and window size."""
+        app = QApplication.instance()
+        app.setStyleSheet(app_style(look))
+        self.glass.setStyleSheet(
+            f"#glass {{ background: {glass(look['opacity'])};"
+            f" border: 1px solid {BORDER}; }}")
+        self.opacity_pct.setText(f"{look['opacity']}%")
+        scale = text_scale(look)
+        w, h = SETTINGS_SIZE
+        self.resize(round(w * scale), round(h * scale))
+
+    def refresh_appearance(self):
+        look = read_appearance()
+        self.accent_btns[look["accent"]].setChecked(True)
+        widgets = [self.opacity, *self.look_combos.values()]
+        for wdg in widgets:
+            wdg.blockSignals(True)
+        self.opacity.setValue(look["opacity"])
+        for key, combo in self.look_combos.items():
+            combo.setCurrentIndex(combo.findData(look[key]))
+        for wdg in widgets:
+            wdg.blockSignals(False)
+        self.apply_look(look)
 
     def filters_changed(self):
         self.on_filters({"defiller": self.cb_defill.isChecked(),
@@ -1582,6 +1732,7 @@ class SettingsWindow(QWidget):
         self.refresh_general()
         self.refresh_hotkey()
         self.refresh_insertion()
+        self.refresh_appearance()
         self.load_dict()
         self.refresh_or_status()
         self.refresh_analytics()
@@ -1686,7 +1837,7 @@ def main():
     app.setApplicationName("Squelch")
     app.setDesktopFileName("squelch")
     app.setQuitOnLastWindowClosed(False)
-    app.setStyleSheet(APP_STYLE)
+    app.setStyleSheet(app_style(read_appearance()))
 
     icon = QIcon.fromTheme("audio-input-microphone")
     if icon.isNull():

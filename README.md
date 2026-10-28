@@ -70,10 +70,11 @@ Focus a text field, hold your trigger key, speak, release.
 | Action | How |
 |---|---|
 | Dictate | hold trigger key, speak, release |
-| Settings (engine, trigger, insertion, cleanup, dictionary, analytics, setup) | tap trigger, double-tap for Settings, or tray menu |
+| Settings (engine, trigger, insertion, cleanup, appearance, dictionary, analytics, setup) | tap trigger, double-tap for Settings, or tray menu |
 | Engine switch | settings popup, General tab, or right-click tray icon |
 | Trigger key (Menu/Caps Lock/Scroll Lock) | settings → General (rewrites kanata binding) |
 | Insertion (paste/type/clipboard-only) | settings → General |
+| Accent color, background opacity, text size, font | settings → Appearance |
 | Speech models (picking one that isn't downloaded yet downloads it) | settings → Setup |
 | Microphone (default: PipeWire's default source) | settings → Setup |
 | Download models, autostart services, API key | settings → Setup (no terminal needed) |
