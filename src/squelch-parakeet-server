@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Resident Parakeet TDT server (Vulkan GPU) for the STT push-to-talk daemon.
 
-Keeps ggml-parakeet-tdt-0.6b-v3 in VRAM and exposes a whisper-server-like
-HTTP API on 127.0.0.1:1894:
+Keeps a Parakeet TDT 0.6B model (v3 multilingual or v2 English, whichever
+engines.env names) in VRAM and exposes a whisper-server-like HTTP API on
+127.0.0.1:1894:
   POST /inference  multipart (file=<wav>, response_format=json) -> {"text": ...}
   GET  /health     -> 200 ok
   GET  /limits?headroom_mb=N -> {"free_mb", "total_mb", "max_seconds"}:

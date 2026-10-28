@@ -1,5 +1,5 @@
 [Unit]
-Description=parakeet TDT v3 server (Vulkan GPU, resident in VRAM)
+Description=parakeet TDT server (Vulkan GPU, resident in VRAM)
 After=pipewire.service
 Wants=pipewire.service
 

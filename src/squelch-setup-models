@@ -2,7 +2,7 @@
 """squelch-setup-models — download the on-device speech models.
 
   squelch-setup-models           the two defaults (~1.2 GB): Parakeet
-                                 Standard (English and 24 other European
+                                 Multilingual (English and 24 other European
                                  languages) and Whisper Turbo (any language)
   squelch-setup-models ID ...    specific models from the list below
   squelch-setup-models --list    show every model, * = downloaded
@@ -11,6 +11,7 @@ Resumable: each file downloads to NAME.part and is renamed only once
 complete, so a failed or partial download never looks like a model.
 The tray's Settings → Setup uses the same CATALOG.
 """
+import hashlib
 import os
 import subprocess
 import sys
@@ -18,34 +19,59 @@ import sys
 PARAKEET_DIR = os.path.expanduser("~/.local/share/parakeet")
 WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp/models")
 _PARAKEET_URL = "https://huggingface.co/ggml-org/parakeet-GGUF/resolve/main/"
+# ggml-org only converts v3. This is a community conversion of NVIDIA's v2
+# for the same whisper.cpp engine, so its files are pinned in SHA256.
+_PARAKEET_V2_URL = ("https://huggingface.co/JoaoZaokk/"
+                    "parakeet-tdt-0.6b-v2-ggml/resolve/main/")
 _WHISPER_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
 
-# (id, engine, label, file, bytes, default). Smaller models are for GPUs
+# (id, engine, label, url, bytes, default). Parakeet v3 (Multilingual)
+# knows English and 24 other European languages; v2 (English) knows only
+# English but is a little more accurate at it. Smaller models are for GPUs
 # with little VRAM; Whisper Large is the most accurate for other languages
 # but several times slower than Turbo.
 CATALOG = [
-    ("parakeet", "parakeet", "Standard",
-     "ggml-parakeet-tdt-0.6b-v3-q8_0.bin", 668757119, True),
-    ("parakeet-small", "parakeet", "Small",
-     "ggml-parakeet-tdt-0.6b-v3-q4_k.bin", 415611879, False),
+    ("parakeet", "parakeet", "Multilingual",
+     _PARAKEET_URL + "ggml-parakeet-tdt-0.6b-v3-q8_0.bin", 668757119, True),
+    ("parakeet-small", "parakeet", "Multilingual small",
+     _PARAKEET_URL + "ggml-parakeet-tdt-0.6b-v3-q4_k.bin", 415611879, False),
+    ("parakeet-en", "parakeet", "English",
+     _PARAKEET_V2_URL + "ggml-parakeet-tdt-0.6b-v2-q8_0.bin", 658909748,
+     False),
+    ("parakeet-en-small", "parakeet", "English small",
+     _PARAKEET_V2_URL + "ggml-parakeet-tdt-0.6b-v2-q5_0.bin", 427494308,
+     False),
     ("whisper", "whisper", "Turbo",
-     "ggml-large-v3-turbo-q5_0.bin", 574041195, True),
+     _WHISPER_URL + "ggml-large-v3-turbo-q5_0.bin", 574041195, True),
     ("whisper-small", "whisper", "Small",
-     "ggml-small-q5_1.bin", 190085487, False),
+     _WHISPER_URL + "ggml-small-q5_1.bin", 190085487, False),
     ("whisper-large", "whisper", "Large",
-     "ggml-large-v3-q5_0.bin", 1081140203, False),
+     _WHISPER_URL + "ggml-large-v3-q5_0.bin", 1081140203, False),
 ]
+SHA256 = {
+    "parakeet-en":
+        "668e1daca59c7a7b0c5072624e5c4abf99b84b60cee29cf2d0c82f1c9b97baa2",
+    "parakeet-en-small":
+        "f2d2b6eabaf77c8c67109e365db72fc4e20d69b52d1af184f3211ec7c530ae04",
+}
 
 
 def model_path(entry):
-    _id, engine, _label, name, _size, _default = entry
+    _id, engine, _label, url, _size, _default = entry
     return os.path.join(PARAKEET_DIR if engine == "parakeet"
-                         else WHISPER_DIR, name)
+                         else WHISPER_DIR, os.path.basename(url))
 
 
 def model_url(entry):
-    _id, engine, _label, name, _size, _default = entry
-    return (_PARAKEET_URL if engine == "parakeet" else _WHISPER_URL) + name
+    return entry[3]
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def find(model_id):
@@ -69,6 +95,10 @@ def fetch(entry):
     got = os.path.getsize(dest + ".part")
     if got < size * 0.95:  # a little slack in case the file is re-uploaded
         sys.exit(f"   only {got} bytes, expected about {size}; try again")
+    want = SHA256.get(entry[0])
+    if want and sha256(dest + ".part") != want:
+        os.remove(dest + ".part")
+        sys.exit("   checksum mismatch, file not saved")
     os.replace(dest + ".part", dest)
 
 
@@ -76,7 +106,7 @@ def main(argv):
     if argv[1:] == ["--list"]:
         for e in CATALOG:
             mark = "*" if os.path.exists(model_path(e)) else " "
-            print(f"{mark} {e[0]:16} {e[1]:9} {e[2]:9} {human(e[4]):>7}")
+            print(f"{mark} {e[0]:18} {e[1]:9} {e[2]:19} {human(e[4]):>7}")
         return 0
     if any(a.startswith("-") for a in argv[1:]):
         print(__doc__.strip())

@@ -4,10 +4,11 @@ Hold **Menu**, speak, release — the transcription appears at your cursor in
 well under a second. Tap **Menu** for a settings popup. Fully on-device,
 no cloud, no accounts.
 
-- **Fast GPU inference**: Parakeet TDT 0.6B v3 (English default, ~0.2 s for
-  11 s of audio) and Whisper large-v3-turbo (other-languages fallback),
-  via Vulkan — NVIDIA and AMD both work. The selected engine stays
-  resident in VRAM; the other one is unloaded
+- **Fast GPU inference**: Parakeet TDT 0.6B (default, ~0.2 s for 11 s of
+  audio; v3 multilingual, or v2 if you only dictate English, which is a
+  little more accurate) and Whisper large-v3-turbo (other-languages
+  fallback), via Vulkan — NVIDIA and AMD both work. The selected engine
+  stays resident in VRAM; the other one is unloaded
 - **Mic-array beamforming**: adaptive delay-and-sum across your mic's
   channels, high-pass, diffraction EQ, noise gate, normalization
 - **Layout-proof output**: pastes via clipboard + Shift+Insert, so Colemak
@@ -41,11 +42,18 @@ Settings → Setup, or `squelch-setup-models --list`:
 
 | Engine | Model | Size | For |
 |---|---|---|---|
-| Parakeet | Standard (default) | 638 MB | English and 24 other European languages |
-| Parakeet | Small | 396 MB | GPUs with little VRAM; same model, 4-bit |
+| Parakeet | Multilingual (default) | 638 MB | English and 24 other European languages (v3) |
+| Parakeet | Multilingual small | 396 MB | GPUs with little VRAM; same model, 4-bit |
+| Parakeet | English | 628 MB | English only, a little more accurate at it (v2) |
+| Parakeet | English small | 408 MB | GPUs with little VRAM; same model, 5-bit |
 | Whisper | Turbo (default) | 547 MB | any language |
 | Whisper | Small | 181 MB | weak GPUs |
 | Whisper | Large | 1.0 GB | best accuracy outside English, slower |
+
+ggml-org only publishes v3, so the English (v2) files come from a
+community conversion for the same whisper.cpp engine
+([JoaoZaokk/parakeet-tdt-0.6b-v2-ggml](https://huggingface.co/JoaoZaokk/parakeet-tdt-0.6b-v2-ggml)),
+pinned by SHA-256.
 
 Then wire up a trigger key — Menu by default (needs [kanata](https://github.com/jtroo/kanata)) —
 see [kanata/snippet.kbd](kanata/snippet.kbd), validate with
