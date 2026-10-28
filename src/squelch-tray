@@ -36,6 +36,7 @@ ENGINE_FILE = os.path.join(CONFIG_DIR, "engine")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 FILTERS_FILE = os.path.join(CONFIG_DIR, "filters.json")
 DICT_FILE = os.path.join(CONFIG_DIR, "dictionary.json")
+LEARNED_FILE = os.path.join(CONFIG_DIR, "learned.json")
 STATS_FILE = os.path.join(CONFIG_DIR, "stats.jsonl")
 INSERTION_FILE = os.path.join(CONFIG_DIR, "insertion.json")
 HOTKEY_FILE = os.path.join(CONFIG_DIR, "hotkey")
@@ -347,6 +348,49 @@ DICT_HELP = ("Your words. 'term' is the correct spelling. 'also_match' lists "
              "ways the engine mishears it, fixed automatically.")
 
 
+def pending_mishearings(entries):
+    """[(term, heard)] squelch-ptt spotted but that are real words, so they
+    wait for a yes/no. Ones already in the dictionary are dropped."""
+    d = read_json(LEARNED_FILE, {})
+    out = []
+    for p in d.get("pending", []) if isinstance(d, dict) else []:
+        if not isinstance(p, dict):
+            continue
+        e = find_entry(entries, str(p.get("term", "")))
+        heard = str(p.get("heard", "")).strip()
+        if e and heard and heard.lower() not in {
+                h.lower() for h in e["also_match"]}:
+            out.append((e["term"], heard))
+    return out
+
+
+def resolve_mishearing(term, heard, accept):
+    """Take (term, heard) off the pending list: accept adds it to the
+    dictionary, otherwise it's ignored for good."""
+    if accept:
+        def change(entries):
+            e = find_entry(entries, term)
+            if e is not None and heard.lower() not in {
+                    h.lower() for h in e["also_match"]}:
+                e["also_match"].append(heard)
+        update_dict(change)
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(LEARNED_FILE + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        d = read_json(LEARNED_FILE, {})
+        d = d if isinstance(d, dict) else {}
+        key = (term.lower(), heard.lower())
+        d["pending"] = [p for p in d.get("pending", [])
+                        if isinstance(p, dict) and
+                        (str(p.get("term", "")).lower(),
+                         str(p.get("heard", "")).lower()) != key]
+        if not accept:
+            d.setdefault("ignored", []).append(
+                {"term": term, "heard": heard})
+        atomic_write(LEARNED_FILE, json.dumps(d, indent=2,
+                                              ensure_ascii=False))
+
+
 # ---------------- kanata trigger key ----------------
 
 TRIGGER_RE = re.compile(r"\(\s*tap-hold\s+\d+\s+\d+\s+f23\s+f24\s*\)")
@@ -532,7 +576,31 @@ def setup_models_cmd():
     """squelch-setup-models next to this script (dev checkout) or on PATH."""
     here = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                         "squelch-setup-models")
-    return here if os.access(here, os.X_OK) else "squelch-setup-models"
+    if os.access(here, os.X_OK):
+        return here
+    return shutil.which("squelch-setup-models") or "squelch-setup-models"
+
+
+_catalog = []
+
+
+def model_catalog():
+    """[(id, engine, label, path, size text)] from squelch-setup-models'
+    CATALOG, so the downloadable models are listed in one place."""
+    if not _catalog:
+        try:
+            from importlib.machinery import SourceFileLoader
+            import importlib.util as iu
+            loader = SourceFileLoader("squelch_setup_models",
+                                      setup_models_cmd())
+            spec = iu.spec_from_loader("squelch_setup_models", loader)
+            m = iu.module_from_spec(spec)
+            loader.exec_module(m)
+            _catalog.extend((e[0], e[1], e[2], m.model_path(e), m.human(e[4]))
+                            for e in m.CATALOG)
+        except Exception as e:
+            print("model catalog unavailable:", e, file=sys.stderr)
+    return _catalog
 
 
 # ---------------- analytics ----------------
@@ -952,6 +1020,8 @@ class SettingsWindow(QWidget):
             lay.addLayout(row)
             self.model_combos[kind] = combo
             self.model_sizes[kind] = size
+        self._downloading = None  # label of the model being downloaded
+        self._dl_select = None    # (engine, path) to switch to once done
         dlrow = QHBoxLayout()
         self.dl_btn = QPushButton("Download")
         self.dl_btn.clicked.connect(self.download_models)
@@ -1004,56 +1074,78 @@ class SettingsWindow(QWidget):
         models = read_engine_models()
         if models.get(kind) == path:
             return
+        if not os.path.exists(path):
+            entry = next((c for c in model_catalog() if c[3] == path), None)
+            if entry is not None and self._downloading is None:
+                self._dl_select = (kind, path)
+                self.start_download([entry[0]], entry[2])
+            self.refresh_models()  # stay on the current model meanwhile
+            return
         models[kind] = path
         write_engine_models(models)
         self.refresh_models()
 
     def refresh_models(self):
         models = read_engine_models()
+        catalog = model_catalog()
         for kind, combo in self.model_combos.items():
-            files = list_model_files(kind)
-            path = models.get(kind, "")
-            if path not in [p for _n, _s, p in files]:
-                try:
-                    files.append((os.path.basename(path),
-                                  os.path.getsize(path) / 1048576, path))
-                except OSError:
-                    files.append((os.path.basename(path) + " (missing)",
-                                  0.0, path))
+            items = []  # (text, path)
+            for _id, eng, name, path, size in catalog:
+                if eng == kind:
+                    items.append((f"{name} · {size}" if os.path.exists(path)
+                                  else f"{name} · {size} · download", path))
+            listed = {p for _t, p in items}
+            for name, mb, path in list_model_files(kind):
+                if path not in listed:
+                    items.append((f"{name} · {mb:.0f} MB", path))
+            cur = models.get(kind, "")
+            if cur not in {p for _t, p in items}:
+                items.append((os.path.basename(cur), cur))
             combo.blockSignals(True)
             combo.clear()
-            for name, _sz, path in files:
-                combo.addItem(name, path)
-            i = combo.findData(models.get(kind))
+            for text, path in items:
+                combo.addItem(text, path)
+            i = combo.findData(cur)
             if i >= 0:
                 combo.setCurrentIndex(i)
             combo.blockSignals(False)
-            cur = [s for n, s, p in files if p == models.get(kind)]
             self.model_sizes[kind].setText(
-                f"{cur[0]:.0f} MB" if cur and cur[0] > 0 else "Missing")
+                "" if os.path.exists(cur) else "Missing")
         missing = [k for k in ("parakeet", "whisper")
                    if not os.path.exists(models.get(k, ""))]
-        downloading = self.dl_status.text() == "Downloading…"
-        self.dl_btn.setVisible(bool(missing) or downloading)
-        self.dl_status.setVisible(bool(missing) or downloading)
-        self.dl_btn.setEnabled(bool(missing) and not downloading)
-        if not downloading and not self.dl_status.text().startswith(
+        busy = self._downloading is not None
+        self.dl_btn.setVisible(bool(missing) and not busy)
+        self.dl_status.setVisible(bool(missing) or busy or bool(
+            self.dl_status.text()))
+        if busy:
+            self.dl_status.setText(f"Downloading {self._downloading}…")
+        elif missing and not self.dl_status.text().startswith(
                 "Download failed"):
             self.dl_status.setText(
-                f"Missing: {', '.join(ENGINE_NAMES[k] for k in missing)}"
-                if missing else "")
+                f"Missing: {', '.join(ENGINE_NAMES[k] for k in missing)}")
 
     def download_models(self):
-        self.dl_btn.setEnabled(False)
-        self.dl_status.setText("Downloading…")
-        threading.Thread(target=self._download_worker, daemon=True).start()
+        """Download button: the selected models that are missing."""
+        models = read_engine_models()
+        ids = [c[0] for c in model_catalog()
+               if c[3] in (models.get("parakeet"), models.get("whisper"))
+               and not os.path.exists(c[3])]
+        self._dl_select = None
+        self.start_download(ids, "models")
 
-    def _download_worker(self):
+    def start_download(self, ids, what):
+        self._downloading = what
+        self.dl_status.setText("")
+        self.refresh_models()
+        threading.Thread(target=self._download_worker, args=(ids,),
+                         daemon=True).start()
+
+    def _download_worker(self, ids):
         try:
-            r = subprocess.run([setup_models_cmd()], capture_output=True,
-                               text=True, timeout=3600)
+            r = subprocess.run([setup_models_cmd(), *ids],
+                               capture_output=True, text=True, timeout=3600)
             if r.returncode == 0:
-                self.dl_done.emit("Done")
+                self.dl_done.emit("")
             else:
                 err = (r.stderr.strip().splitlines() or ["error"])[-1]
                 self.dl_done.emit(f"Download failed: {err[:80]}")
@@ -1061,8 +1153,15 @@ class SettingsWindow(QWidget):
             self.dl_done.emit(f"Download failed: {e}")
 
     def _dl_finished(self, msg):
+        self._downloading = None
         self.dl_status.setText(msg)
-        self.dl_status.show()
+        if not msg and self._dl_select:
+            kind, path = self._dl_select
+            if os.path.exists(path):
+                models = read_engine_models()
+                models[kind] = path
+                write_engine_models(models)
+        self._dl_select = None
         self.refresh_models()
 
     def headroom_changed(self, gb):
@@ -1157,6 +1256,24 @@ class SettingsWindow(QWidget):
         detrow.addWidget(rm_btn)
         lay.addLayout(detrow)
 
+        self.learned_box = QWidget()
+        lb = QVBoxLayout(self.learned_box)
+        lb.setContentsMargins(0, 8, 0, 0)
+        lb.setSpacing(8)
+        lb.addWidget(label("Possible mishearings", "dim"))
+        self.learned_list = QListWidget()
+        self.learned_list.setMaximumHeight(96)
+        lb.addWidget(self.learned_list)
+        lrow = QHBoxLayout()
+        lrow.addStretch(1)
+        for text, accept in (("Add", True), ("Ignore", False)):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _=False, a=accept: self.learned_resolve(a))
+            lrow.addWidget(b)
+        lb.addLayout(lrow)
+        lay.addWidget(self.learned_box)
+        self.learned_pairs = []
+
         self.or_status = label("", "dim", wrap=True)
         lay.addWidget(self.or_status)
         self.tabs.addTab(tab, "Dictionary")
@@ -1178,6 +1295,26 @@ class SettingsWindow(QWidget):
                     if select and e["term"].lower() == select.lower()), -1)
         self.term_list.setCurrentRow(row)
         self.dict_select(row)
+        self.show_learned()
+
+    def show_learned(self):
+        self.learned_pairs = pending_mishearings(self.dict_entries)
+        self.learned_list.clear()
+        for term, heard in self.learned_pairs:
+            self.learned_list.addItem(f"“{heard}” → {term}")
+        if self.learned_pairs:
+            self.learned_list.setCurrentRow(0)
+        self.learned_box.setVisible(bool(self.learned_pairs))
+
+    def learned_resolve(self, accept):
+        row = self.learned_list.currentRow()
+        if not 0 <= row < len(self.learned_pairs):
+            return
+        term, heard = self.learned_pairs[row]
+        resolve_mishearing(term, heard, accept)
+        self.show_dict(load_dict(), self.selected_term())
+        self.or_status.setText(f"“{heard}” now becomes {term}" if accept
+                               else f"Ignored “{heard}”")
 
     def load_dict(self):
         self.show_dict(load_dict(), self.selected_term())

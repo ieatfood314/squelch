@@ -12,6 +12,7 @@ Usage:
   squelch-ptt --probe-mic    record 2.5 s, report whether the mic delivers audio
   squelch-ptt --reset-mic    power-cycle the mic's USB port and re-probe
 """
+import fcntl
 import glob
 import json
 import os
@@ -244,12 +245,19 @@ def read_vocab():
 
 def aspell_unknown(words):
     """Words aspell doesn't know (empty set on any failure -> mine nothing)."""
+    return aspell_check(words) or set()
+
+
+def aspell_check(words):
+    """Lowercased words aspell doesn't know, or None if aspell can't run."""
     try:
         p = subprocess.run(["aspell", "-a", "--lang=en_US"],
                            input="\n".join(words) + "\n",
                            capture_output=True, text=True, timeout=30)
     except Exception:
-        return set()
+        return None
+    if p.returncode != 0:
+        return None
     out = set()
     for line in p.stdout.splitlines():
         if line.startswith(("&", "#")):
@@ -268,16 +276,19 @@ def mine_vocab():
     except OSError:
         return
     counts = {}
+    texts = []
     for line in rows:
         try:
             parsed = json.loads(line)
             text = parsed.get("text", "") if isinstance(parsed, dict) else ""
         except (ValueError, AttributeError):
             continue
+        texts.append(text)
         for w in re.findall(r"[a-zA-Z']{4,}", text.lower()):
             w = w.strip("'")
             if len(w) >= 4 and w not in STOPWORDS:
                 counts[w] = counts.get(w, 0) + 1
+    learn_mishearings(texts)
     frequent = sorted([w for w, c in counts.items() if c >= 3])
     if not frequent:
         return
@@ -298,19 +309,217 @@ def mine_vocab():
 
 
 def maybe_adapt_vocab(text):
-    global _adapt_counter
+    """Log the transcript and learn from it, off the paste path."""
     if os.environ.get("STT_NO_STATS"):
         return
-    log_transcript(text)
-    if not text:
-        return
-    _adapt_counter += 1
-    if _adapt_counter % 25 != 1:
-        return
+    threading.Thread(target=_adapt, args=(text,), daemon=True).start()
+
+
+def _adapt(text):
+    global _adapt_counter
+    with _adapt_lock:
+        log_transcript(text)
+        if not text:
+            return
+        _adapt_counter += 1
+        try:
+            if _adapt_counter % 25 == 1:
+                mine_vocab()  # rescans recent history, mishearings included
+            else:
+                learn_mishearings([text])
+        except Exception as e:
+            log("vocab mining failed:", e)
+
+
+# ---- learned mishearings: near-misses of your dictionary words ----
+# Parakeet takes no prompt, so the dictionary's also_match fixes are the only
+# way to steer it. Spans of a transcript that look and sound like a
+# dictionary word ("QubitTrint", "Cache OS") are mishearings of it. Non-words
+# and spacing variants are added straight away (rewriting a non-word can't
+# damage real text); real-word spans wait in learned.json for you to accept
+# or ignore in the Dictionary tab.
+
+LEARNED_FILE = os.path.expanduser("~/.config/squelch/learned.json")
+DICT_HELP = ("Your words. 'term' is the correct spelling. 'also_match' lists "
+             "ways the engine mishears it, fixed automatically.")
+_adapt_lock = threading.Lock()
+_spell_cache = {}  # word -> True if aspell knows it
+TOKEN_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)*")
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _skeleton(s):
+    """Rough sound key: first letter, then consonants with look-alike
+    spellings merged and doubles collapsed (qubittrint, qbittorrent -> kbtrnt)."""
+    s = _norm(s)
+    for a, b in (("ph", "f"), ("ck", "k"), ("c", "k"), ("q", "k"),
+                 ("z", "s"), ("x", "ks")):
+        s = s.replace(a, b)
+    s = s[:1] + re.sub(r"[aeiouwyh]", "", s[1:])
+    return re.sub(r"(.)\1+", r"\1", s)
+
+
+def _similarity(cand, term):
+    import difflib
+    a, b = _norm(cand), _norm(term)
+    r = difflib.SequenceMatcher(None, a, b).ratio()
+    sk = _skeleton(term)
+    if r >= 0.6 and len(sk) >= 3 and _skeleton(cand) == sk:
+        r = max(r, 0.85)
+    return r
+
+
+def _spell_known(words):
+    """{word: known?} via aspell, cached; None if aspell can't run. Words
+    with digits ("T3") are never plain English; aspell just skips them."""
+    words = set(words)  # case kept: aspell knows "OS" but not "os"
+    for w in words:
+        if any(c.isdigit() for c in w):
+            _spell_cache[w] = False
+    todo = sorted(w for w in words if w not in _spell_cache)
+    if todo:
+        unknown = aspell_check(todo)
+        if unknown is None:
+            return None
+        for w in todo:
+            _spell_cache[w] = w.lower() not in unknown
+    return {w: _spell_cache[w] for w in words}
+
+
+def find_near_misses(text, terms):
+    """[(term, heard)] for spans of text that are likely mishearings of a
+    dictionary term. Each span is 1-3 words joined only by spaces/hyphens;
+    overlapping spans keep the best match."""
+    toks = list(TOKEN_RE.finditer(text))
+    found = []  # (score, start, end, term, heard)
+    for term in terms:
+        tn = _norm(term)
+        if len(tn) < 5:
+            continue
+        for i in range(len(toks)):
+            for n in (1, 2, 3):
+                if i + n > len(toks):
+                    break
+                span = toks[i:i + n]
+                if any(not re.fullmatch(r"[ -]",
+                                        text[a.end():b.start()])
+                       for a, b in zip(span, span[1:])):
+                    break
+                heard = text[span[0].start():span[-1].end()]
+                cn = _norm(heard)
+                if (heard.lower() == term.lower() or cn == tn + "s"
+                        or any(_norm(t.group()) == tn for t in span)
+                        or not 0.7 * len(tn) <= len(cn) <= 1.35 * len(tn)
+                        or _skeleton(heard)[:1] != _skeleton(term)[:1]):
+                    continue
+                s = _similarity(heard, term)
+                if s >= 0.8:
+                    found.append((s, span[0].start(), span[-1].end(),
+                                  term, heard))
+    out, taken = [], []
+    for s, a, b, term, heard in sorted(found, reverse=True):
+        if all(b <= x or a >= y for x, y in taken):
+            taken.append((a, b))
+            out.append((term, heard))
+    return out
+
+
+def _read_learned():
     try:
-        mine_vocab()
-    except Exception as e:
-        log("vocab mining failed:", e)
+        with open(LEARNED_FILE) as f:
+            d = json.load(f)
+        return {"pending": list(d.get("pending", [])),
+                "ignored": list(d.get("ignored", []))}
+    except (OSError, ValueError, AttributeError):
+        return {"pending": [], "ignored": []}
+
+
+def _write_json_atomic(path, obj):
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def learn_mishearings(texts):
+    """Find near-misses of dictionary words in texts; add the safe ones to
+    the dictionary and queue the rest for review. Idempotent."""
+    try:
+        with open(DICT_FILE) as f:
+            entries = json.load(f).get("entries", [])
+    except (OSError, ValueError, AttributeError):
+        return
+    have = {}
+    for e in entries:
+        term = str(e.get("term", "")).strip()
+        if term:
+            have[term] = {term.lower()} | {
+                str(m).strip().lower() for m in e.get("also_match") or []}
+    # Learning mishearings of plain English words ("Steam") would rewrite
+    # ordinary speech, so only your jargon gets this treatment.
+    known = _spell_known(t for t in have if " " not in t) or {}
+    terms = [t for t in have if not known.get(t, False)]
+    hits = {}
+    for text in texts:
+        for term, heard in find_near_misses(text, terms):
+            if heard.lower() not in have[term]:
+                hits[(term, heard.lower())] = (term, heard)
+    if not hits:
+        return
+    learned = _read_learned()
+    seen = {(p.get("term"), str(p.get("heard", "")).lower())
+            for p in learned["pending"] + learned["ignored"]}
+    auto, review = [], []
+    for term, heard in hits.values():
+        words = [t.group() for t in TOKEN_RE.finditer(heard)]
+        spell = _spell_known(words)
+        if _norm(heard) == _norm(term) or (
+                spell is not None and not all(spell.values())):
+            auto.append((term, heard))
+        elif (term, heard.lower()) not in seen:
+            review.append((term, heard))
+    if auto:
+        add_mishearings(auto)
+        for term, heard in auto:
+            log(f"learned: {heard!r} -> {term}")
+        notify_stt("Squelch learned a word",
+                   ", ".join(f"{h} → {t}" for t, h in auto))
+    if review:
+        with open(LEARNED_FILE + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            learned = _read_learned()
+            seen = {(p.get("term"), str(p.get("heard", "")).lower())
+                    for p in learned["pending"] + learned["ignored"]}
+            for term, heard in review:
+                if (term, heard.lower()) not in seen:
+                    learned["pending"].append({"term": term, "heard": heard})
+                    log(f"possible mishearing: {heard!r} -> {term}")
+            _write_json_atomic(LEARNED_FILE, learned)
+
+
+def add_mishearings(pairs):
+    """Append (term, heard) pairs to the dictionary, under the lock the tray
+    and squelch CLI use, re-reading it fresh so nobody's edits are lost."""
+    with open(DICT_FILE + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(DICT_FILE) as f:
+                entries = json.load(f).get("entries", [])
+        except (OSError, ValueError, AttributeError):
+            return
+        for term, heard in pairs:
+            e = next((x for x in entries if isinstance(x, dict) and
+                      str(x.get("term", "")).lower() == term.lower()), None)
+            if e is None:
+                continue
+            ms = e.setdefault("also_match", [])
+            if heard.lower() not in {str(m).lower() for m in ms}:
+                ms.append(heard)
+        _write_json_atomic(DICT_FILE, {"_help": DICT_HELP,
+                                       "entries": entries})
 
 
 ENGINE_PORTS = {"parakeet": 1894, "whisper": 1893}

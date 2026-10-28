@@ -1,31 +1,105 @@
-#!/bin/sh
-# squelch-setup-models — download the on-device speech models.
-# Whisper large-v3-turbo (q5_0, multilingual/French fallback) and
-# Parakeet TDT 0.6B v3 (q8_0, English default). ~1.2 GB total. Resumable:
-# each file downloads to NAME.part and is renamed only once complete, so a
-# failed or partial download never looks like a model.
-set -e
-WDIR="$HOME/.local/share/whisper.cpp/models"
-PDIR="$HOME/.local/share/parakeet"
+#!/usr/bin/env python3
+"""squelch-setup-models — download the on-device speech models.
 
-fetch() {  # fetch DEST URL MIN_BYTES
-    [ -s "$1" ] && { echo "   already there"; return 0; }
-    mkdir -p "$(dirname "$1")"
-    curl -fL --retry 3 -C - -o "$1.part" "$2"
-    size=$(stat -c %s "$1.part")
-    if [ "$size" -lt "$3" ]; then
-        echo "   only $size bytes, expected at least $3; try again" >&2
-        exit 1
-    fi
-    mv "$1.part" "$1"
-}
+  squelch-setup-models           the two defaults (~1.2 GB): Parakeet
+                                 Standard (English and 24 other European
+                                 languages) and Whisper Turbo (any language)
+  squelch-setup-models ID ...    specific models from the list below
+  squelch-setup-models --list    show every model, * = downloaded
 
-echo "-> whisper large-v3-turbo-q5_0 (~550 MB)"
-fetch "$WDIR/ggml-large-v3-turbo-q5_0.bin" \
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin" \
-  500000000
-echo "-> parakeet-tdt-0.6b-v3-q8_0 (~670 MB)"
-fetch "$PDIR/ggml-parakeet-tdt-0.6b-v3-q8_0.bin" \
-  "https://huggingface.co/ggml-org/parakeet-GGUF/resolve/main/ggml-parakeet-tdt-0.6b-v3-q8_0.bin" \
-  600000000
-echo "done. Enable with: systemctl --user enable --now squelch-ptt squelch-tray squelch-vram squelch-ydotoold"
+Resumable: each file downloads to NAME.part and is renamed only once
+complete, so a failed or partial download never looks like a model.
+The tray's Settings → Setup uses the same CATALOG.
+"""
+import os
+import subprocess
+import sys
+
+PARAKEET_DIR = os.path.expanduser("~/.local/share/parakeet")
+WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp/models")
+_PARAKEET_URL = "https://huggingface.co/ggml-org/parakeet-GGUF/resolve/main/"
+_WHISPER_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+
+# (id, engine, label, file, bytes, default). Smaller models are for GPUs
+# with little VRAM; Whisper Large is the most accurate for other languages
+# but several times slower than Turbo.
+CATALOG = [
+    ("parakeet", "parakeet", "Standard",
+     "ggml-parakeet-tdt-0.6b-v3-q8_0.bin", 668757119, True),
+    ("parakeet-small", "parakeet", "Small",
+     "ggml-parakeet-tdt-0.6b-v3-q4_k.bin", 415611879, False),
+    ("whisper", "whisper", "Turbo",
+     "ggml-large-v3-turbo-q5_0.bin", 574041195, True),
+    ("whisper-small", "whisper", "Small",
+     "ggml-small-q5_1.bin", 190085487, False),
+    ("whisper-large", "whisper", "Large",
+     "ggml-large-v3-q5_0.bin", 1081140203, False),
+]
+
+
+def model_path(entry):
+    _id, engine, _label, name, _size, _default = entry
+    return os.path.join(PARAKEET_DIR if engine == "parakeet"
+                         else WHISPER_DIR, name)
+
+
+def model_url(entry):
+    _id, engine, _label, name, _size, _default = entry
+    return (_PARAKEET_URL if engine == "parakeet" else _WHISPER_URL) + name
+
+
+def find(model_id):
+    return next((e for e in CATALOG if e[0] == model_id), None)
+
+
+def human(nbytes):
+    mb = nbytes / 1048576
+    return f"{mb / 1024:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
+
+
+def fetch(entry):
+    dest, size = model_path(entry), entry[4]
+    print(f"-> {entry[2]} {entry[1]} ({human(size)})", flush=True)
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        print("   already there", flush=True)
+        return
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    subprocess.run(["curl", "-fL", "--retry", "3", "-C", "-",
+                    "-o", dest + ".part", model_url(entry)], check=True)
+    got = os.path.getsize(dest + ".part")
+    if got < size * 0.95:  # a little slack in case the file is re-uploaded
+        sys.exit(f"   only {got} bytes, expected about {size}; try again")
+    os.replace(dest + ".part", dest)
+
+
+def main(argv):
+    if argv[1:] == ["--list"]:
+        for e in CATALOG:
+            mark = "*" if os.path.exists(model_path(e)) else " "
+            print(f"{mark} {e[0]:16} {e[1]:9} {e[2]:9} {human(e[4]):>7}")
+        return 0
+    if any(a.startswith("-") for a in argv[1:]):
+        print(__doc__.strip())
+        return 2
+    wanted = argv[1:] or [e[0] for e in CATALOG if e[5]]
+    entries = [find(i) for i in wanted]
+    if None in entries:
+        bad = [i for i, e in zip(wanted, entries) if e is None]
+        print(f"unknown model: {', '.join(bad)} (see --list)",
+              file=sys.stderr)
+        return 2
+    try:
+        for e in entries:
+            fetch(e)
+    except subprocess.CalledProcessError as ex:
+        print(f"download failed (curl exit {ex.returncode}); run again to "
+              "resume", file=sys.stderr)
+        return 1
+    if not argv[1:]:
+        print("done. Enable with: systemctl --user enable --now squelch-ptt "
+              "squelch-tray squelch-vram squelch-ydotoold")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

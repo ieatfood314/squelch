@@ -15,7 +15,8 @@ no cloud, no accounts.
   instead, since web editors like Word online ignore Shift+Insert
 - **Text cleanup**: filler words (um/uh/ah…) removed, number words over ten
   (optionally all) written as digits, custom dictionary with AI-suggested
-  mishearings via OpenRouter
+  mishearings via OpenRouter, and mishearings learned from your own
+  dictation
 - **Game mode**: models unload once a game has been fullscreen for 10 s and
   reload after. Browsers, video players, the lock screen and Spectacle
   going fullscreen don't count
@@ -34,6 +35,17 @@ small tweaks.
 yay -S squelch
 squelch-setup-models     # downloads ~1.2 GB of models, resumable
 ```
+
+That gets the two default models. Smaller and larger ones are in
+Settings → Setup, or `squelch-setup-models --list`:
+
+| Engine | Model | Size | For |
+|---|---|---|---|
+| Parakeet | Standard (default) | 638 MB | English and 24 other European languages |
+| Parakeet | Small | 396 MB | GPUs with little VRAM; same model, 4-bit |
+| Whisper | Turbo (default) | 547 MB | any language |
+| Whisper | Small | 181 MB | weak GPUs |
+| Whisper | Large | 1.0 GB | best accuracy outside English, slower |
 
 Then wire up a trigger key — Menu by default (needs [kanata](https://github.com/jtroo/kanata)) —
 see [kanata/snippet.kbd](kanata/snippet.kbd), validate with
@@ -54,11 +66,12 @@ Focus a text field, hold your trigger key, speak, release.
 | Engine switch | settings popup, General tab, or right-click tray icon |
 | Trigger key (Menu/Caps Lock/Scroll Lock) | settings → General (rewrites kanata binding) |
 | Insertion (paste/type/clipboard-only) | settings → General |
-| Speech models (per-engine file) | settings → Setup |
+| Speech models (picking one that isn't downloaded yet downloads it) | settings → Setup |
 | Microphone (default: PipeWire's default source) | settings → Setup |
 | Download models, autostart services, API key | settings → Setup (no terminal needed) |
 | Dictionary: `squelch WORD [mishearings…]` | AI suggests what it sounds like when an OpenRouter key is configured (`~/.config/squelch/openrouter.key`, chmod 600); `--no-ai` skips that |
 | Dictionary editor | settings → Dictionary tab (Add/Suggest/Remove) |
+| Learned mishearings | settings → Dictionary tab, under Possible mishearings (Add/Ignore) |
 | Analytics dashboard | settings → Analytics tab, or glance line on the tap card |
 
 Other languages: switch to Whisper in the popup (auto language
@@ -83,7 +96,14 @@ and transcript go there. If the directory is unreachable (a NAS that's
 away), the last 100 utterances wait in `~/.config/squelch/spool` and upload
 later. No file, no archive. Adaptation is fully on-device either way:
 frequent words you actually say are mined into your Whisper vocabulary
-prompt over time. No gradients leave your machine, ever.
+prompt over time. And when a transcript has something that looks and
+sounds like one of your dictionary words ("QubitTrint" for qBittorrent),
+Squelch learns it as a mishearing. If it isn't a real word, it's added
+straight away and you get a notification. If it is made of real words
+("Cache OS"), it waits under Possible mishearings in the Dictionary tab
+for you to add or ignore. Dictionary words that are plain English are
+left alone, so ordinary speech never gets rewritten. Both need
+`aspell-en`. No gradients leave your machine, ever.
 
 Music (any MPRIS player) pauses while you hold the trigger and resumes on
 release, so it never bleeds into the mic.
