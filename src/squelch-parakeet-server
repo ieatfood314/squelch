@@ -92,7 +92,10 @@ ggml.ggml_backend_dev_memory.restype = None
 ggml.ggml_backend_dev_memory.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
     ctypes.POINTER(ctypes.c_size_t)]
+# Integrated GPUs (Intel, AMD APUs) report IGPU, and parakeet runs on them
+# too, counting both kinds when it picks gpu_device.
 GGML_BACKEND_DEVICE_TYPE_GPU = 1
+GGML_BACKEND_DEVICE_TYPE_IGPU = 2
 
 lib = _load("libparakeet.so.1")
 lib.parakeet_context_default_params.restype = CtxParams
@@ -132,7 +135,8 @@ def gpu_memory_mb():
     gpus = 0
     for i in range(ggml.ggml_backend_dev_count()):
         dev = ggml.ggml_backend_dev_get(i)
-        if ggml.ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU:
+        if ggml.ggml_backend_dev_type(dev) not in (
+                GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU):
             continue
         if gpus == GPU_DEVICE:
             free, total = ctypes.c_size_t(), ctypes.c_size_t()

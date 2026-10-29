@@ -7,7 +7,7 @@ no cloud, no accounts.
 - **Fast GPU inference**: Parakeet TDT 0.6B (default, ~0.2 s for 11 s of
   audio; v3 multilingual, or v2 if you only dictate English, which is a
   little more accurate) and Whisper large-v3-turbo (other-languages
-  fallback), via Vulkan — NVIDIA and AMD both work. The selected engine
+  fallback), via Vulkan — NVIDIA, AMD and Intel (integrated too) work. The selected engine
   stays resident in VRAM; the other one is unloaded
 - **Mic-array beamforming**: adaptive delay-and-sum across your mic's
   channels, high-pass, diffraction EQ, noise gate, normalization
@@ -26,7 +26,8 @@ no cloud, no accounts.
 - **Everything survives reboot** via systemd user services
 
 Tested on EndeavourOS / KDE Plasma 6 / Wayland, AMD RX 5700,
-Logitech C920 webcam (stereo mic), with and without kanata. PipeWire required; KWin fullscreen
+Logitech C920 webcam (stereo mic), with and without kanata, and on a
+laptop with Intel Alder Lake graphics and its built-in mic. PipeWire required; KWin fullscreen
 detection and tray applet assume Plasma, other Wayland compositors need
 small tweaks.
 

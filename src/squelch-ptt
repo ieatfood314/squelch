@@ -619,9 +619,10 @@ def usb_id_of(props):
 
 
 def find_mic():
-    """{"target": node name or None, "usb": USB id or None} for the mic to
-    record from, or None if the configured mic is missing. Target None
-    means PipeWire's default source."""
+    """{"target": node name or None, "usb": USB id or None, "id": node id
+    or None, "muted": bool} for the mic to record from, or None if the
+    configured mic is missing. Target None means PipeWire's default
+    source."""
     want = configured_mic()
     try:
         out = subprocess.run(
@@ -642,7 +643,10 @@ def find_mic():
                     default = v.get("name") if isinstance(v, dict) else None
         props = info.get("props") or {}
         if props.get("media.class") == "Audio/Source":
-            sources.append(props)
+            mute = any(isinstance(x, dict) and x.get("mute")
+                       for x in (info.get("params") or {}).get("Props") or [])
+            sources.append(dict(props, **{"squelch.id": o.get("id"),
+                                          "squelch.muted": mute}))
     pick = None
     if want:
         pick = next((p for p in sources if p.get("node.name") == want), None)
@@ -658,7 +662,27 @@ def find_mic():
     usb = usb_id_of(pick) if pick else None
     if usb:
         _last_mic_usb["id"] = usb
-    return {"target": pick.get("node.name") if want else None, "usb": usb}
+    return {"target": pick.get("node.name") if want else None, "usb": usb,
+            "id": pick.get("squelch.id") if pick else None,
+            "muted": bool(pick and pick.get("squelch.muted"))}
+
+
+def unmute_mic(mic):
+    """Holding the trigger means the user wants the mic, so undo a mute
+    (a stray Mic Mute key otherwise turns every dictation into silence)."""
+    if not mic["muted"] or mic["id"] is None:
+        return
+    try:
+        r = subprocess.run(["wpctl", "set-mute", str(mic["id"]), "0"],
+                           capture_output=True, text=True, timeout=5)
+        ok = r.returncode == 0
+    except Exception as e:
+        ok, r = False, e
+    if ok:
+        log(f"mic {mic['id']} was muted, unmuted it")
+        notify_stt("Mic was muted", "Unmuted it.", urgency="normal")
+    else:
+        log("couldn't unmute the mic:", getattr(r, "stderr", r))
 
 
 # ---------------- DSP: mic-pair beamform + monitor-diffraction comp ----------------
@@ -695,6 +719,13 @@ def beamform_and_clean(path_in, path_out, sr=SR, max_s=None):
     a = a.reshape(-1, nch)
     if max_s:
         a = a[:int(max_s * sr)]
+    if not a.any():
+        # Exact zeros: a live mic always has some noise floor, so this is
+        # a mute that unmute_mic couldn't see or undo (e.g. in hardware).
+        log("recording is all zeros (mic muted?), skipping")
+        notify_stt("Mic is muted", "Unmute it and try again.",
+                   urgency="normal")
+        return None
     a -= a.mean(axis=0, keepdims=True)
 
     if nch > 1:
@@ -1660,6 +1691,7 @@ def start_hold(code):
         resume_players(paused)
         recover_mic_async("not found")
         return None
+    unmute_mic(mic)
     fd, path = tempfile.mkstemp(suffix="-raw.wav")
     os.close(fd)
     proc = start_recording(mic["target"], path)
