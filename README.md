@@ -153,6 +153,12 @@ worked. Cutting port power needs a hub with per-port power switching; on
 ports without it you get a "replug it" notification. `squelch-ptt
 --probe-mic` checks the mic by hand, `--reset-mic` forces a reset.
 
+Holding the trigger unmutes a muted mic, including the real mic behind a
+virtual source like EasyEffects or echo-cancel, and tells you it did. A
+mute it can't undo (a hardware switch) gets a "Mic is muted"
+notification, and a virtual source with no mic feeding it gets "No mic
+behind …".
+
 ## Layout
 
 - `src/squelch-ptt` — push-to-talk daemon (record → beamform → transcribe → paste)

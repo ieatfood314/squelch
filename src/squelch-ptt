@@ -618,23 +618,42 @@ def usb_id_of(props):
     return name if USB_ID_RE.match(name) else None
 
 
-def find_mic():
-    """{"target": node name or None, "usb": USB id or None, "id": node id
-    or None, "muted": bool} for the mic to record from, or None if the
-    configured mic is missing. Target None means PipeWire's default
-    source."""
-    want = configured_mic()
+# Virtual sources (EasyEffects, echo-cancel, filter chains) sit between
+# the recording and a hardware mic, which is the one a mute would be on.
+SOURCE_CLASSES = ("Audio/Source", "Audio/Source/Virtual")
+
+
+def pw_objects():
+    """pw-dump's object list, or None if PipeWire can't be read."""
     try:
         out = subprocess.run(
             ["pw-dump"], capture_output=True, timeout=10).stdout
         objs = json.loads(out)
+        return [o for o in objs if isinstance(o, dict)]
     except Exception as e:
-        log("mic discovery failed:", e)
-        return None if want else {"target": None, "usb": None}
+        log("pw-dump failed:", e)
+        return None
+
+
+def node_muted(info):
+    return any(isinstance(x, dict) and x.get("mute")
+               for x in (info.get("params") or {}).get("Props") or [])
+
+
+def find_mic():
+    """{"target": node name or None, "usb": USB id or None, "id": node id
+    or None, "muted": bool, "virtual": bool, "desc": str} for the mic to
+    record from, or None if the configured mic is missing. Target None
+    means PipeWire's default source. Virtual: not a hardware device, so
+    the real mic is somewhere upstream of it."""
+    want = configured_mic()
+    objs = pw_objects()
+    if objs is None:
+        return None if want else {"target": None, "usb": None, "id": None,
+                                  "muted": False, "virtual": False,
+                                  "desc": ""}
     sources, default = [], None
     for o in objs:
-        if not isinstance(o, dict):
-            continue
         info = o.get("info") or {}
         if o.get("type", "").endswith(":Metadata"):
             for item in o.get("metadata") or []:
@@ -642,11 +661,9 @@ def find_mic():
                     v = item.get("value")
                     default = v.get("name") if isinstance(v, dict) else None
         props = info.get("props") or {}
-        if props.get("media.class") == "Audio/Source":
-            mute = any(isinstance(x, dict) and x.get("mute")
-                       for x in (info.get("params") or {}).get("Props") or [])
+        if props.get("media.class") in SOURCE_CLASSES:
             sources.append(dict(props, **{"squelch.id": o.get("id"),
-                                          "squelch.muted": mute}))
+                                          "squelch.muted": node_muted(info)}))
     pick = None
     if want:
         pick = next((p for p in sources if p.get("node.name") == want), None)
@@ -664,25 +681,79 @@ def find_mic():
         _last_mic_usb["id"] = usb
     return {"target": pick.get("node.name") if want else None, "usb": usb,
             "id": pick.get("squelch.id") if pick else None,
-            "muted": bool(pick and pick.get("squelch.muted"))}
+            "muted": bool(pick and pick.get("squelch.muted")),
+            "virtual": bool(pick and "device.id" not in pick),
+            "desc": (pick.get("node.description") or pick.get("node.name")
+                     or "") if pick else ""}
 
 
-def unmute_mic(mic):
+def unmute_node(node_id):
     """Holding the trigger means the user wants the mic, so undo a mute
     (a stray Mic Mute key otherwise turns every dictation into silence)."""
-    if not mic["muted"] or mic["id"] is None:
-        return
     try:
-        r = subprocess.run(["wpctl", "set-mute", str(mic["id"]), "0"],
+        r = subprocess.run(["wpctl", "set-mute", str(node_id), "0"],
                            capture_output=True, text=True, timeout=5)
         ok = r.returncode == 0
     except Exception as e:
         ok, r = False, e
     if ok:
-        log(f"mic {mic['id']} was muted, unmuted it")
+        log(f"mic {node_id} was muted, unmuted it")
         notify_stt("Mic was muted", "Unmuted it.", urgency="normal")
     else:
         log("couldn't unmute the mic:", getattr(r, "stderr", r))
+
+
+def upstream_mics(objs, node_id):
+    """Hardware sources feeding node_id, as {node id: muted}. Follows
+    links upstream, and hops across a node.link-group: loopbacks, filter
+    chains, echo-cancel and EasyEffects pass audio from their capture
+    stream to their source in-process, with no link between the two."""
+    nodes = {o.get("id"): o.get("info") or {} for o in objs
+             if o.get("type", "").endswith(":Node")}
+    feeds, groups = {}, {}
+    for o in objs:
+        if o.get("type", "").endswith(":Link"):
+            info = o.get("info") or {}
+            feeds.setdefault(info.get("input-node-id"), set()).add(
+                info.get("output-node-id"))
+    for nid, info in nodes.items():
+        group = (info.get("props") or {}).get("node.link-group")
+        if group:
+            groups.setdefault(group, set()).add(nid)
+    found, seen, todo = {}, {node_id}, [node_id]
+    while todo:
+        nid = todo.pop()
+        group = (nodes.get(nid, {}).get("props") or {}).get("node.link-group")
+        for up in feeds.get(nid, set()) | groups.get(group, set()):
+            if up in seen or up not in nodes:
+                continue
+            seen.add(up)
+            props = nodes[up].get("props") or {}
+            if (props.get("media.class") in SOURCE_CLASSES
+                    and "device.id" in props):
+                found[up] = node_muted(nodes[up])
+            else:
+                todo.append(up)
+    return found
+
+
+def check_upstream(mic, proc, source):
+    """Unmute the hardware mic behind a virtual source. Filters often
+    link it only while something records, so look once recording runs.
+    Sets source["fed"]: whether any hardware mic feeds the source."""
+    for _ in range(4):
+        time.sleep(0.4)
+        if proc.poll() is not None:
+            return
+        objs = pw_objects()
+        found = upstream_mics(objs, mic["id"]) if objs else {}
+        if found:
+            source["fed"] = True
+            for node_id, muted in found.items():
+                if muted:
+                    unmute_node(node_id)
+            return
+    source["fed"] = False
 
 
 # ---------------- DSP: mic-pair beamform + monitor-diffraction comp ----------------
@@ -703,10 +774,11 @@ def gcc_phat_lag(sig, ref, max_shift=8):
     return best_lag
 
 
-def beamform_and_clean(path_in, path_out, sr=SR, max_s=None):
+def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None):
     """Delay-and-sum the raw capsules, HP filter, HF shelf to compensate
     monitor-edge diffraction loss, gate room noise, normalize, trim.
-    Only the first max_s seconds are used when given."""
+    Only the first max_s seconds are used when given. source is the
+    hold's source info, for explaining a silent recording."""
     with wave.open(path_in, "rb") as w:
         nch, rate, nframes = (w.getnchannels(), w.getframerate(),
                               w.getnframes())
@@ -721,10 +793,19 @@ def beamform_and_clean(path_in, path_out, sr=SR, max_s=None):
         a = a[:int(max_s * sr)]
     if not a.any():
         # Exact zeros: a live mic always has some noise floor, so this is
-        # a mute that unmute_mic couldn't see or undo (e.g. in hardware).
-        log("recording is all zeros (mic muted?), skipping")
-        notify_stt("Mic is muted", "Unmute it and try again.",
-                   urgency="normal")
+        # a mute unmute_node couldn't see or undo (e.g. in hardware), or a
+        # virtual source nothing feeds.
+        source = source or {}
+        if source.get("virtual") and source.get("fed") is False:
+            log(f"recording is all zeros and no mic feeds "
+                f"{source.get('desc')!r}, skipping")
+            notify_stt("No mic behind " + (source.get("desc") or "the source"),
+                       "It isn't getting audio from any mic. Pick your mic "
+                       "in Settings.", urgency="normal")
+        else:
+            log("recording is all zeros (mic muted?), skipping")
+            notify_stt("Mic is muted", "Unmute it and try again.",
+                       urgency="normal")
         return None
     a -= a.mean(axis=0, keepdims=True)
 
@@ -1557,7 +1638,7 @@ def gaming():
         return False
 
 
-def process_utterance(raw_path, record=True, max_s=None):
+def process_utterance(raw_path, record=True, max_s=None, source=None):
     """DSP + transcribe + clean up text. record=False skips stats, the
     archive and vocabulary learning (for --process). Deletes raw_path."""
     t0 = time.time()
@@ -1566,7 +1647,8 @@ def process_utterance(raw_path, record=True, max_s=None):
         clean_path = f.name
     stats = log_stats if record else (lambda _entry: None)
     try:
-        info = beamform_and_clean(raw_path, clean_path, max_s=max_s)
+        info = beamform_and_clean(raw_path, clean_path, max_s=max_s,
+                                  source=source)
         if info is None:
             log("utterance empty after cleanup, skipping")
             stats({"outcome": "skipped", "engine": current_engine(),
@@ -1650,9 +1732,9 @@ def utterance_worker(jobs):
     so a new hold starts recording at once even while the last one is
     still being pasted."""
     while True:
-        rec_path, held, cap_s = jobs.get()
+        rec_path, held, cap_s, source = jobs.get()
         try:
-            text = process_utterance(rec_path, max_s=cap_s)
+            text = process_utterance(rec_path, max_s=cap_s, source=source)
             if held > cap_s:
                 notify_stt("Dictation cut short",
                            f"Kept the first {duration(cap_s)}.",
@@ -1691,17 +1773,22 @@ def start_hold(code):
         resume_players(paused)
         recover_mic_async("not found")
         return None
-    unmute_mic(mic)
+    if mic["muted"] and mic["id"] is not None:
+        unmute_node(mic["id"])
     fd, path = tempfile.mkstemp(suffix="-raw.wav")
     os.close(fd)
     proc = start_recording(mic["target"], path)
+    source = {"virtual": mic["virtual"], "fed": None, "desc": mic["desc"]}
+    if mic["virtual"] and mic["id"] is not None:
+        threading.Thread(target=check_upstream, args=(mic, proc, source),
+                         daemon=True).start()
     cap_s = max_hold_s(current_engine())
     cap = threading.Timer(cap_s, stop_recording, [proc])
     cap.daemon = True
     cap.start()
     log(f"recording... (cap {duration(cap_s)})")
     return {"proc": proc, "path": path, "paused": paused, "code": code,
-            "t": time.time(), "cap": cap, "cap_s": cap_s}
+            "t": time.time(), "cap": cap, "cap_s": cap_s, "source": source}
 
 
 def end_hold(rec, jobs):
@@ -1722,7 +1809,7 @@ def end_hold(rec, jobs):
         return
     if held > cap_s:
         log(f"held {held:.0f}s, keeping the first {cap_s:.0f}s")
-    jobs.put((path, held, cap_s))
+    jobs.put((path, held, cap_s, rec["source"]))
 
 
 def abandon_hold(rec):
