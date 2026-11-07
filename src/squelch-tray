@@ -1753,11 +1753,11 @@ class SettingsWindow(QWidget):
         self.add_field.returnPressed.connect(self.dict_add)
         add_btn = QPushButton("Add")
         add_btn.clicked.connect(self.dict_add)
-        key_btn = QPushButton("OpenRouter key")
-        key_btn.clicked.connect(self.open_key_dialog)
+        self.key_btn = QPushButton()
+        self.key_btn.clicked.connect(self.open_key_dialog)
         addrow.addWidget(self.add_field, 1)
         addrow.addWidget(add_btn)
-        addrow.addWidget(key_btn)
+        addrow.addWidget(self.key_btn)
         lay.addLayout(addrow)
 
         self.term_list = QListWidget()
@@ -1901,8 +1901,7 @@ class SettingsWindow(QWidget):
         lay.addWidget(label("Used by Suggest. Saved owner-only.", "dim"))
         field = QLineEdit()
         field.setEchoMode(QLineEdit.EchoMode.Password)
-        field.setPlaceholderText("Key set" if openrouter_key()
-                                 else "Paste key")
+        field.setPlaceholderText("Paste key")
         lay.addWidget(field)
         st = label("", "dim")
         lay.addWidget(st)
@@ -1914,6 +1913,10 @@ class SettingsWindow(QWidget):
         for b in (set_btn, clear_btn, close_btn):
             row.addWidget(b)
         lay.addLayout(row)
+
+        def show_state():
+            st.setText("Key set" if openrouter_key() else "No key set")
+            clear_btn.setEnabled(os.path.lexists(OPENROUTER_KEY_FILE))
 
         def forget_model():
             try:
@@ -1933,18 +1936,18 @@ class SettingsWindow(QWidget):
             os.chmod(OPENROUTER_KEY_FILE, 0o600)
             forget_model()
             field.clear()
-            field.setPlaceholderText("Key set")
-            st.setText("Saved")
+            show_state()
+            st.setText("Key saved")
 
         def do_clear():
             try:
                 os.unlink(OPENROUTER_KEY_FILE)
-                st.setText("Removed")
             except OSError:
-                st.setText("No key set")
+                pass
             forget_model()
-            field.setPlaceholderText("Paste key")
+            show_state()
 
+        show_state()
         set_btn.clicked.connect(do_set)
         clear_btn.clicked.connect(do_clear)
         close_btn.clicked.connect(dlg.accept)
@@ -1958,7 +1961,10 @@ class SettingsWindow(QWidget):
         self.refresh_or_status()
 
     def refresh_or_status(self):
-        self.or_status.setText("" if openrouter_key()
+        have = bool(openrouter_key())
+        self.key_btn.setText("OpenRouter key: Set" if have
+                             else "OpenRouter key: Not set")
+        self.or_status.setText("" if have
                                else "No OpenRouter key: Suggest is off")
 
     def suggest(self):

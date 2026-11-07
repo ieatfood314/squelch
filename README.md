@@ -100,9 +100,10 @@ config, Change moves it to the new key for you.
 | Accent color, background opacity, text size, font | settings → Appearance |
 | Speech models (picking one that isn't downloaded yet downloads it) | settings → Setup |
 | Microphone (default: PipeWire's default source) | settings → Setup |
-| Download models, autostart services, keyboard access, API key | settings → Setup (no terminal needed; until it's all done, the app menu opens Setup with a Get started list) |
+| Download models, autostart services, keyboard access | settings → Setup (no terminal needed; until it's all done, the app menu opens Setup with a Get started list) |
 | Dictionary: `squelch WORD [mishearings…]` | AI suggests what it sounds like when an OpenRouter key is configured (`~/.config/squelch/openrouter.key`, chmod 600); `--no-ai` skips that |
 | Dictionary editor | settings → Dictionary tab (Add/Suggest/Remove) |
+| OpenRouter key | settings → Dictionary tab; the button shows Set or Not set |
 | Learned mishearings | settings → Dictionary tab, under Possible mishearings (Add/Ignore) |
 | Analytics dashboard | settings → Analytics tab, or glance line on the tap card |
 
