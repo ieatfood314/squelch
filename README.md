@@ -31,6 +31,12 @@ laptop with Intel Alder Lake graphics and its built-in mic. PipeWire required; K
 detection and tray applet assume Plasma, other Wayland compositors need
 small tweaks.
 
+## Phone
+
+There's an Android version too: hold a key (the Essential key on Nothing
+phones), speak, let go, and the text lands in the field you're in, decoded
+on the phone with the same Parakeet model. See [android/](android/README.md).
+
 ## Install (Arch)
 
 ```
@@ -170,6 +176,7 @@ behind …".
 - `src/squelch-mic-reset` — root helper: power-cycle a USB mic's port
 - `systemd/` — user units · `systemd/system/` — mic-reset template unit
 - `polkit/` — lets wheel users' squelch-ptt start the mic-reset unit · `kanata/snippet.kbd` — optional kanata tap-hold for the trigger
+- `android/` — the Android app
 
 Runtime state lives in `~/.config/squelch/` (engine, filters, dictionary,
 mic, hotkey, archive, vram.json, stats, key). Models in `~/.local/share/whisper.cpp/models` and

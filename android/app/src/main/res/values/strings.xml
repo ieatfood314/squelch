@@ -1,0 +1,3 @@
+<resources>
+    <string name="a11y_description">Hold the trigger key to dictate. Squelch reads that one key and types what you said into the field you\'re in. Speech never leaves the phone.</string>
+</resources>
