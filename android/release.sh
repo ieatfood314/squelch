@@ -8,11 +8,13 @@ code=${2:?versionCode, e.g. 1}
 key=~/.config/squelch-android
 export JAVA_HOME=${JAVA_HOME:-$HOME/.local/android-toolchain/jdk17}
 export ANDROID_HOME=${ANDROID_HOME:-$HOME/.local/android-toolchain/sdk}
+export PATH=$JAVA_HOME/bin:$PATH
 export SQUELCH_KEYSTORE_PATH=$key/android.jks
 export SQUELCH_KEYSTORE_PASSWORD=$(cat "$key/android.pass")
 export SQUELCH_KEY_PASSWORD=$SQUELCH_KEYSTORE_PASSWORD
 export SQUELCH_VERSION_NAME=$ver SQUELCH_VERSION_CODE=$code
 ./gradlew -q assembleRelease
+./gradlew -q --stop || true  # frees ~3 GB on nas
 out=build/squelch-$ver.apk
 mkdir -p build
 cp app/build/outputs/apk/release/app-release.apk "$out"
