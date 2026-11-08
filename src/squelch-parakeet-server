@@ -5,6 +5,8 @@ Keeps a Parakeet TDT 0.6B model (v3 multilingual or v2 English, whichever
 engines.env names) in VRAM and exposes a whisper-server-like HTTP API on
 127.0.0.1:1894:
   POST /inference  multipart (file=<wav>, response_format=json) -> {"text": ...}
+                   header X-Squelch-Partial: 1 marks a live pass of a clip
+                   still being recorded (not logged, VRAM not freed after)
   GET  /health     -> 200 ok
   GET  /limits?headroom_mb=N -> {"free_mb", "total_mb", "max_seconds"}:
                    the longest clip whose working memory fits in free VRAM
@@ -239,6 +241,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        # A live pass while the trigger is still held: not logged, and its
+        # VRAM is kept for the final pass of the same clip.
+        partial = self.headers.get("X-Squelch-Partial") == "1"
         if self.path != "/inference":
             self.send_response(404)
             self.end_headers()
@@ -256,9 +261,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("no wav payload found")
             pcm = wav_to_float_mono(wav)
             text, dt = transcribe(pcm)
-            log(f"transcribed {len(pcm)/16000:.2f}s audio in {dt:.2f}s: {text[:100]!r}")
+            if not partial:
+                log(f"transcribed {len(pcm)/16000:.2f}s audio in {dt:.2f}s: "
+                    f"{text[:100]!r}")
             self.send_json(200, {"text": text})
-            if working_mb(len(pcm) / 16000) > RELEASE_MB:
+            if not partial and working_mb(len(pcm) / 16000) > RELEASE_MB:
                 log("long clip, reloading to free its VRAM")
                 threading.Thread(target=release_buffers, daemon=True).start()
         except Exception as e:

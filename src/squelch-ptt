@@ -3,8 +3,9 @@
 otherwise; F24 when kanata's Squelch tap-hold sits on it) to record
 from the mic picked in Settings (default: PipeWire's default source),
 beamform + clean, transcribe with the resident Parakeet or Whisper server
-(Vulkan GPU), and paste the result via clipboard + Shift+Insert, or Ctrl+V
-in browsers (layout-proof: raw keycode typing gets mangled by Colemak).
+(Vulkan GPU), and insert the result: word by word while you speak (typed
+through the active keyboard layout, so Colemak works), or pasted via
+clipboard + Shift+Insert (Ctrl+V in browsers).
 
 Usage:
   squelch-ptt                run the daemon (systemd user service does this)
@@ -13,6 +14,8 @@ Usage:
   squelch-ptt --probe-mic    record 2.5 s, report whether the mic delivers audio
   squelch-ptt --reset-mic    power-cycle the mic's USB port and re-probe
 """
+import configparser
+import ctypes
 import fcntl
 import glob
 import json
@@ -23,6 +26,7 @@ import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -758,10 +762,26 @@ def check_upstream(mic, proc, source):
 
 # ---------------- DSP: mic-pair beamform + monitor-diffraction comp ----------------
 
+def fast_len(n):
+    """Smallest 2^a 3^b 5^c >= n: FFTs of awkward clip lengths (a large
+    prime factor) are many times slower, which live passes feel."""
+    best, p2 = 1 << max(0, (n - 1).bit_length()), 1
+    while p2 < best:
+        p3 = p2
+        while p3 < best:
+            p5 = p3
+            while p5 < n:
+                p5 *= 5
+            best = min(best, p5)
+            p3 *= 3
+        p2 *= 2
+    return best
+
+
 def gcc_phat_lag(sig, ref, max_shift=8):
-    n = len(sig)
-    S = np.fft.rfft(sig - sig.mean())
-    R = np.fft.rfft(ref - ref.mean())
+    n = fast_len(len(sig))  # zero-padded, so lags don't wrap around either
+    S = np.fft.rfft(sig - sig.mean(), n)
+    R = np.fft.rfft(ref - ref.mean(), n)
     cross = S * np.conj(R)
     cross /= (np.abs(cross) + 1e-9)  # phase transform: robust to mic gain mismatch
     corr = np.fft.irfft(cross, n)
@@ -774,11 +794,13 @@ def gcc_phat_lag(sig, ref, max_shift=8):
     return best_lag
 
 
-def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None):
+def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None,
+                       quiet=False):
     """Delay-and-sum the raw capsules, HP filter, HF shelf to compensate
     monitor-edge diffraction loss, gate room noise, normalize, trim.
     Only the first max_s seconds are used when given. source is the
-    hold's source info, for explaining a silent recording."""
+    hold's source info, for explaining a silent recording. quiet skips
+    logs and notifications (live partials)."""
     with wave.open(path_in, "rb") as w:
         nch, rate, nframes = (w.getnchannels(), w.getframerate(),
                               w.getnframes())
@@ -792,6 +814,8 @@ def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None):
     if max_s:
         a = a[:int(max_s * sr)]
     if not a.any():
+        if quiet:
+            return None
         # Exact zeros: a live mic always has some noise floor, so this is
         # a mute unmute_node couldn't see or undo (e.g. in hardware), or a
         # virtual source nothing feeds.
@@ -821,10 +845,11 @@ def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None):
     else:
         lags = [0]
         m = a[:, 0]
-    log(f"align lags (samples @16k): {lags}")
+    if not quiet:
+        log(f"align lags (samples @16k): {lags}")
 
-    n = len(m)
-    X = np.fft.rfft(m)
+    n = fast_len(len(m))
+    X = np.fft.rfft(m, n)
     freqs = np.fft.rfftfreq(n, 1.0 / sr)
     # 2nd-order Butterworth high-pass @80 Hz: desk/monitor rumble + handling noise
     f0 = 80.0
@@ -836,7 +861,7 @@ def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None):
     t = np.clip(np.log2(np.maximum(freqs, 1.0) / 2500.0), 0, 1)
     t = t * t * (3 - 2 * t)
     shelf = 1.0 + g * t
-    y = np.fft.irfft(X * hp * shelf, n).astype(np.float32)
+    y = np.fft.irfft(X * hp * shelf, n)[:len(m)].astype(np.float32)
 
     # Noise gate, 20 ms frames, 120 ms hangover, 10 ms smoothing
     F = 320
@@ -848,9 +873,8 @@ def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None):
     peak_e = float(e.max())
     thr = max(peak_e * 0.01, 25.0)
     mask = (e > thr).astype(np.float32)
-    keep = np.zeros_like(mask)
-    for i in np.where(mask > 0)[0]:
-        keep[i:min(nf, i + 7)] = 1.0
+    # each loud frame keeps itself and the 6 after it open
+    keep = (np.convolve(mask, np.ones(7))[:nf] > 0).astype(np.float32)
     gain = np.repeat(keep, F)
     k = 160
     gain = np.convolve(gain, np.ones(k) / k, mode="same")
@@ -863,7 +887,9 @@ def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None):
     if peak < QUIET_PEAK or rms_pre < QUIET_RMS:
         # Gate BEFORE normalization, since the gain below would amplify
         # silence into something whisper hallucinates on.
-        log(f"utterance too quiet (peak={peak:.0f} rms={rms_pre:.0f}), skipping")
+        if not quiet:
+            log(f"utterance too quiet (peak={peak:.0f} rms={rms_pre:.0f}), "
+                "skipping")
         try:
             os.unlink(path_out)
         except OSError:
@@ -959,7 +985,7 @@ def apply_dictionary(text):
     return text
 
 
-def post_wav(url, wav_path, response_format, extra=None):
+def post_wav(url, wav_path, response_format, extra=None, headers=None):
     data = open(wav_path, "rb").read()
     bound = "----sttpttboundary"
     body = (
@@ -977,17 +1003,21 @@ def post_wav(url, wav_path, response_format, extra=None):
     body += f"--{bound}--\r\n".encode()
     req = urllib.request.Request(
         url, data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={bound}"})
+        headers={"Content-Type": f"multipart/form-data; boundary={bound}",
+                 **(headers or {})})
     with urllib.request.urlopen(req, timeout=120) as r:
         return json.loads(r.read().decode())
 
 
-def transcribe_parakeet(wav_path):
-    res = post_wav(PARAKEET_URL, wav_path, "json")
+def transcribe_parakeet(wav_path, partial=False):
+    # partial: the server neither logs it nor frees VRAM after it (the
+    # final pass of the same hold comes soon and needs the same buffers)
+    res = post_wav(PARAKEET_URL, wav_path, "json",
+                   headers={"X-Squelch-Partial": "1"} if partial else None)
     return res.get("text", "").strip()
 
 
-def transcribe_whisper(wav_path):
+def transcribe_whisper(wav_path, partial=False):
     terms, _subs = load_dictionary()
     seen, combo = set(), []
     for t_ in terms + read_vocab():  # your words + voice-mined vocabulary
@@ -1002,7 +1032,8 @@ def transcribe_whisper(wav_path):
         probs = [float(s.get("no_speech_prob", 0.0)) for s in segs]
         nsp = sum(probs) / len(probs)
         text = "".join(s.get("text", "") for s in segs)
-        log(f"no_speech_prob={nsp:.2f}")
+        if not partial:
+            log(f"no_speech_prob={nsp:.2f}")
         if nsp > 0.6:
             return ""  # silence / room noise hallucination guard
     else:
@@ -1202,35 +1233,233 @@ def numbers_to_digits(text, all_digits=False):
     return _NUM_RUN_RE.sub(repl, text)
 
 
-def transcribe(wav_path, engine):
+def transcribe(wav_path, engine, partial=False):
     if engine == "whisper":
-        return clean_text(transcribe_whisper(wav_path))
-    return clean_text(transcribe_parakeet(wav_path))
+        return clean_text(transcribe_whisper(wav_path, partial))
+    return clean_text(transcribe_parakeet(wav_path, partial))
+
+
+def tidy(text):
+    """The cleanup filters from Settings, then your dictionary."""
+    do_defill, do_numbers, do_all = text_filters()
+    if do_defill:
+        text = defiller(text)
+    if do_numbers:
+        text = numbers_to_digits(text, all_digits=do_all)
+    return apply_dictionary(text)
+
+
+INSERTION_MODES = ("live", "paste", "type", "clipboard")
 
 
 def insertion_mode():
-    """paste (default), type (ydotool raw keycodes, QWERTY assumed), or
-    clipboard (copy only, you paste yourself)."""
+    """live (typed word by word while you speak), paste (default), type
+    (typed once you let go), or clipboard (copy only, you paste
+    yourself)."""
     try:
         with open(INSERTION_FILE) as f:
             m = json.load(f).get("mode", "paste")
-        return m if m in ("paste", "type", "clipboard") else "paste"
+        return m if m in INSERTION_MODES else "paste"
     except (OSError, ValueError):
         return "paste"
 
 
-def type_ydotool(text):
+# ---------------- layout-aware typing ----------------
+# ydotool only sends physical keycodes, and the compositor maps those
+# through the active layout (`ydotool type` assumes QWERTY, so under
+# Colemak "hello" comes out "hkuuy"). So build char -> keycode from the
+# layout KWin is using right now, via libxkbcommon.
+
+KXKBRC = os.path.expanduser("~/.config/kxkbrc")
+KEY_BACKSPACE, KEY_ENTER, KEY_LEFTSHIFT = 14, 28, 42
+TYPE_DELAY_MS = 4      # between key events; ydotool's default is 12
+_keymaps = {}          # (layout, variant, options) -> {char: (code, shift)}
+
+
+class _RuleNames(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_char_p)
+                for n in ("rules", "model", "layout", "variant", "options")]
+
+
+def active_layout():
+    """(layout, variant, options) of the layout typing goes through now:
+    Plasma's layout list plus its current index, else XKB_DEFAULT_*."""
+    layout = os.environ.get("XKB_DEFAULT_LAYOUT", "us")
+    variant = os.environ.get("XKB_DEFAULT_VARIANT", "")
+    options = os.environ.get("XKB_DEFAULT_OPTIONS", "")
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
     try:
-        r = subprocess.run(["ydotool", "type", "--", text],
-                           capture_output=True, text=True, timeout=60)
-        if r.returncode == 0:
-            log("typed via ydotool:", text[:80])
-            return
-        log("ydotool type failed:", (r.stderr or "").strip()[:200])
+        cp.read(KXKBRC)
+        sec = cp["Layout"]
+    except (configparser.Error, KeyError):
+        return layout, variant, options
+    if sec.get("Use", "false").lower() != "true":
+        return layout, variant, options
+    layouts = sec.get("LayoutList", "").split(",")
+    variants = sec.get("VariantList", "").split(",")
+    idx = 0
+    try:
+        out = subprocess.run(
+            ["gdbus", "call", "--session", "-d", "org.kde.keyboard",
+             "-o", "/Layouts", "-m", "org.kde.KeyboardLayouts.getLayout"],
+            capture_output=True, text=True, timeout=2).stdout
+        m = re.search(r"(\d+)", out)
+        idx = int(m.group(1)) if m else 0
     except Exception as e:
-        log("ydotool type error:", e)
+        log("layout index unknown, using the first:", e)
+    if not layouts[0]:
+        return layout, variant, options
+    idx = idx if idx < len(layouts) else 0
+    return (layouts[idx], variants[idx] if idx < len(variants) else "",
+            sec.get("Options", ""))
+
+
+def keymap_table(layout, variant, options):
+    """{char: (evdev keycode, needs shift)} for one XKB layout."""
+    key = (layout, variant, options)
+    if key in _keymaps:
+        return _keymaps[key]
+    x = ctypes.CDLL("libxkbcommon.so.0")
+    vp, u32 = ctypes.c_void_p, ctypes.c_uint32
+    x.xkb_context_new.restype = vp
+    x.xkb_context_new.argtypes = [ctypes.c_int]
+    x.xkb_keymap_new_from_names.restype = vp
+    x.xkb_keymap_new_from_names.argtypes = [
+        vp, ctypes.POINTER(_RuleNames), ctypes.c_int]
+    for f in ("xkb_keymap_min_keycode", "xkb_keymap_max_keycode"):
+        getattr(x, f).restype = u32
+        getattr(x, f).argtypes = [vp]
+    x.xkb_keymap_num_levels_for_key.restype = u32
+    x.xkb_keymap_num_levels_for_key.argtypes = [vp, u32, u32]
+    x.xkb_keymap_key_get_syms_by_level.restype = ctypes.c_int
+    x.xkb_keymap_key_get_syms_by_level.argtypes = [
+        vp, u32, u32, u32, ctypes.POINTER(ctypes.POINTER(u32))]
+    x.xkb_keymap_key_get_mods_for_level.restype = ctypes.c_size_t
+    x.xkb_keymap_key_get_mods_for_level.argtypes = [
+        vp, u32, u32, u32, ctypes.POINTER(u32), ctypes.c_size_t]
+    x.xkb_keymap_mod_get_index.restype = u32
+    x.xkb_keymap_mod_get_index.argtypes = [vp, ctypes.c_char_p]
+    x.xkb_keysym_to_utf32.restype = u32
+    x.xkb_keysym_to_utf32.argtypes = [u32]
+    x.xkb_keymap_unref.argtypes = [vp]
+    x.xkb_context_unref.argtypes = [vp]
+
+    ctx = x.xkb_context_new(0)
+    names = _RuleNames(None, None, layout.encode(), variant.encode(),
+                       options.encode())
+    km = x.xkb_keymap_new_from_names(ctx, ctypes.byref(names), 0)
+    if not km:
+        x.xkb_context_unref(ctx)
+        raise RuntimeError(f"no XKB keymap for {layout}({variant})")
+    shift = 1 << x.xkb_keymap_mod_get_index(km, b"Shift")
+    table = {}
+    masks = (u32 * 8)()
+    syms = ctypes.POINTER(u32)()
+    for kc in range(x.xkb_keymap_min_keycode(km),
+                    x.xkb_keymap_max_keycode(km) + 1):
+        for level in range(x.xkb_keymap_num_levels_for_key(km, kc, 0)):
+            if x.xkb_keymap_key_get_syms_by_level(
+                    km, kc, 0, level, ctypes.byref(syms)) != 1:
+                continue
+            sym = syms[0]
+            if 0xff80 <= sym <= 0xffbd:  # keypad: odd in terminals, vim
+                continue
+            cp_ = x.xkb_keysym_to_utf32(sym)
+            if cp_ < 32 or cp_ == 127:
+                continue
+            n = x.xkb_keymap_key_get_mods_for_level(km, kc, 0, level,
+                                                    masks, 8)
+            ms = set(masks[:n])
+            if 0 in ms:
+                needs = False
+            elif shift in ms:
+                needs = True
+            else:
+                continue  # AltGr and friends: paste those instead
+            ch = chr(cp_)
+            old = table.get(ch)
+            if old is None or (old[1] and not needs):
+                table[ch] = (kc - 8, needs)  # XKB keycodes are evdev + 8
+    x.xkb_keymap_unref(km)
+    x.xkb_context_unref(ctx)
+    log(f"keymap {layout}({variant or 'default'}): {len(table)} characters")
+    _keymaps[key] = table
+    return table
+
+
+def current_keymap():
+    try:
+        return keymap_table(*active_layout())
+    except Exception as e:
+        log("keymap failed, assuming US QWERTY:", e)
+        try:
+            return keymap_table("us", "", "")
+        except Exception:
+            return {}
+
+
+def key_events(text, table):
+    """Split text into runs: ("keys", [ydotool events]) for what the
+    layout can type, ("paste", str) for the rest (é, —, emoji)."""
+    runs = []
+    for ch in text:
+        if ch == "\n":
+            ev = [f"{KEY_ENTER}:1", f"{KEY_ENTER}:0"]
+        elif ch in table:
+            code, sh = table[ch]
+            ev = [f"{code}:1", f"{code}:0"]
+            if sh:
+                ev = [f"{KEY_LEFTSHIFT}:1", *ev, f"{KEY_LEFTSHIFT}:0"]
+        else:
+            if runs and runs[-1][0] == "paste":
+                runs[-1] = ("paste", runs[-1][1] + ch)
+            else:
+                runs.append(("paste", ch))
+            continue
+        if runs and runs[-1][0] == "keys":
+            runs[-1][1].extend(ev)
+        else:
+            runs.append(("keys", ev))
+    return runs
+
+
+def ydotool_keys(events):
+    if not events:
+        return True
+    try:
+        r = subprocess.run(["ydotool", "key", "-d", str(TYPE_DELAY_MS),
+                            *events], capture_output=True, text=True,
+                           timeout=30 + len(events) * TYPE_DELAY_MS / 1000)
+        if r.returncode == 0:
+            return True
+        log("ydotool key failed:", (r.stderr or "").strip()[:200])
+    except Exception as e:
+        log("ydotool key error:", e)
     notify_stt("Typing failed", "Is squelch-ydotoold running?",
                urgency="normal")
+    return False
+
+
+def type_text(text, table=None):
+    """Type text through the active layout; characters it has no key for
+    are pasted. False if typing failed."""
+    table = current_keymap() if table is None else table
+    for kind, val in key_events(text, table):
+        if kind == "keys":
+            if not ydotool_keys(val):
+                return False
+        else:
+            paste_text(val)
+    return True
+
+
+def backspace(n):
+    return ydotool_keys([f"{KEY_BACKSPACE}:1", f"{KEY_BACKSPACE}:0"] * n)
+
+
+def type_ydotool(text):
+    if type_text(text):
+        log("typed:", text[:80])
 
 
 def clipboard_only(text):
@@ -1248,7 +1477,7 @@ def clipboard_only(text):
 
 def output_text(text):
     mode = insertion_mode()
-    if mode == "type":
+    if mode in ("type", "live"):
         type_ydotool(text)
     elif mode == "clipboard":
         clipboard_only(text)
@@ -1671,12 +1900,7 @@ def process_utterance(raw_path, record=True, max_s=None, source=None):
                    "dsp_s": round(time.time() - t0, 3)})
             return ""
         transcribe_s = time.time() - t1
-        do_defill, do_numbers, do_all = text_filters()
-        if do_defill:
-            text = defiller(text)
-        if do_numbers:
-            text = numbers_to_digits(text, all_digits=do_all)
-        text = apply_dictionary(text)
+        text = tidy(text)
         log(f"[{engine}] transcribed in {transcribe_s:.2f}s: {text[:120]!r}")
         if record:
             meta = {"ts": t0, "engine": engine,
@@ -1727,27 +1951,186 @@ def duration(seconds):
             else f"{seconds / 60:.1f} min".replace(".0 min", " min"))
 
 
+# ---------------- live dictation (word by word) ----------------
+
+LIVE_EVERY_S = 0.5     # how often the clip so far is transcribed while held
+LIVE_MIN_NEW_S = 0.25  # unless it grew less than this since the last pass
+LIVE_FIX_WORDS = 3     # while held, only rewrite this many words back
+
+
+def read_growing_wav(path):
+    """(channels, PCM bytes) pw-record has written so far. Its header only
+    gets real sizes on exit, so walk the chunks by hand."""
+    with open(path, "rb") as f:
+        d = f.read()
+    if d[:4] != b"RIFF" or d[8:12] != b"WAVE":
+        return None
+    i, nch = 12, None
+    while i + 8 <= len(d):
+        cid, size = d[i:i + 4], struct.unpack("<I", d[i + 4:i + 8])[0]
+        if cid == b"fmt " and i + 12 <= len(d):
+            nch = struct.unpack("<H", d[i + 10:i + 12])[0]
+        elif cid == b"data":
+            if not nch:
+                return None
+            pcm = d[i + 8:i + 8 + size] if size else d[i + 8:]
+            return nch, pcm[:len(pcm) - len(pcm) % (2 * nch)]
+        i += 8 + size + (size & 1)
+    return None
+
+
+def common_prefix(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+class LiveTyper:
+    """Types a dictation word by word while the trigger is held. Every
+    LIVE_EVERY_S the clip so far is transcribed, and the words two passes
+    in a row agree on get typed (a word still being spoken changes between
+    passes, so it waits). On release the whole clip goes through the
+    normal path and finish() backspaces and retypes whatever changed,
+    usually just the last word's punctuation."""
+
+    def __init__(self, path, cap_s, source, jobs):
+        self.path, self.cap_s, self.source = path, cap_s, source
+        self.jobs = jobs
+        self.typed = ""     # what this hold has typed so far
+        self.prev = None    # words of the previous pass
+        self.table = None   # the layout's keys, looked up off the key loop
+        self.dry = bool(os.environ.get("STT_DRY_RUN"))
+        self._stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def halt(self):
+        """Stop transcribing partials; returns once the last one is done."""
+        self._stop.set()
+        self.thread.join()
+
+    def partial(self, nch, pcm):
+        """Cleaned-up words of the clip so far, or None."""
+        fd, snap = tempfile.mkstemp(suffix="-live.wav")
+        os.close(fd)
+        clean = snap[:-4] + "-clean.wav"
+        try:
+            with wave.open(snap, "wb") as w:
+                w.setnchannels(nch)
+                w.setsampwidth(2)
+                w.setframerate(SR)
+                w.writeframes(pcm)
+            if beamform_and_clean(snap, clean, max_s=self.cap_s,
+                                  source=self.source, quiet=True) is None:
+                return None
+            text = transcribe(clean, current_engine(), partial=True)
+            return tidy(text).split() if text else None
+        except Exception as e:
+            log("live pass failed:", e)
+            return None
+        finally:
+            discard(snap)
+            discard(clean)
+
+    def run(self):
+        self.table = current_keymap()
+        seen = 0
+        while not self._stop.wait(LIVE_EVERY_S):
+            try:
+                got = read_growing_wav(self.path)
+            except OSError:
+                continue
+            if not got:
+                continue
+            nch, pcm = got
+            frames = len(pcm) // (2 * nch)
+            if frames - seen < LIVE_MIN_NEW_S * SR:
+                continue
+            seen = frames
+            words = self.partial(nch, pcm)
+            if not words:
+                continue
+            prev, self.prev = self.prev, words
+            if prev is None or self._stop.is_set():
+                continue
+            # an earlier hold may still be pasting; its text goes first
+            if self.jobs.unfinished_tasks == 0:
+                self.advance(prev, words)
+
+    def advance(self, prev, words):
+        """Type what two passes in a row agree on."""
+        agreed = words[:common_prefix(prev, words)]
+        if agreed and len(agreed) == len(words):
+            # the clip ends at a pause, so the model ends the sentence;
+            # hold that back until it's clear speech has stopped
+            last = agreed[-1].rstrip(".?!")
+            agreed = agreed[:-1] + ([last] if last else [])
+        typed = self.typed.split()
+        if len(agreed) <= len(typed):
+            return
+        if len(typed) - common_prefix(typed, agreed) > LIVE_FIX_WORDS:
+            # a word further back changed: rewriting a whole stretch of
+            # text mid-sentence is jarring, so release fixes that instead
+            agreed = typed + agreed[len(typed):]
+        self.retype(" ".join(agreed))
+
+    def retype(self, target):
+        """Make the typed text read target: backspace to where they part,
+        type the rest. False if a keystroke failed."""
+        p = common_prefix(self.typed, target)
+        drop, add = len(self.typed) - p, target[p:]
+        if self.dry:
+            log(f"DRYRUN live: {drop} backspaces, then {add!r}")
+            self.typed = target
+            return True
+        if drop:
+            if not backspace(drop):
+                return False
+            self.typed = self.typed[:p]
+        if add and not type_text(add, self.table):
+            return False
+        self.typed = target
+        return True
+
+    def finish(self, text):
+        if self.retype(text):
+            log(f"live typed, finished as: {text[:80]!r}")
+        else:
+            clipboard_only(text)
+
+
 def utterance_worker(jobs):
     """Transcribe and insert utterances in order, off the key-reading loop,
     so a new hold starts recording at once even while the last one is
     still being pasted."""
     while True:
-        rec_path, held, cap_s, source = jobs.get()
+        rec_path, held, cap_s, source, live = jobs.get()
         try:
+            if live:
+                live.halt()
             text = process_utterance(rec_path, max_s=cap_s, source=source)
             if held > cap_s:
                 notify_stt("Dictation cut short",
                            f"Kept the first {duration(cap_s)}.",
                            urgency="normal")
-            if text:
+            if text and live:
+                live.finish(" ".join(text.split()) + " ")
+            elif text:
                 if os.environ.get("STT_DRY_RUN"):
                     log(f"DRYRUN would type: {text[:120]!r}")
                 else:
                     output_text(text + " ")
+            elif live and live.typed:
+                log("final pass found no speech, keeping the live text")
             else:
                 log("no speech, typing nothing")
         except Exception as e:
             log("utterance failed:", e)
+        finally:
+            jobs.task_done()
 
 
 def discard(path):
@@ -1757,7 +2140,7 @@ def discard(path):
         pass
 
 
-def start_hold(code):
+def start_hold(code, jobs):
     """Start recording for a held trigger; None if we can't."""
     if notify_engine_down():
         log("engine unavailable, ignoring press")
@@ -1786,9 +2169,13 @@ def start_hold(code):
     cap = threading.Timer(cap_s, stop_recording, [proc])
     cap.daemon = True
     cap.start()
-    log(f"recording... (cap {duration(cap_s)})")
+    live = None
+    if insertion_mode() == "live":
+        live = LiveTyper(path, cap_s, source, jobs)
+    log(f"recording... (cap {duration(cap_s)}{', live' if live else ''})")
     return {"proc": proc, "path": path, "paused": paused, "code": code,
-            "t": time.time(), "cap": cap, "cap_s": cap_s, "source": source}
+            "t": time.time(), "cap": cap, "cap_s": cap_s, "source": source,
+            "live": live}
 
 
 def end_hold(rec, jobs):
@@ -1796,26 +2183,32 @@ def end_hold(rec, jobs):
     rec["cap"].cancel()
     stop_recording(rec["proc"])
     resume_players(rec["paused"])
-    path, cap_s = rec["path"], rec["cap_s"]
+    path, cap_s, live = rec["path"], rec["cap_s"], rec["live"]
     if held < MIN_HOLD_S:
         log(f"tap ({held:.2f}s), ignoring")
+        if live:
+            live.halt()
         discard(path)
         return
     if capture_dead(path, min(held, cap_s)):
         log(f"recording got {raw_frames(path)} frames "
             f"in {held:.1f}s (mic wedged?)")
         recover_mic_async("short capture")
+        if live:
+            live.halt()
         discard(path)
         return
     if held > cap_s:
         log(f"held {held:.0f}s, keeping the first {cap_s:.0f}s")
-    jobs.put((path, held, cap_s, rec["source"]))
+    jobs.put((path, held, cap_s, rec["source"], live))
 
 
 def abandon_hold(rec):
     rec["cap"].cancel()
     stop_recording(rec["proc"])
     resume_players(rec["paused"])
+    if rec["live"]:
+        rec["live"].halt()
     discard(rec["path"])
 
 
@@ -1843,7 +2236,7 @@ def main():
             lonely = not kbd.devs
         if pending and now - pending[1] >= HOLD_DELAY_S:
             if rec is None:
-                rec = start_hold(kbd.code)
+                rec = start_hold(kbd.code, jobs)
                 if rec is not None:
                     rec["dev"] = pending[0]
             pending = None
@@ -1873,7 +2266,7 @@ def main():
                     continue
                 if ev.code == F24:  # kanata already timed the hold
                     if ev.value == 1 and rec is None:
-                        rec = start_hold(F24)
+                        rec = start_hold(F24, jobs)
                         if rec is not None:
                             rec["dev"] = path
                     elif ev.value == 0 and rec and rec["code"] == F24:

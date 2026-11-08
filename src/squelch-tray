@@ -55,8 +55,9 @@ DEFAULT_HEADROOM_GB = 1.0
 STUCK_KEY_S, MIN_CAP_S = 900.0, 30.0
 KANATA_CFG = os.path.expanduser("~/.config/kanata/kanata.kbd")
 INSERTION_MODES = (
+    ("live", "Type as you speak"),
     ("paste", "Paste"),
-    ("type", "Type keys (QWERTY only)"),
+    ("type", "Type when done"),
     ("clipboard", "Clipboard only"))
 PARAKEET_DIR = os.path.expanduser("~/.local/share/parakeet")
 WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp/models")

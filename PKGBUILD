@@ -8,7 +8,8 @@ url='https://github.com/ieatfood314/squelch'
 license=('MIT')
 depends=('python' 'python-evdev' 'python-numpy' 'python-pyqt6' 'ydotool'
          'wl-clipboard' 'libnotify' 'pipewire' 'vulkan-icd-loader'
-         'playerctl' 'polkit' 'qt6-tools' 'wireplumber')
+         'playerctl' 'polkit' 'qt6-tools' 'wireplumber' 'libxkbcommon'
+         'glib2')
 makedepends=('git' 'cmake' 'vulkan-headers' 'spirv-headers')
 optdepends=('aspell-en: learn your vocabulary and mishearings'
             'kanata: stop the trigger key doing its own job too')
