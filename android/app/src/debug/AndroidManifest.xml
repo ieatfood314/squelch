@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application>
+    <!-- test hubs on the emulator host run over plain http -->
+    <application android:usesCleartextTraffic="true">
         <!-- adb shell am broadcast -n ca.heeney.squelch/.Bench with extras wav and runs -->
         <receiver android:name=".Bench" android:exported="true" />
     </application>

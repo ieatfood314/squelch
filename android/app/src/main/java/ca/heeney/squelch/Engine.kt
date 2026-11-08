@@ -14,24 +14,9 @@ import java.util.concurrent.Future
 
 const val TAG = "Squelch"
 
-/** Parakeet TDT 0.6B v2 (English), int8, on the CPU through sherpa-onnx. It
+/** The selected model (Parakeet v2 by default) on the CPU through sherpa-onnx. It
  *  stays loaded once it's up, so a dictation only pays for decoding. */
 object Engine {
-    const val MODEL = "parakeet-tdt-0.6b-v2-int8"
-    private const val BASE =
-        "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/resolve/main/"
-
-    /** name to size in bytes, so a half-finished download never counts as ready */
-    val FILES = linkedMapOf(
-        "encoder.int8.onnx" to 652_282_309L,
-        "decoder.int8.onnx" to 7_257_753L,
-        "joiner.int8.onnx" to 1_739_080L,
-        "tokens.txt" to 9_384L,
-    )
-    val TOTAL_BYTES = FILES.values.sum()
-
-    fun url(name: String) = BASE + name
-
     enum class State {
         Missing, Loading, Ready, Failed,
         /** installed, unloaded under memory pressure; loads on the next dictation */
@@ -44,36 +29,48 @@ object Engine {
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "squelch-engine") }
     @Volatile private var recognizer: OfflineRecognizer? = null
 
-    fun dir(ctx: Context) = File(ctx.filesDir, MODEL)
+    /** which model `recognizer` holds */
+    @Volatile private var loadedKey: String? = null
 
-    fun installed(ctx: Context) =
-        FILES.all { (name, size) -> File(dir(ctx), name).length() == size }
+    fun installed(ctx: Context) = Models.selected(ctx).installed(ctx)
+
+    private fun loaded(ctx: Context) = recognizer != null && loadedKey == Models.selected(ctx).key
 
     /** Load in the background if the files are there and nothing's loaded. */
     fun warm(ctx: Context) {
         val app = ctx.applicationContext
-        if (recognizer != null || state.value == State.Loading) return
+        if (loaded(app) || state.value == State.Loading) return
         if (!installed(app)) { state.value = State.Missing; return }
         state.value = State.Loading
         worker.execute { loadNow(app) }
     }
 
+    /** Switch to another (installed) model; the old one is freed first. */
+    fun select(ctx: Context, m: Model) {
+        val app = ctx.applicationContext
+        Prefs.model = m.key
+        state.value = if (m.installed(app)) State.Loading else State.Missing
+        worker.execute { loadNow(app) }
+    }
+
     private fun loadNow(ctx: Context) {
-        if (recognizer != null) return
-        if (!installed(ctx)) { state.value = State.Missing; return }
-        val d = dir(ctx)
+        val m = Models.selected(ctx)
+        if (recognizer != null && loadedKey == m.key) return
+        recognizer?.let { recognizer = null; loadedKey = null; it.release() }
+        if (!m.installed(ctx)) { state.value = State.Missing; return }
+        val d = m.dir(ctx)
         val t0 = SystemClock.elapsedRealtime()
         try {
             val config = OfflineRecognizerConfig(
                 featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
                 modelConfig = OfflineModelConfig(
                     transducer = OfflineTransducerModelConfig(
-                        encoder = File(d, "encoder.int8.onnx").path,
-                        decoder = File(d, "decoder.int8.onnx").path,
-                        joiner = File(d, "joiner.int8.onnx").path,
+                        encoder = File(d, m.encoder!!).path,
+                        decoder = File(d, m.decoder!!).path,
+                        joiner = File(d, m.joiner!!).path,
                     ),
                     tokens = File(d, "tokens.txt").path,
-                    modelType = "nemo_transducer",
+                    modelType = m.modelType,
                     numThreads = threads,
                     provider = "cpu",
                 ),
@@ -84,8 +81,9 @@ object Engine {
             // First run allocates everything; do it now instead of on your first dictation.
             decodeWith(r, FloatArray(16000))
             recognizer = r
+            loadedKey = m.key
             state.value = State.Ready
-            Log.i(TAG, "model loaded in ${t1 - t0} ms, warm-up ${SystemClock.elapsedRealtime() - t1} ms")
+            Log.i(TAG, "${m.key} loaded in ${t1 - t0} ms, warm-up ${SystemClock.elapsedRealtime() - t1} ms")
         } catch (t: Throwable) {
             Log.e(TAG, "model load failed", t)
             state.value = State.Failed
@@ -149,6 +147,7 @@ object Engine {
             if (Dictation.phase.value != Dictation.Phase.Idle) return@execute
             val r = recognizer ?: return@execute
             recognizer = null
+            loadedKey = null
             r.release()
             state.value = State.Asleep
             Log.i(TAG, "model unloaded to free memory")
@@ -158,7 +157,7 @@ object Engine {
     /** Debug builds: try another thread count. */
     fun reload(ctx: Context, n: Int) {
         worker.execute {
-            recognizer?.release(); recognizer = null
+            recognizer?.release(); recognizer = null; loadedKey = null
             threads = n
             loadNow(ctx.applicationContext)
         }

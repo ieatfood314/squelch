@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Sync the dictionary and analytics with a squelch-sync-server hub.
+
+The hub address is the first line of ~/.config/squelch/sync (for example
+https://squelch.example.ts.net); no file, no sync. Run by squelch-sync.timer
+every few minutes and by squelch-sync.path whenever the dictionary or the
+stats change. Other devices' analytics land in ~/.config/squelch/stats.d/.
+
+  squelch-sync           sync once (quiet unless something fails)
+  squelch-sync --status  show the hub address and when it last synced
+"""
+import fcntl
+import json
+import os
+import re
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.config/squelch")
+DICT_FILE = os.path.join(CONFIG_DIR, "dictionary.json")
+STATS_FILE = os.path.join(CONFIG_DIR, "stats.jsonl")
+STATS_DIR = os.path.join(CONFIG_DIR, "stats.d")
+SYNC_FILE = os.path.join(CONFIG_DIR, "sync")
+STATE_FILE = os.path.join(CONFIG_DIR, "sync-state.json")
+DICT_HELP = ("Your words. 'term' is the correct spelling. 'also_match' lists "
+             "ways the engine mishears it, fixed automatically.")
+
+
+def hub():
+    try:
+        with open(SYNC_FILE) as f:
+            url = f.readline().strip()
+    except OSError:
+        return None
+    if not url:
+        return None
+    if "://" not in url:
+        url = "https://" + url
+    return url.rstrip("/")
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def atomic_write(path, text):
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def dict_entries():
+    d = read_json(DICT_FILE, {})
+    e = d.get("entries") if isinstance(d, dict) else None
+    return e if isinstance(e, list) else []
+
+
+def read_jsonl(path):
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return rows
+
+
+def safe_id(s):
+    return re.sub(r"[^A-Za-z0-9._-]", "-", str(s))[:64].strip(".-") or "x"
+
+
+def sync(url):
+    device = safe_id(os.environ.get("SQUELCH_SYNC_DEVICE")
+                     or socket.gethostname().split(".")[0])
+    state = read_json(STATE_FILE, {})
+    pushed = float(state.get("pushed", 0) or 0)
+    base = state.get("base")
+    mine = dict_entries()
+    mine_mtime = os.path.getmtime(DICT_FILE) if os.path.exists(DICT_FILE) else 0
+    events = [e for e in read_jsonl(STATS_FILE)
+              if isinstance(e.get("ts"), (int, float)) and e["ts"] > pushed]
+    have = {}
+    if os.path.isdir(STATS_DIR):
+        for fn in os.listdir(STATS_DIR):
+            if fn.endswith(".jsonl"):
+                rows = read_jsonl(os.path.join(STATS_DIR, fn))
+                if rows:
+                    have[fn[:-6]] = max(float(r.get("ts", 0)) for r in rows)
+    body = json.dumps({
+        "device": device, "name": device,
+        "dictionary": {"base": base, "mine": mine},
+        "stats": {"events": events, "have": have},
+    }).encode()
+    req = urllib.request.Request(url + "/v1/sync", data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        resp = json.load(r)
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    merged = resp.get("dictionary")
+    if isinstance(merged, list):
+        with open(DICT_FILE + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            now = os.path.getmtime(DICT_FILE) if os.path.exists(DICT_FILE) else 0
+            if now != mine_mtime:
+                # Edited while we were away: keep the edit, and keep the old
+                # base so the next sync sends it as a change.
+                merged = None
+            elif merged != mine:
+                atomic_write(DICT_FILE, json.dumps(
+                    {"_help": DICT_HELP, "entries": merged},
+                    indent=2, ensure_ascii=False))
+        if merged is not None:
+            state["base"] = merged
+
+    st = resp.get("stats") or {}
+    if isinstance(st.get("pushed"), (int, float)):
+        state["pushed"] = st["pushed"]
+    names = state.get("names", {})
+    for dev, v in (st.get("devices") or {}).items():
+        dev = safe_id(dev)
+        names[dev] = v.get("name") or dev
+        new = [e for e in v.get("events") or []
+               if isinstance(e, dict) and e.get("ts", 0) > have.get(dev, 0)]
+        if new:
+            os.makedirs(STATS_DIR, exist_ok=True)
+            with open(os.path.join(STATS_DIR, dev + ".jsonl"), "a") as f:
+                for e in new:
+                    f.write(json.dumps(e) + "\n")
+    state["names"] = names
+    state["synced"] = time.time()
+    atomic_write(STATE_FILE, json.dumps(state, ensure_ascii=False))
+    return len(events)
+
+
+def main():
+    url = hub()
+    if "--status" in sys.argv:
+        st = read_json(STATE_FILE, {})
+        print("hub:", url or "not set (" + SYNC_FILE + ")")
+        if st.get("synced"):
+            print("last sync:", time.strftime("%Y-%m-%d %H:%M:%S",
+                                              time.localtime(st["synced"])))
+        if st.get("names"):
+            print("other devices:", ", ".join(sorted(st["names"].values())))
+        return 0
+    if not url:
+        return 0
+    # One sync at a time (the timer and the path unit can fire together).
+    with open(os.path.join(CONFIG_DIR, "sync.lock"), "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        try:
+            sync(url)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            print("squelch-sync:", e, file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -875,17 +875,36 @@ def model_catalog():
 
 # ---------------- analytics ----------------
 
-def load_stats():
+def _read_stats(path, device):
     rows = []
     try:
-        with open(STATS_FILE) as f:
+        with open(path) as f:
             for line in f:
                 try:
-                    rows.append(json.loads(line))
+                    r = json.loads(line)
                 except ValueError:
                     continue
+                if isinstance(r, dict):
+                    r["device"] = device
+                    rows.append(r)
     except OSError:
         pass
+    return rows
+
+
+def load_stats():
+    """This machine's stats plus the other devices' that squelch-sync
+    brought into stats.d/, oldest first."""
+    rows = _read_stats(STATS_FILE, os.uname().nodename.split(".")[0])
+    names = read_json(os.path.join(CONFIG_DIR, "sync-state.json"),
+                      {}).get("names", {})
+    d = os.path.join(CONFIG_DIR, "stats.d")
+    if os.path.isdir(d):
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".jsonl"):
+                rows += _read_stats(os.path.join(d, fn),
+                                    names.get(fn[:-6], fn[:-6]))
+    rows.sort(key=lambda r: float(r.get("ts", 0) or 0))
     return rows
 
 
@@ -910,6 +929,10 @@ def summarize_stats(rows, now=None, recent_min=60):
         e[1] += 1
         e[2] += float(r.get("audio_s", 0))
     day_rows = sorted(days.items(), reverse=True)[:7]
+    per_device = {}
+    for r in ok:
+        k = r.get("device") or "?"
+        per_device[k] = per_device.get(k, 0) + int(r.get("words", 0))
     return {
         "words": words,
         "utterances": len(ok),
@@ -923,6 +946,7 @@ def summarize_stats(rows, now=None, recent_min=60):
                        if last10_lat else 0.0),
         "recent_min": recent_min,
         "days": [(d, w, u, a / 60) for d, (w, u, a) in day_rows],
+        "devices": sorted(per_device.items(), key=lambda kv: -kv[1]),
     }
 
 
@@ -2028,6 +2052,8 @@ class SettingsWindow(QWidget):
         lay.addLayout(tiles)
         self.a_recent = label("", "dim", wrap=True)
         lay.addWidget(self.a_recent)
+        self.a_devices = label("", "dim", wrap=True)
+        lay.addWidget(self.a_devices)
         self.a_table = QTableWidget(0, 4)
         self.a_table.setHorizontalHeaderLabels(
             ["Day", "Words", "Dictations", "Minutes"])
@@ -2053,6 +2079,10 @@ class SettingsWindow(QWidget):
             f"{s['recent_words']:,} words · "
             f"last 10 avg {s['recent_lat']:.2f} s"
             if s["recent_n"] else "Nothing in the last hour")
+        devs = s["devices"]
+        self.a_devices.setText(" · ".join(f"{n} {w:,} words" for n, w in devs)
+                               if len(devs) > 1 else "")
+        self.a_devices.setVisible(len(devs) > 1)
         self.a_table.setRowCount(0)
         for d, w, u, a in s["days"]:
             r = self.a_table.rowCount()

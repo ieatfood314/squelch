@@ -23,6 +23,8 @@ no cloud, no accounts.
   going fullscreen don't count
 - **Analytics**: all-time words/WPM/latency plus last-60-minutes WPM and a
   7-day table, in the tap popup and a fullscreen dashboard
+- **Sync**: dictionary and analytics shared between your computers and the
+  phone app through a small hub you run yourself ([Sync](#sync))
 - **Everything survives reboot** via systemd user services
 
 Tested on EndeavourOS / KDE Plasma 6 / Wayland, AMD RX 5700,
@@ -166,6 +168,37 @@ mute it can't undo (a hardware switch) gets a "Mic is muted"
 notification, and a virtual source with no mic feeding it gets "No mic
 behind …".
 
+### Sync
+
+Your dictionary and analytics can follow you between computers and the
+[phone app](android/README.md). One machine runs the hub, which every
+device can reach (it has no login, so keep it on a private network such as
+Tailscale):
+
+```
+systemctl --user enable --now squelch-sync-server
+```
+
+It listens on 127.0.0.1:4615 and keeps its data in
+`~/.local/share/squelch-sync`; put it behind HTTPS on your private network,
+for example `tailscale serve --bg 4615`. Then on each computer, write the
+hub's address to `~/.config/squelch/sync` and turn on the sync units:
+
+```
+echo https://squelch.your-tailnet.ts.net > ~/.config/squelch/sync
+```
+
+```
+systemctl --user enable --now squelch-sync.timer squelch-sync.path
+```
+
+The computer syncs whenever its dictionary or stats change, and every 3
+minutes to pick up everyone else's. On the phone, put the same address under
+Sync. Words added or removed anywhere reach every device, deletions
+included, and the Analytics tab adds up every device (with a per-device
+line once there's more than one). `squelch-sync --status` shows when it last
+synced.
+
 ## Layout
 
 - `src/squelch-ptt` — push-to-talk daemon (record → beamform → transcribe → paste)
@@ -173,13 +206,14 @@ behind …".
 - `src/squelch-tray` — tray applet, tap popup, dictionary editor, analytics
 - `src/squelch-vram` — supervisor: one engine at a time, unload when gaming
 - `src/squelch` — dictionary CLI · `src/squelch-setup-models` — model downloads
+- `src/squelch-sync` — dictionary and analytics sync · `src/squelch-sync-server` — the hub it syncs with
 - `src/squelch-mic-reset` — root helper: power-cycle a USB mic's port
 - `systemd/` — user units · `systemd/system/` — mic-reset template unit
 - `polkit/` — lets wheel users' squelch-ptt start the mic-reset unit · `kanata/snippet.kbd` — optional kanata tap-hold for the trigger
 - `android/` — the Android app
 
 Runtime state lives in `~/.config/squelch/` (engine, filters, dictionary,
-mic, hotkey, archive, vram.json, stats, key). Models in `~/.local/share/whisper.cpp/models` and
+mic, hotkey, archive, vram.json, stats, sync, key; other devices' stats in stats.d/). Models in `~/.local/share/whisper.cpp/models` and
 `~/.local/share/parakeet`.
 
 ## Uninstall

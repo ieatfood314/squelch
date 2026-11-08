@@ -1,0 +1,9 @@
+[Unit]
+Description=Squelch: sync the dictionary and analytics every few minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=3min
+
+[Install]
+WantedBy=timers.target

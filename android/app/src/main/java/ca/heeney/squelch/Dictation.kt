@@ -51,6 +51,8 @@ object Dictation {
         val app = ctx.applicationContext
         if (mic && !Engine.installed(app)) { Notice.show(app, "Open Squelch to download the model"); return }
         Engine.warm(app)
+        // Pick up dictionary changes from your other devices while you talk.
+        if (mic) Sync.soon(app, minGapMs = 60_000)
         this.sink = sink
         fromMic = mic
         synchronized(lock) {
@@ -159,6 +161,12 @@ object Dictation {
             Stats.lastAudioMs = audioMs
             Stats.lastWaitMs = SystemClock.elapsedRealtime() - t0
             Log.i(TAG, "released to text in ${Stats.lastWaitMs} ms ($audioMs ms left to decode)")
+            if (fromMic) {
+                try {
+                    Analytics.record(app, text, heldMs / 1000f, Stats.lastWaitMs / 1000f, Models.selected(app).key)
+                } catch (t: Throwable) { Log.e(TAG, "stats", t) }
+                Sync.soon(app)
+            }
             main.post {
                 if (text.isNotEmpty()) {
                     Stats.last.value = text

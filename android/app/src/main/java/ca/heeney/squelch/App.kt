@@ -11,7 +11,9 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         Prefs.init(this)
+        Sync.init(this)
         Engine.warm(this)
+        Sync.soon(this)
     }
 }
 
@@ -30,6 +32,15 @@ object Prefs {
     var scanCode: Int
         get() = sp.getInt("scan_code", ESSENTIAL_SCAN)
         set(v) = sp.edit().putInt("scan_code", v).apply()
+
+    var model: String
+        get() = sp.getString("model", Models.ENGLISH.key)!!
+        set(v) = sp.edit().putString("model", v).apply()
+
+    /** the sync hub, "" when sync is off */
+    var syncUrl: String
+        get() = sp.getString("sync_url", "")!!
+        set(v) = sp.edit().putString("sync_url", v).apply()
 
     fun isTrigger(ev: KeyEvent): Boolean {
         val code = keyCode

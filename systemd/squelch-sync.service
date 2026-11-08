@@ -1,0 +1,7 @@
+[Unit]
+Description=Squelch: sync the dictionary and analytics with the hub
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/squelch-sync

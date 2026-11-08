@@ -1,0 +1,10 @@
+[Unit]
+Description=Squelch: sync as soon as the dictionary or the stats change
+
+[Path]
+PathChanged=%h/.config/squelch/dictionary.json
+PathChanged=%h/.config/squelch/stats.jsonl
+Unit=squelch-sync.service
+
+[Install]
+WantedBy=default.target

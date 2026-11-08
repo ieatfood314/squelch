@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Squelch sync hub: one copy of the dictionary and everyone's analytics.
+
+Every device (desktop squelch-sync, the Android app) POSTs /v1/sync with
+its dictionary, the dictionary as it was at its last sync, and its new
+analytics events. The hub merges the dictionary three ways, so a word
+added on one device and another word removed on a second both survive,
+stores the events, and answers with the merged dictionary and the other
+devices' events the caller hasn't got yet.
+
+No auth: run it where only your own devices can reach it (behind
+Tailscale). Usage: squelch-sync-server [--port 4615] [--data DIR]
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+lock = threading.Lock()
+DATA = ""
+dictionary = []          # [{"term", "also_match"}]
+devices = {}             # id -> {"name": str, "events": [..], "last": ts}
+MAX_BODY = 32 << 20
+
+
+def atomic_write(path, text):
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def safe_id(s):
+    s = re.sub(r"[^A-Za-z0-9._-]", "-", str(s or ""))[:64].strip(".-")
+    return s or None
+
+
+# ---------------- dictionary ----------------
+
+def norm(entries):
+    """term.lower() -> [term, [mishearings]], in order, duplicates folded
+    (matching is case-insensitive, so case-only twins are one entry)."""
+    out = {}
+    for e in entries if isinstance(entries, list) else []:
+        if not isinstance(e, dict):
+            continue
+        term = str(e.get("term", "")).strip()
+        if not term:
+            continue
+        ms = out.setdefault(term.lower(), [term, []])[1]
+        seen = {m.lower() for m in ms}
+        for m in e.get("also_match") or []:
+            m = str(m).strip()
+            if m and m.lower() not in seen:
+                ms.append(m)
+                seen.add(m.lower())
+    return out
+
+
+def union(into, extra):
+    seen = {m.lower() for m in into}
+    for m in extra:
+        if m.lower() not in seen:
+            into.append(m)
+            seen.add(m.lower())
+
+
+def merge(server, base, mine):
+    """Apply what changed between base and mine to server."""
+    S, B, M = norm(server), norm(base), norm(mine)
+    for k in B.keys() - M.keys():
+        S.pop(k, None)
+    for k, (term, ms) in M.items():
+        b = B.get(k)
+        if b is None:                      # new here (or a first sync)
+            if k in S:
+                union(S[k][1], ms)
+            else:
+                S[k] = [term, list(ms)]
+            continue
+        bterm, bms = b
+        had = {m.lower() for m in bms}
+        now = {m.lower() for m in ms}
+        added = [m for m in ms if m.lower() not in had]
+        removed = had - now
+        if k not in S:
+            # removed elsewhere; an edit here since then brings it back
+            if added or removed or term != bterm:
+                S[k] = [term, list(ms)]
+            continue
+        s = S[k]
+        if term != bterm:
+            s[0] = term
+        s[1] = [m for m in s[1] if m.lower() not in removed]
+        union(s[1], added)
+    return [{"term": t, "also_match": ms} for t, ms in S.values()]
+
+
+# ---------------- storage ----------------
+
+def load():
+    global dictionary
+    os.makedirs(os.path.join(DATA, "stats"), exist_ok=True)
+    try:
+        with open(os.path.join(DATA, "dictionary.json")) as f:
+            dictionary = json.load(f).get("entries", [])
+    except (OSError, ValueError, AttributeError):
+        dictionary = []
+    try:
+        with open(os.path.join(DATA, "devices.json")) as f:
+            names = json.load(f)
+    except (OSError, ValueError):
+        names = {}
+    for fn in os.listdir(os.path.join(DATA, "stats")):
+        if not fn.endswith(".jsonl"):
+            continue
+        dev = fn[:-6]
+        events = []
+        with open(os.path.join(DATA, "stats", fn)) as f:
+            for line in f:
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    pass
+        events.sort(key=lambda e: e.get("ts", 0))
+        devices[dev] = {"name": names.get(dev, dev), "events": events,
+                        "last": events[-1]["ts"] if events else 0}
+
+
+def save_names():
+    atomic_write(os.path.join(DATA, "devices.json"),
+                 json.dumps({d: v["name"] for d, v in devices.items()},
+                            indent=2))
+
+
+def add_events(dev, name, events):
+    new = dev not in devices
+    d = devices.setdefault(dev, {"name": name or dev, "events": [], "last": 0})
+    if new or (name and name != d["name"]):
+        d["name"] = name or d["name"]
+        save_names()
+    fresh = []
+    for e in events if isinstance(events, list) else []:
+        if isinstance(e, dict) and isinstance(e.get("ts"), (int, float)) \
+                and e["ts"] > d["last"]:
+            fresh.append(e)
+    fresh.sort(key=lambda e: e["ts"])
+    if fresh:
+        with open(os.path.join(DATA, "stats", dev + ".jsonl"), "a") as f:
+            for e in fresh:
+                f.write(json.dumps(e) + "\n")
+        d["events"].extend(fresh)
+        d["last"] = fresh[-1]["ts"]
+    return d["last"]
+
+
+def sync(req):
+    global dictionary
+    dev = safe_id(req.get("device"))
+    if not dev:
+        raise ValueError("device missing")
+    name = str(req["name"])[:80] if req.get("name") else None
+    out = {}
+    with lock:
+        dic = req.get("dictionary")
+        if isinstance(dic, dict) and isinstance(dic.get("mine"), list):
+            merged = merge(dictionary, dic.get("base") or [], dic["mine"])
+            if merged != dictionary:
+                dictionary = merged
+                atomic_write(os.path.join(DATA, "dictionary.json"),
+                             json.dumps({"entries": dictionary}, indent=2,
+                                        ensure_ascii=False))
+            out["dictionary"] = dictionary
+        st = req.get("stats")
+        if isinstance(st, dict):
+            pushed = add_events(dev, name, st.get("events") or [])
+            have = st.get("have") if isinstance(st.get("have"), dict) else {}
+            others = {}
+            for d, v in devices.items():
+                if d == dev:
+                    continue
+                after = have.get(d, 0)
+                after = after if isinstance(after, (int, float)) else 0
+                others[d] = {"name": v["name"],
+                             "events": [e for e in v["events"]
+                                        if e["ts"] > after]}
+            out["stats"] = {"pushed": pushed, "devices": others}
+    return out
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/v1/status"):
+            with lock:
+                self._send(200, {
+                    "squelch-sync": 1,
+                    "words": len(dictionary),
+                    "devices": {d: {"name": v["name"],
+                                    "events": len(v["events"]),
+                                    "last": v["last"]}
+                                for d, v in devices.items()}})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/v1/sync":
+            return self._send(404, {"error": "not found"})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > MAX_BODY:
+                return self._send(413, {"error": "too big"})
+            req = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(req, dict):
+                raise ValueError("expected an object")
+            self._send(200, sync(req))
+        except (ValueError, TypeError) as e:
+            self._send(400, {"error": str(e)})
+
+    def log_message(self, fmt, *args):
+        if os.environ.get("SQUELCH_SYNC_VERBOSE"):
+            sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+
+def main():
+    global DATA
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=4615)
+    ap.add_argument("--data", default=os.path.expanduser(
+        "~/.local/share/squelch-sync"))
+    a = ap.parse_args()
+    DATA = a.data
+    load()
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    print(f"squelch-sync on {a.host}:{a.port}, data in {DATA}", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

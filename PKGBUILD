@@ -1,6 +1,6 @@
 # Maintainer: Aidan Heeney <aidan.heeney@proton.me>
 pkgname=squelch
-pkgver=0.7.9
+pkgver=0.8.0
 pkgrel=1
 pkgdesc='Push-to-talk speech-to-text on GPU: Parakeet/Whisper, mic-array beamforming, Menu-key dictation'
 arch=('x86_64')
@@ -40,8 +40,10 @@ package() {
   cd "$srcdir/$pkgname-$pkgver"
   install -Dm755 src/squelch src/squelch-ptt src/squelch-parakeet-server \
     src/squelch-tray src/squelch-vram src/squelch-setup-models \
-    src/squelch-mic-reset -t "$pkgdir/usr/bin/"
-  install -Dm644 systemd/*.service -t "$pkgdir/usr/lib/systemd/user/"
+    src/squelch-mic-reset src/squelch-sync src/squelch-sync-server \
+    -t "$pkgdir/usr/bin/"
+  install -Dm644 systemd/*.service systemd/*.timer systemd/*.path \
+    -t "$pkgdir/usr/lib/systemd/user/"
   install -Dm644 systemd/system/squelch-mic-reset@.service -t \
     "$pkgdir/usr/lib/systemd/system/"
   install -Dm644 polkit/50-squelch.rules -t \

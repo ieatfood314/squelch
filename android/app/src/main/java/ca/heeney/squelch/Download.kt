@@ -7,36 +7,53 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-/** Fetches the model from Hugging Face. Resumes a partial file instead of starting over. */
+/** Fetches a model from Hugging Face, then switches to it. Resumes a partial file
+ *  instead of starting over. One download at a time. */
 object Download {
     /** null when not downloading, else 0..1 */
     val progress = Observable<Float?>(null)
+    /** key of the model being fetched */
+    val which = Observable<String?>(null)
     val error = Observable<String?>(null)
 
-    fun start(ctx: Context) {
+    fun start(ctx: Context, model: Model) = run(ctx, model.key) { model }
+
+    /** A Hugging Face repo you typed in: look it up first. */
+    fun custom(ctx: Context, repo: String) = run(ctx, Models.keyFor(repo)) { Models.resolve(it, repo) }
+
+    private fun run(ctx: Context, key: String, model: (Context) -> Model) {
         if (progress.value != null) return
         val app = ctx.applicationContext
+        which.value = key
         progress.value = 0f
         error.value = null
         Thread({
             try {
-                val dir = Engine.dir(app).apply { mkdirs() }
+                val m = model(app)
+                val dir = m.dir(app).apply { mkdirs() }
                 var done = 0L
-                for ((name, size) in Engine.FILES) {
+                for ((name, size) in m.files) {
                     val f = File(dir, name)
                     if (f.length() == size) { done += size; continue }
-                    fetch(Engine.url(name), f, size) { got -> progress.value = (done + got).toFloat() / Engine.TOTAL_BYTES }
+                    f.parentFile?.mkdirs()
+                    fetch(m.url(name), f, size) { got -> progress.value = (done + got).toFloat() / m.bytes }
                     done += size
                 }
                 progress.value = null
-                Engine.warm(app)
+                which.value = null
+                Engine.select(app, m)
             } catch (t: Throwable) {
                 Log.e(TAG, "download failed", t)
                 progress.value = null
-                error.value = "Download failed"
+                errorText = t.message?.takeIf { it.length < 60 && "http" !in it.lowercase() } ?: "Download failed"
+                error.value = key
+                which.value = null
             }
         }, "squelch-download").start()
     }
+
+    /** what went wrong with the model in `error` */
+    @Volatile var errorText = ""
 
     private fun fetch(url: String, dest: File, size: Long, onBytes: (Long) -> Unit) {
         val part = File(dest.path + ".part")
