@@ -16,6 +16,7 @@ Usage:
 """
 import configparser
 import ctypes
+import difflib
 import fcntl
 import glob
 import json
@@ -1955,7 +1956,7 @@ def duration(seconds):
 
 LIVE_EVERY_S = 0.5     # how often the clip so far is transcribed while held
 LIVE_MIN_NEW_S = 0.25  # unless it grew less than this since the last pass
-LIVE_FIX_WORDS = 3     # while held, only rewrite this many words back
+LIVE_FIX_WORDS = 3     # only ever rewrite this many typed words back
 
 
 def read_growing_wav(path):
@@ -1977,6 +1978,40 @@ def read_growing_wav(path):
             return nch, pcm[:len(pcm) - len(pcm) % (2 * nch)]
         i += 8 + size + (size & 1)
     return None
+
+
+def _word_key(w):
+    return re.sub(r"[^\w']", "", w.lower())
+
+
+def splice(typed, words, fix=LIVE_FIX_WORDS):
+    """Line typed words up with a newer pass. Returns (target, ahead):
+    target keeps typed as is except its last `fix` words, which take the
+    newer pass's version, followed by the rest of that pass; ahead is how
+    many words of the pass come after the end of the typed text. Words
+    are matched ignoring case and punctuation, so a pass that merges or
+    splits a word ("we are" -> "we're", "three D" -> "3D") can't shift
+    the rest by one and type a word twice."""
+    a, b = [_word_key(w) for w in typed], [_word_key(w) for w in words]
+    ops = difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+    keep, j = max(0, len(typed) - fix), len(words)
+    for tag, i1, i2, j1, j2 in ops:
+        if i1 <= keep < i2 or keep == i1 == i2:
+            if tag == "equal":
+                j = j1 + keep - i1
+            elif keep - i1 <= fix:
+                keep, j = i1, j1   # a small change: take the new version
+            else:
+                keep, j = i2, j2   # changed further back: leave it be
+            break
+    end = 0
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "insert" and i1 == len(typed):
+            end = j1
+            break
+        if i2 == len(typed):
+            end = j2
+    return typed[:keep] + words[j:], len(words) - end
 
 
 def common_prefix(a, b):
@@ -2068,14 +2103,9 @@ class LiveTyper:
             # hold that back until it's clear speech has stopped
             last = agreed[-1].rstrip(".?!")
             agreed = agreed[:-1] + ([last] if last else [])
-        typed = self.typed.split()
-        if len(agreed) <= len(typed):
-            return
-        if len(typed) - common_prefix(typed, agreed) > LIVE_FIX_WORDS:
-            # a word further back changed: rewriting a whole stretch of
-            # text mid-sentence is jarring, so release fixes that instead
-            agreed = typed + agreed[len(typed):]
-        self.retype(" ".join(agreed))
+        target, ahead = splice(self.typed.split(), agreed)
+        if ahead > 0:
+            self.retype(" ".join(target))
 
     def retype(self, target):
         """Make the typed text read target: backspace to where they part,
@@ -2096,8 +2126,16 @@ class LiveTyper:
         return True
 
     def finish(self, text):
-        if self.retype(text):
-            log(f"live typed, finished as: {text[:80]!r}")
+        """Bring the typed text in line with the final pass. Only the last
+        few words are rewritten: backspacing over a whole dictation is
+        slow, and if an app misses some of those keys the text ends up
+        doubled."""
+        before = self.typed
+        target, _ahead = splice(self.typed.split(), text.split())
+        target = " ".join(target) + " "
+        if self.retype(target):
+            log(f"live finished: {len(before) - common_prefix(before, target)}"
+                f" chars fixed, {target[:80]!r}")
         else:
             clipboard_only(text)
 
@@ -2117,7 +2155,7 @@ def utterance_worker(jobs):
                            f"Kept the first {duration(cap_s)}.",
                            urgency="normal")
             if text and live:
-                live.finish(" ".join(text.split()) + " ")
+                live.finish(text)
             elif text:
                 if os.environ.get("STT_DRY_RUN"):
                     log(f"DRYRUN would type: {text[:120]!r}")
