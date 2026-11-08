@@ -5,10 +5,12 @@ Switching writes ~/.config/squelch/engine, which the squelch-ptt daemon
 reads on every utterance and squelch-vram uses to pick the one engine that
 stays loaded. Quitting the tray does NOT stop dictation.
 """
+import ctypes
 import datetime
 import fcntl
 import glob
 import grp
+import html
 import json
 import os
 import pwd
@@ -23,6 +25,7 @@ import urllib.request
 
 import evdev
 
+from PyQt6 import sip
 from PyQt6.QtCore import (QEvent, QObject, QSocketNotifier, QTimer, Qt,
                           pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor,
@@ -55,9 +58,8 @@ DEFAULT_HEADROOM_GB = 1.0
 STUCK_KEY_S, MIN_CAP_S = 900.0, 30.0
 KANATA_CFG = os.path.expanduser("~/.config/kanata/kanata.kbd")
 INSERTION_MODES = (
-    ("live", "Type as you speak"),
     ("paste", "Paste"),
-    ("type", "Type when done"),
+    ("type", "Type keys"),
     ("clipboard", "Clipboard only"))
 PARAKEET_DIR = os.path.expanduser("~/.local/share/parakeet")
 WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp/models")
@@ -287,8 +289,19 @@ def read_insertion():
     return m if m in dict(INSERTION_MODES) else "paste"
 
 
-def write_insertion(mode):
-    atomic_write(INSERTION_FILE, json.dumps({"mode": mode}))
+def write_insertion(mode=None, preview=None):
+    d = read_json(INSERTION_FILE, {})
+    d = d if isinstance(d, dict) else {}
+    if mode is not None:
+        d["mode"] = mode
+    if preview is not None:
+        d["preview"] = preview
+    atomic_write(INSERTION_FILE, json.dumps(d))
+
+
+def read_preview():
+    d = read_json(INSERTION_FILE, {})
+    return bool(d.get("preview", False)) if isinstance(d, dict) else False
 
 
 def read_mic():
@@ -1298,9 +1311,13 @@ class SettingsWindow(QWidget):
             rb = QRadioButton(text)
             self.ins_group.addButton(rb)
             rb.toggled.connect(
-                lambda checked, k=key: checked and write_insertion(k))
+                lambda checked, k=key: checked and write_insertion(mode=k))
             lay.addWidget(rb)
             self.ins_radios[key] = rb
+        self.cb_preview = QCheckBox("Show words as you speak")
+        self.cb_preview.toggled.connect(
+            lambda checked: write_insertion(preview=checked))
+        lay.addWidget(self.cb_preview)
 
         lay.addWidget(label("Cleanup", "heading"))
         self.cb_defill = QCheckBox("Remove filler words")
@@ -1447,6 +1464,9 @@ class SettingsWindow(QWidget):
             rb.blockSignals(True)
             rb.setChecked(key == cur)
             rb.blockSignals(False)
+        self.cb_preview.blockSignals(True)
+        self.cb_preview.setChecked(read_preview())
+        self.cb_preview.blockSignals(False)
 
     # ---- setup tab (models, mic, services) ----
     def _build_setup(self):
@@ -2181,6 +2201,112 @@ class TriggerWatcher:
             pass
 
 
+def make_overlay(widget, bottom_margin):
+    """Turn widget into a layer-shell overlay: bottom centre of the active
+    screen, above everything, and never given keyboard focus, so the
+    window you're dictating into keeps it. False if layer-shell-qt isn't
+    there (another compositor, X11)."""
+    if QGuiApplication.platformName() != "wayland":
+        return False
+    try:
+        lib = ctypes.CDLL("libLayerShellQtInterface.so.6")
+    except OSError:
+        return False
+    get = lib._ZN12LayerShellQt6Window3getEP7QWindow
+    get.restype, get.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+    set_margins = lib._ZN12LayerShellQt6Window10setMarginsERK8QMargins
+    set_margins.restype = None
+    set_margins.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    widget.winId()  # create the QWindow, but don't map it yet
+    ptr = get(sip.unwrapinstance(widget.windowHandle()))
+    if not ptr:
+        return False
+    win = sip.wrapinstance(ptr, QObject)
+    for prop, value in (("layer", 3),                  # LayerOverlay
+                        ("anchors", 2),                # AnchorBottom
+                        ("keyboardInteractivity", 0),  # None
+                        ("activateOnShow", False),
+                        ("wantsToBeOnActiveScreen", True),
+                        ("scope", "squelch-preview")):
+        win.setProperty(prop, value)
+    margins = (ctypes.c_int * 4)(0, 0, 0, bottom_margin)  # QMargins l,t,r,b
+    set_margins(ptr, ctypes.addressof(margins))
+    widget._layer_margins = margins  # the C++ side keeps a copy; be safe
+    return True
+
+
+class LivePreview(QWidget):
+    """What squelch-ptt hears while the trigger is held, in a strip at
+    the bottom of the screen. Display only: the text box gets the final
+    transcript on release, as without it."""
+
+    MAX_CHARS = 280  # roughly three lines; older words scroll off the front
+    STALE_MS = 5000  # hide if the daemon goes quiet (it crashed mid-hold)
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.hold = None
+        panel = QWidget(self)
+        panel.setObjectName("panel")
+        panel.setStyleSheet(
+            f"#panel {{ background: {POPOVER}; border: 1px solid {BORDER};"
+            " border-radius: 12px; }")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(panel)
+        inner = QVBoxLayout(panel)
+        inner.setContentsMargins(16, 12, 16, 12)
+        self.text = QLabel()
+        self.text.setTextFormat(Qt.TextFormat.RichText)
+        self.text.setWordWrap(True)
+        inner.addWidget(self.text)
+        self.layered = make_overlay(self, 48)
+        self.stale = QTimer(self)
+        self.stale.setSingleShot(True)
+        self.stale.setInterval(self.STALE_MS)
+        self.stale.timeout.connect(self.hide)
+
+    def update_from(self, msg):
+        try:
+            d = json.loads(msg)
+        except ValueError:
+            return
+        if not isinstance(d, dict):
+            return
+        if d.get("end"):
+            if d.get("hold") == self.hold:
+                self.stale.stop()
+                self.hide()
+            return
+        if not self.layered:
+            return  # an ordinary window could take focus from your text
+        self.hold = d.get("hold")
+        stable, tail = str(d.get("stable", "")), str(d.get("tail", ""))
+        sep = " " if stable and tail else ""
+        over = len(stable) + len(sep) + len(tail) - self.MAX_CHARS
+        if over > 0:  # keep the newest words
+            if over <= len(stable):
+                stable = "…" + stable[over:]
+            else:
+                tail = "…" + tail[over - len(stable) - len(sep):]
+                stable = sep = ""
+        self.text.setText(
+            f'<span style="color:{FG}">{html.escape(stable + sep)}</span>'
+            f'<span style="color:{MUTED}">{html.escape(tail)}</span>')
+        screen = self.screen()  # the compositor puts it on the active one
+        width = screen.availableGeometry().width() if screen else 1200
+        self.text.setFixedWidth(min(720, int(width * 0.6)) - 34)
+        self.adjustSize()
+        self.show()
+        self.stale.start()
+
+
 def tell_running_tray(msg):
     """Hand `msg` to the tray that's already running; False if none is."""
     sock = QLocalSocket()
@@ -2329,9 +2455,13 @@ def main():
             tap["pending"] = True
             tap_timer.start()
 
+    preview = LivePreview()
+
     def on_launch(msg):
         cmd, _sep, token = msg.partition(" ")
-        if cmd == "settings":
+        if cmd == "preview":
+            preview.update_from(token)
+        elif cmd == "settings":
             if token:
                 os.environ["XDG_ACTIVATION_TOKEN"] = token
             open_settings(None)

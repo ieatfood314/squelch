@@ -3,9 +3,9 @@
 otherwise; F24 when kanata's Squelch tap-hold sits on it) to record
 from the mic picked in Settings (default: PipeWire's default source),
 beamform + clean, transcribe with the resident Parakeet or Whisper server
-(Vulkan GPU), and insert the result: word by word while you speak (typed
-through the active keyboard layout, so Colemak works), or pasted via
-clipboard + Shift+Insert (Ctrl+V in browsers).
+(Vulkan GPU), and paste the result via clipboard + Shift+Insert (Ctrl+V
+in browsers), or type it through the active keyboard layout. Optionally
+the words show in the tray's overlay while you speak.
 
 Usage:
   squelch-ptt                run the daemon (systemd user service does this)
@@ -16,7 +16,6 @@ Usage:
 """
 import configparser
 import ctypes
-import difflib
 import fcntl
 import glob
 import json
@@ -1250,13 +1249,12 @@ def tidy(text):
     return apply_dictionary(text)
 
 
-INSERTION_MODES = ("live", "paste", "type", "clipboard")
+INSERTION_MODES = ("paste", "type", "clipboard")
 
 
 def insertion_mode():
-    """live (typed word by word while you speak), paste (default), type
-    (typed once you let go), or clipboard (copy only, you paste
-    yourself)."""
+    """paste (default), type (keys through the active layout), or
+    clipboard (copy only, you paste yourself)."""
     try:
         with open(INSERTION_FILE) as f:
             m = json.load(f).get("mode", "paste")
@@ -1272,7 +1270,7 @@ def insertion_mode():
 # layout KWin is using right now, via libxkbcommon.
 
 KXKBRC = os.path.expanduser("~/.config/kxkbrc")
-KEY_BACKSPACE, KEY_ENTER, KEY_LEFTSHIFT = 14, 28, 42
+KEY_ENTER, KEY_LEFTSHIFT = 28, 42
 TYPE_DELAY_MS = 4      # between key events; ydotool's default is 12
 _keymaps = {}          # (layout, variant, options) -> {char: (code, shift)}
 
@@ -1454,10 +1452,6 @@ def type_text(text, table=None):
     return True
 
 
-def backspace(n):
-    return ydotool_keys([f"{KEY_BACKSPACE}:1", f"{KEY_BACKSPACE}:0"] * n)
-
-
 def type_ydotool(text):
     if type_text(text):
         log("typed:", text[:80])
@@ -1478,7 +1472,7 @@ def clipboard_only(text):
 
 def output_text(text):
     mode = insertion_mode()
-    if mode in ("type", "live"):
+    if mode == "type":
         type_ydotool(text)
     elif mode == "clipboard":
         clipboard_only(text)
@@ -1952,11 +1946,35 @@ def duration(seconds):
             else f"{seconds / 60:.1f} min".replace(".0 min", " min"))
 
 
-# ---------------- live dictation (word by word) ----------------
+# ---------------- live preview ----------------
+# While the trigger is held, the clip so far is transcribed every
+# LIVE_EVERY_S and shown in the tray's overlay strip. Display only: the
+# text box gets the final transcript on release, exactly as without it.
 
 LIVE_EVERY_S = 0.5     # how often the clip so far is transcribed while held
 LIVE_MIN_NEW_S = 0.25  # unless it grew less than this since the last pass
-LIVE_FIX_WORDS = 3     # only ever rewrite this many typed words back
+TRAY_SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+                           f"squelch-tray-{os.getuid()}")
+_hold_ids = iter(range(1, 1 << 62))
+
+
+def preview_enabled():
+    try:
+        with open(INSERTION_FILE) as f:
+            return bool(json.load(f).get("preview", False))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def tell_tray(obj):
+    """One preview line to the tray; nothing happens if it isn't running."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            s.connect(TRAY_SOCKET)
+            s.sendall(b"preview " + json.dumps(obj).encode() + b"\n")
+    except OSError:
+        pass
 
 
 def read_growing_wav(path):
@@ -1980,40 +1998,6 @@ def read_growing_wav(path):
     return None
 
 
-def _word_key(w):
-    return re.sub(r"[^\w']", "", w.lower())
-
-
-def splice(typed, words, fix=LIVE_FIX_WORDS):
-    """Line typed words up with a newer pass. Returns (target, ahead):
-    target keeps typed as is except its last `fix` words, which take the
-    newer pass's version, followed by the rest of that pass; ahead is how
-    many words of the pass come after the end of the typed text. Words
-    are matched ignoring case and punctuation, so a pass that merges or
-    splits a word ("we are" -> "we're", "three D" -> "3D") can't shift
-    the rest by one and type a word twice."""
-    a, b = [_word_key(w) for w in typed], [_word_key(w) for w in words]
-    ops = difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
-    keep, j = max(0, len(typed) - fix), len(words)
-    for tag, i1, i2, j1, j2 in ops:
-        if i1 <= keep < i2 or keep == i1 == i2:
-            if tag == "equal":
-                j = j1 + keep - i1
-            elif keep - i1 <= fix:
-                keep, j = i1, j1   # a small change: take the new version
-            else:
-                keep, j = i2, j2   # changed further back: leave it be
-            break
-    end = 0
-    for tag, i1, i2, j1, j2 in ops:
-        if tag == "insert" and i1 == len(typed):
-            end = j1
-            break
-        if i2 == len(typed):
-            end = j2
-    return typed[:keep] + words[j:], len(words) - end
-
-
 def common_prefix(a, b):
     n = 0
     for x, y in zip(a, b):
@@ -2023,29 +2007,26 @@ def common_prefix(a, b):
     return n
 
 
-class LiveTyper:
-    """Types a dictation word by word while the trigger is held. Every
-    LIVE_EVERY_S the clip so far is transcribed, and the words two passes
-    in a row agree on get typed (a word still being spoken changes between
-    passes, so it waits). On release the whole clip goes through the
-    normal path and finish() backspaces and retypes whatever changed,
-    usually just the last word's punctuation."""
+class LivePreview:
+    """Transcribes a hold's clip as it grows and sends the words to the
+    tray: the ones two passes in a row agree on as settled, the rest as
+    still changing."""
 
-    def __init__(self, path, cap_s, source, jobs):
+    def __init__(self, path, cap_s, source):
         self.path, self.cap_s, self.source = path, cap_s, source
-        self.jobs = jobs
-        self.typed = ""     # what this hold has typed so far
-        self.prev = None    # words of the previous pass
-        self.table = None   # the layout's keys, looked up off the key loop
-        self.dry = bool(os.environ.get("STT_DRY_RUN"))
+        self.hold = next(_hold_ids)
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
     def halt(self):
-        """Stop transcribing partials; returns once the last one is done."""
+        """Stop transcribing; returns once the last pass is done."""
         self._stop.set()
         self.thread.join()
+
+    def end(self):
+        self.halt()
+        tell_tray({"hold": self.hold, "end": True})
 
     def partial(self, nch, pcm):
         """Cleaned-up words of the clip so far, or None."""
@@ -2071,8 +2052,7 @@ class LiveTyper:
             discard(clean)
 
     def run(self):
-        self.table = current_keymap()
-        seen = 0
+        seen, prev = 0, []
         while not self._stop.wait(LIVE_EVERY_S):
             try:
                 got = read_growing_wav(self.path)
@@ -2086,58 +2066,12 @@ class LiveTyper:
                 continue
             seen = frames
             words = self.partial(nch, pcm)
-            if not words:
+            if not words or self._stop.is_set():
                 continue
-            prev, self.prev = self.prev, words
-            if prev is None or self._stop.is_set():
-                continue
-            # an earlier hold may still be pasting; its text goes first
-            if self.jobs.unfinished_tasks == 0:
-                self.advance(prev, words)
-
-    def advance(self, prev, words):
-        """Type what two passes in a row agree on."""
-        agreed = words[:common_prefix(prev, words)]
-        if agreed and len(agreed) == len(words):
-            # the clip ends at a pause, so the model ends the sentence;
-            # hold that back until it's clear speech has stopped
-            last = agreed[-1].rstrip(".?!")
-            agreed = agreed[:-1] + ([last] if last else [])
-        target, ahead = splice(self.typed.split(), agreed)
-        if ahead > 0:
-            self.retype(" ".join(target))
-
-    def retype(self, target):
-        """Make the typed text read target: backspace to where they part,
-        type the rest. False if a keystroke failed."""
-        p = common_prefix(self.typed, target)
-        drop, add = len(self.typed) - p, target[p:]
-        if self.dry:
-            log(f"DRYRUN live: {drop} backspaces, then {add!r}")
-            self.typed = target
-            return True
-        if drop:
-            if not backspace(drop):
-                return False
-            self.typed = self.typed[:p]
-        if add and not type_text(add, self.table):
-            return False
-        self.typed = target
-        return True
-
-    def finish(self, text):
-        """Bring the typed text in line with the final pass. Only the last
-        few words are rewritten: backspacing over a whole dictation is
-        slow, and if an app misses some of those keys the text ends up
-        doubled."""
-        before = self.typed
-        target, _ahead = splice(self.typed.split(), text.split())
-        target = " ".join(target) + " "
-        if self.retype(target):
-            log(f"live finished: {len(before) - common_prefix(before, target)}"
-                f" chars fixed, {target[:80]!r}")
-        else:
-            clipboard_only(text)
+            n = common_prefix(prev, words)
+            prev = words
+            tell_tray({"hold": self.hold, "stable": " ".join(words[:n]),
+                       "tail": " ".join(words[n:])})
 
 
 def utterance_worker(jobs):
@@ -2154,21 +2088,18 @@ def utterance_worker(jobs):
                 notify_stt("Dictation cut short",
                            f"Kept the first {duration(cap_s)}.",
                            urgency="normal")
-            if text and live:
-                live.finish(text)
-            elif text:
+            if text:
                 if os.environ.get("STT_DRY_RUN"):
                     log(f"DRYRUN would type: {text[:120]!r}")
                 else:
                     output_text(text + " ")
-            elif live and live.typed:
-                log("final pass found no speech, keeping the live text")
             else:
                 log("no speech, typing nothing")
         except Exception as e:
             log("utterance failed:", e)
         finally:
-            jobs.task_done()
+            if live:
+                live.end()
 
 
 def discard(path):
@@ -2178,7 +2109,7 @@ def discard(path):
         pass
 
 
-def start_hold(code, jobs):
+def start_hold(code):
     """Start recording for a held trigger; None if we can't."""
     if notify_engine_down():
         log("engine unavailable, ignoring press")
@@ -2207,9 +2138,7 @@ def start_hold(code, jobs):
     cap = threading.Timer(cap_s, stop_recording, [proc])
     cap.daemon = True
     cap.start()
-    live = None
-    if insertion_mode() == "live":
-        live = LiveTyper(path, cap_s, source, jobs)
+    live = LivePreview(path, cap_s, source) if preview_enabled() else None
     log(f"recording... (cap {duration(cap_s)}{', live' if live else ''})")
     return {"proc": proc, "path": path, "paused": paused, "code": code,
             "t": time.time(), "cap": cap, "cap_s": cap_s, "source": source,
@@ -2225,7 +2154,7 @@ def end_hold(rec, jobs):
     if held < MIN_HOLD_S:
         log(f"tap ({held:.2f}s), ignoring")
         if live:
-            live.halt()
+            live.end()
         discard(path)
         return
     if capture_dead(path, min(held, cap_s)):
@@ -2233,7 +2162,7 @@ def end_hold(rec, jobs):
             f"in {held:.1f}s (mic wedged?)")
         recover_mic_async("short capture")
         if live:
-            live.halt()
+            live.end()
         discard(path)
         return
     if held > cap_s:
@@ -2246,7 +2175,7 @@ def abandon_hold(rec):
     stop_recording(rec["proc"])
     resume_players(rec["paused"])
     if rec["live"]:
-        rec["live"].halt()
+        rec["live"].end()
     discard(rec["path"])
 
 
@@ -2274,7 +2203,7 @@ def main():
             lonely = not kbd.devs
         if pending and now - pending[1] >= HOLD_DELAY_S:
             if rec is None:
-                rec = start_hold(kbd.code, jobs)
+                rec = start_hold(kbd.code)
                 if rec is not None:
                     rec["dev"] = pending[0]
             pending = None
@@ -2304,7 +2233,7 @@ def main():
                     continue
                 if ev.code == F24:  # kanata already timed the hold
                     if ev.value == 1 and rec is None:
-                        rec = start_hold(F24, jobs)
+                        rec = start_hold(F24)
                         if rec is not None:
                             rec["dev"] = path
                     elif ev.value == 0 and rec and rec["code"] == F24:

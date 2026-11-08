@@ -9,7 +9,7 @@ license=('MIT')
 depends=('python' 'python-evdev' 'python-numpy' 'python-pyqt6' 'ydotool'
          'wl-clipboard' 'libnotify' 'pipewire' 'vulkan-icd-loader'
          'playerctl' 'polkit' 'qt6-tools' 'wireplumber' 'libxkbcommon'
-         'glib2')
+         'glib2' 'layer-shell-qt')
 makedepends=('git' 'cmake' 'vulkan-headers' 'spirv-headers')
 optdepends=('aspell-en: learn your vocabulary and mishearings'
             'kanata: stop the trigger key doing its own job too')
