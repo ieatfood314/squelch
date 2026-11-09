@@ -9,7 +9,7 @@ The README covers what squelch does and its file layout. This file covers where 
 - **Android builds on nas** with `~/.local/android-toolchain` and the signing key in `~/.config/squelch-android/`. Gradle uses about 3 GB; `release.sh` stops its daemon when done, so do the same after any other Gradle run (with `JAVA_HOME=~/.local/android-toolchain/jdk17`, since nas has no system Java).
 
 ## Shipping the desktop app (AUR)
-Squelch ships as the AUR package `squelch`, built from GitHub tag tarballs. Never hand-copy files into `/usr`; that drifted from the repo before 0.6.0. Run from `~/repos/squelch` on nas:
+Squelch ships as the AUR package `squelch`, built from GitHub tag tarballs. Never hand-copy files into `/usr`; that drifted from the repo before 0.6.0. Releases are cut from main, so merge a feature branch before tagging; 0.8.0 shipped without the `live-typing` branch that regolith had been trying. To try a branch on regolith, stop the squelch-ptt service first: a second squelch-ptt run by hand next to it answers every hold too, which doubles every dictation (this happened 2026-11-07 to 11-08). Run from `~/repos/squelch` on nas:
 
 1. Commit to main and push.
 2. Bump `pkgver` in PKGBUILD (reset `pkgrel=1`), `git tag -a vX.Y.Z -m "Squelch X.Y.Z"`, push the tag.
