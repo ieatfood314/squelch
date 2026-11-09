@@ -1,7 +1,8 @@
 # Squelch — push-to-talk speech-to-text on your GPU
 
 Hold **Menu**, speak, release — the transcription appears at your cursor in
-well under a second. Tap **Menu** for a settings popup. Fully on-device,
+well under a second. Optionally the words show in a strip at the bottom of
+the screen while you speak. Tap **Menu** for a settings popup. Fully on-device,
 no cloud, no accounts.
 
 - **Fast GPU inference**: Parakeet TDT 0.6B (default, ~0.2 s for 11 s of
@@ -11,9 +12,15 @@ no cloud, no accounts.
   stays resident in VRAM; the other one is unloaded
 - **Mic-array beamforming**: adaptive delay-and-sum across your mic's
   channels, high-pass, diffraction EQ, noise gate, normalization
-- **Layout-proof output**: pastes via clipboard + Shift+Insert, so Colemak
-  (or any layout) never mangles dictated text. In browsers it sends Ctrl+V
-  instead, since web editors like Word online ignore Shift+Insert
+- **Live preview**: while you hold the key, the audio so far is
+  transcribed twice a second and shown in an overlay strip that never takes
+  focus. It's display only: your text box gets the full-clip transcript on
+  release, the same text as with the preview off
+- **Layout-proof output**: pastes via clipboard + Shift+Insert, or Ctrl+V
+  in browsers, since web editors like Word online ignore Shift+Insert.
+  Type mode goes through your active keyboard layout (read from Plasma and
+  libxkbcommon), so Colemak or a layout switched mid-session types
+  correctly; characters it has no key for are pasted
 - **Text cleanup**: filler words (um/uh/ah…) removed, number words over ten
   (optionally all) written as digits, custom dictionary with AI-suggested
   mishearings via OpenRouter, and mishearings learned from your own
@@ -104,7 +111,7 @@ config, Change moves it to the new key for you.
 | Settings (engine, trigger, insertion, cleanup, appearance, dictionary, analytics, setup) | tap trigger, double-tap for Settings, Squelch in the app menu, or tray menu |
 | Engine switch | settings popup, General tab, or right-click tray icon |
 | Trigger key (any key) | settings → General → Change, then press the key |
-| Insertion (paste/type/clipboard-only) | settings → General |
+| Insertion (paste/type/clipboard-only), live preview | settings → General |
 | Accent color, background opacity, text size, font | settings → Appearance |
 | Speech models (picking one that isn't downloaded yet downloads it) | settings → Setup |
 | Microphone (default: PipeWire's default source) | settings → Setup |
