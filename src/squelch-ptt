@@ -779,7 +779,7 @@ def fast_len(n):
 
 
 def gcc_phat_lag(sig, ref, max_shift=8):
-    n = fast_len(len(sig))  # zero-padded, so lags don't wrap around either
+    n = fast_len(len(sig))  # padded to a fast FFT length
     S = np.fft.rfft(sig - sig.mean(), n)
     R = np.fft.rfft(ref - ref.mean(), n)
     cross = S * np.conj(R)
@@ -1302,7 +1302,7 @@ def active_layout():
             ["gdbus", "call", "--session", "-d", "org.kde.keyboard",
              "-o", "/Layouts", "-m", "org.kde.KeyboardLayouts.getLayout"],
             capture_output=True, text=True, timeout=2).stdout
-        m = re.search(r"(\d+)", out)
+        m = re.search(r"uint32 (\d+)", out)  # reply: (uint32 N,)
         idx = int(m.group(1)) if m else 0
     except Exception as e:
         log("layout index unknown, using the first:", e)
@@ -2024,7 +2024,13 @@ class LivePreview:
         self._stop.set()
         self.thread.join()
 
-    def end(self):
+    def end(self, wait=True):
+        """Stop and hide the overlay. wait=False returns at once, for the
+        key-reading loop, which mustn't sit behind a pass in flight."""
+        if not wait:
+            self._stop.set()
+            threading.Thread(target=self.end, daemon=True).start()
+            return
         self.halt()
         tell_tray({"hold": self.hold, "end": True})
 
@@ -2154,7 +2160,7 @@ def end_hold(rec, jobs):
     if held < MIN_HOLD_S:
         log(f"tap ({held:.2f}s), ignoring")
         if live:
-            live.end()
+            live.end(wait=False)
         discard(path)
         return
     if capture_dead(path, min(held, cap_s)):
@@ -2162,7 +2168,7 @@ def end_hold(rec, jobs):
             f"in {held:.1f}s (mic wedged?)")
         recover_mic_async("short capture")
         if live:
-            live.end()
+            live.end(wait=False)
         discard(path)
         return
     if held > cap_s:
@@ -2175,7 +2181,7 @@ def abandon_hold(rec):
     stop_recording(rec["proc"])
     resume_players(rec["paused"])
     if rec["live"]:
-        rec["live"].end()
+        rec["live"].end(wait=False)
     discard(rec["path"])
 
 
