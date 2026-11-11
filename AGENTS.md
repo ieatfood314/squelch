@@ -17,7 +17,7 @@ Squelch ships as the AUR package `squelch`, built from GitHub tag tarballs. Neve
    `ssh regolith 'd=$(mktemp -d); cd $d; cat > PKGBUILD; makepkg --printsrcinfo; rm -rf $d' < PKGBUILD > .SRCINFO`
    Commit "X.Y.Z checksums", push.
 4. AUR: only regolith's ssh key can push to `ssh://aur@aur.archlinux.org/squelch.git`. On regolith, clone it into a temp dir, copy in PKGBUILD and .SRCINFO (scp them from nas), commit, push.
-5. Install on regolith: `makepkg` in a temp dir (builds whisper.cpp with Vulkan, several minutes), then `sudo -n pacman -U --noconfirm` on the package. `systemctl --user daemon-reload` and restart squelch-vram, squelch-ptt, squelch-tray and squelch-ydotoold.
+5. Install on regolith: `makepkg` in a temp dir (builds whisper.cpp with Vulkan, several minutes), then `sudo -n pacman -U --noconfirm` on the package. `systemctl --user daemon-reload` and restart squelch-vram, squelch-ptt, squelch-tray and squelch-ydotoold, plus squelch-parakeet when `squelch-parakeet-server` changed (squelch-ptt and the server talk over HTTP, and typing as you speak needs the 0.9.0 server).
 6. Verify on regolith: `pacman -Q squelch`, `cmp` each `/usr/bin/squelch*` against the tag's `src/`, and the services' journals.
 7. mars (laptop, often offline) also runs squelch. On regolith, copy step 5's `squelch-X.Y.Z-1-x86_64.pkg.tar.zst` (in the makepkg temp dir) to `/mnt/nas/Aidan/squelch-pkg/`, which is `/mnt/RAID1/Aidan/squelch-pkg/` on nas and `/mnt/nas/Aidan/squelch-pkg/` on mars, and queue an idempotent `sudo -n pacman -U` plus step 5's restarts with the fleet skill's `when-online mars - squelch-X.Y.Z`. Don't build on mars.
 
@@ -27,6 +27,9 @@ regolith also pulls AUR releases through yay on its own, so a reinstall of the s
 1. `cd android && ./release.sh X.Y.Z <versionCode>`. versionCode must go up every release (0.2.0 = 2).
 2. Tag `android-vX.Y.Z` (never `vX.Y.Z`, which is the desktop/AUR namespace), push it, then `gh release create android-vX.Y.Z android/build/squelch-X.Y.Z.apk`.
 3. Obtainium on halley tracks the GitHub releases. Only Android gets GitHub releases; desktop is tags only, so Obtainium never sees an APK-less latest release.
+
+## Testing dictation without a mic or an unlocked screen
+`STT_DRY_RUN=1` makes squelch-ptt log what it would type. Never let it type for real while regolith's screen is locked: the keys go into the lock screen. Live typing's rule (`live_settled` in squelch-ptt) was tuned by replaying the archive in `/mnt/RAID1/Aidan/squelch/raw/` in 0.5 s steps through a second `squelch-parakeet-server` (`SQUELCH_PARAKEET_PORT=1895`) and comparing what it would type with the full-clip transcript; redo that before changing its numbers.
 
 ## Mic on regolith
 regolith uses a Logitech C920 (046d:0892, stereo) since 2026-10-23, picked in `~/.config/squelch/mic`. regolith's default source is easyeffects_source, so don't delete that file. The PS Eye it replaced wedged after suspend and only a replug fixed it; don't suggest going back to it or adding software resets for it. The "too quiet" gate is QUIET_PEAK=3000 / QUIET_RMS=500 in squelch-ptt, set from the C920's idle floor (peak about 1700, rms 350) rather than real speech, so if short dictations get dropped as too quiet, lower those first.

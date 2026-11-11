@@ -4,7 +4,10 @@
 Keeps a Parakeet TDT 0.6B model (v3 multilingual or v2 English, whichever
 engines.env names) in VRAM and exposes a whisper-server-like HTTP API on
 127.0.0.1:1894:
-  POST /inference  multipart (file=<wav>, response_format=json) -> {"text": ...}
+  POST /inference  multipart (file=<wav>, response_format=json) ->
+                   {"text": ..., "words": [[word, confidence, end_s], ...]}
+                   confidence is the lowest probability among the word's
+                   tokens; end_s is where the word ends in the clip
                    header X-Squelch-Partial: 1 marks a live pass of a clip
                    still being recorded (not logged, VRAM not freed after)
   GET  /health     -> 200 ok
@@ -29,7 +32,8 @@ import numpy as np
 BINDIR = os.environ.get("SQUELCH_WSP_BIN", "/usr/bin")
 MODEL = os.environ.get("SQUELCH_PARAKEET_MODEL") or os.path.expanduser(
     "~/.local/share/parakeet/ggml-parakeet-tdt-0.6b-v3-q8_0.bin")
-HOST, PORT = "127.0.0.1", 1894
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("SQUELCH_PARAKEET_PORT") or 1894)
 N_THREADS = 6
 # Working VRAM on top of the loaded model grows with the square of clip
 # length (attention): measured on an RX 5700 at +71 MB for 1 min, +0.46 GB
@@ -113,6 +117,28 @@ lib.parakeet_full_n_segments.restype = ctypes.c_int
 lib.parakeet_full_n_segments.argtypes = [ctypes.c_void_p]
 lib.parakeet_full_get_segment_text.restype = ctypes.c_char_p
 lib.parakeet_full_get_segment_text.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+
+class TokenData(ctypes.Structure):
+    _fields_ = [("id", ctypes.c_int32),
+                ("duration_idx", ctypes.c_int),
+                ("duration_value", ctypes.c_int),
+                ("frame_index", ctypes.c_int),
+                ("p", ctypes.c_float),
+                ("plog", ctypes.c_float),
+                ("t0", ctypes.c_int64),
+                ("t1", ctypes.c_int64),
+                ("is_word_start", ctypes.c_bool)]
+
+
+lib.parakeet_full_n_tokens.restype = ctypes.c_int
+lib.parakeet_full_n_tokens.argtypes = [ctypes.c_void_p, ctypes.c_int]
+lib.parakeet_full_get_token_text.restype = ctypes.c_char_p
+lib.parakeet_full_get_token_text.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.c_int]
+lib.parakeet_full_get_token_data.restype = TokenData
+lib.parakeet_full_get_token_data.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.c_int]
 lib.parakeet_free.restype = None
 lib.parakeet_free.argtypes = [ctypes.c_void_p]
 
@@ -190,13 +216,24 @@ def transcribe(pcm):
         if rc != 0:
             raise RuntimeError(f"parakeet_full failed: {rc}")
         n = lib.parakeet_full_n_segments(CTX)
-        texts = []
+        texts, words = [], []
         for i in range(n):
             s = lib.parakeet_full_get_segment_text(CTX, i)
             if s:
                 texts.append(s.decode("utf-8", "replace"))
+            for j in range(lib.parakeet_full_n_tokens(CTX, i)):
+                t = lib.parakeet_full_get_token_text(CTX, i, j) or b""
+                t = t.decode("utf-8", "replace")
+                d = lib.parakeet_full_get_token_data(CTX, i, j)
+                end = d.t1 / 100  # token times are in 10 ms steps
+                if words and not (d.is_word_start or t.startswith("\u2581")):
+                    w = words[-1]
+                    w[0], w[1], w[2] = w[0] + t, min(w[1], d.p), end
+                else:
+                    words.append([t.lstrip("\u2581"), d.p, end])
     dt = time.time() - t0
-    return "".join(texts), dt
+    words = [[w, round(p, 3), end] for w, p, end in words if w]
+    return "".join(texts), words, dt
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -260,11 +297,11 @@ class Handler(BaseHTTPRequestHandler):
             if not wav:
                 raise ValueError("no wav payload found")
             pcm = wav_to_float_mono(wav)
-            text, dt = transcribe(pcm)
+            text, words, dt = transcribe(pcm)
             if not partial:
                 log(f"transcribed {len(pcm)/16000:.2f}s audio in {dt:.2f}s: "
                     f"{text[:100]!r}")
-            self.send_json(200, {"text": text})
+            self.send_json(200, {"text": text, "words": words})
             if not partial and working_mb(len(pcm) / 16000) > RELEASE_MB:
                 log("long clip, reloading to free its VRAM")
                 threading.Thread(target=release_buffers, daemon=True).start()

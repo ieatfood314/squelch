@@ -10,8 +10,8 @@ import datetime
 import fcntl
 import glob
 import grp
-import html
 import json
+import math
 import os
 import pwd
 import re
@@ -26,8 +26,8 @@ import urllib.request
 import evdev
 
 from PyQt6 import sip
-from PyQt6.QtCore import (QEvent, QObject, QSocketNotifier, QTimer, Qt,
-                          pyqtSignal)
+from PyQt6.QtCore import (QEvent, QObject, QRectF, QSocketNotifier, QTimer,
+                          Qt, pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor,
                          QGuiApplication, QIcon, QPainter, QPixmap)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
@@ -289,19 +289,23 @@ def read_insertion():
     return m if m in dict(INSERTION_MODES) else "paste"
 
 
-def write_insertion(mode=None, preview=None):
+def write_insertion(mode=None, live=None):
     d = read_json(INSERTION_FILE, {})
     d = d if isinstance(d, dict) else {}
     if mode is not None:
         d["mode"] = mode
-    if preview is not None:
-        d["preview"] = preview
+    if live is not None:
+        d["live"] = live
+        d.pop("preview", None)  # the overlay strip this replaced
     atomic_write(INSERTION_FILE, json.dumps(d))
 
 
-def read_preview():
+def read_live():
+    """Type words while you speak. Whoever had the old preview strip on
+    gets this in its place."""
     d = read_json(INSERTION_FILE, {})
-    return bool(d.get("preview", False)) if isinstance(d, dict) else False
+    d = d if isinstance(d, dict) else {}
+    return bool(d.get("live", d.get("preview", False)))
 
 
 def read_mic():
@@ -1338,10 +1342,10 @@ class SettingsWindow(QWidget):
                 lambda checked, k=key: checked and write_insertion(mode=k))
             lay.addWidget(rb)
             self.ins_radios[key] = rb
-        self.cb_preview = QCheckBox("Show words as you speak")
-        self.cb_preview.toggled.connect(
-            lambda checked: write_insertion(preview=checked))
-        lay.addWidget(self.cb_preview)
+        self.cb_live = QCheckBox("Type words as you speak")
+        self.cb_live.toggled.connect(
+            lambda checked: write_insertion(live=checked))
+        lay.addWidget(self.cb_live)
 
         lay.addWidget(label("Cleanup", "heading"))
         self.cb_defill = QCheckBox("Remove filler words")
@@ -1488,9 +1492,9 @@ class SettingsWindow(QWidget):
             rb.blockSignals(True)
             rb.setChecked(key == cur)
             rb.blockSignals(False)
-        self.cb_preview.blockSignals(True)
-        self.cb_preview.setChecked(read_preview())
-        self.cb_preview.blockSignals(False)
+        self.cb_live.blockSignals(True)
+        self.cb_live.setChecked(read_live())
+        self.cb_live.blockSignals(False)
 
     # ---- setup tab (models, mic, services) ----
     def _build_setup(self):
@@ -2257,7 +2261,7 @@ def make_overlay(widget, bottom_margin):
                         ("keyboardInteractivity", 0),  # None
                         ("activateOnShow", False),
                         ("wantsToBeOnActiveScreen", True),
-                        ("scope", "squelch-preview")):
+                        ("scope", "squelch-pill")):
         win.setProperty(prop, value)
     margins = (ctypes.c_int * 4)(0, 0, 0, bottom_margin)  # QMargins l,t,r,b
     set_margins(ptr, ctypes.addressof(margins))
@@ -2265,42 +2269,42 @@ def make_overlay(widget, bottom_margin):
     return True
 
 
-class LivePreview(QWidget):
-    """What squelch-ptt hears while the trigger is held, in a strip at
-    the bottom of the screen. Display only: the text box gets the final
-    transcript on release, as without it."""
+class Pill(QWidget):
+    """Black pill at the bottom of the screen while you dictate, the same
+    one the phone app shows: level bars in the accent while it listens, a
+    white ripple while it transcribes. Never takes focus or clicks."""
 
-    MAX_CHARS = 280  # roughly three lines; older words scroll off the front
-    STALE_MS = 5000  # hide if the daemon goes quiet (it crashed mid-hold)
+    BARS, BAR_W, GAP = 9, 3, 4
+    SIZE = (132, 40)
+    QUIET_MS = 3000     # no level for this long while listening: hide
+    WORKING_MS = 150000  # the longest a transcription should ever take
 
     def __init__(self):
         super().__init__(
             None,
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.WindowTransparentForInput
             | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setFixedSize(*self.SIZE)
         self.hold = None
-        panel = QWidget(self)
-        panel.setObjectName("panel")
-        panel.setStyleSheet(
-            f"#panel {{ background: {POPOVER}; border: 1px solid {BORDER};"
-            " border-radius: 12px; }")
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(panel)
-        inner = QVBoxLayout(panel)
-        inner.setContentsMargins(16, 12, 16, 12)
-        self.text = QLabel()
-        self.text.setTextFormat(Qt.TextFormat.RichText)
-        self.text.setWordWrap(True)
-        inner.addWidget(self.text)
+        self.working = False
+        self.levels = [0.0] * self.BARS
+        self.accent = QColor(STEEL_FOCUS)
+        self.still = reduced_motion()
         self.layered = make_overlay(self, 48)
         self.stale = QTimer(self)
         self.stale.setSingleShot(True)
-        self.stale.setInterval(self.STALE_MS)
         self.stale.timeout.connect(self.hide)
+        self.ripple = QTimer(self)
+        self.ripple.setInterval(33)
+        self.ripple.timeout.connect(self.update)
+
+    def hideEvent(self, ev):
+        self.ripple.stop()
+        super().hideEvent(ev)
 
     def update_from(self, msg):
         try:
@@ -2316,25 +2320,72 @@ class LivePreview(QWidget):
             return
         if not self.layered:
             return  # an ordinary window could take focus from your text
+        if d.get("working"):
+            if d.get("hold") != self.hold and self.isVisible():
+                return  # an older dictation; a newer one is being recorded
+            self.working = True
+            if not self.still:
+                self.ripple.start()
+            self.stale.start(self.WORKING_MS)
+        else:
+            if d.get("hold") != self.hold or self.working:
+                self.levels = [0.0] * self.BARS
+            self.working = False
+            self.ripple.stop()
+            try:
+                r = max(float(d.get("level", 0.0)), 1e-4)
+            except (TypeError, ValueError):
+                r = 1e-4
+            # dB-ish: 0.001 (quiet room) to 0.3 (loud) maps to 0..1
+            v = (math.log(r) - math.log(0.001)) / (math.log(0.3)
+                                                   - math.log(0.001))
+            self.levels = self.levels[1:] + [min(1.0, max(0.0, v))]
+            self.stale.start(self.QUIET_MS)
         self.hold = d.get("hold")
-        stable, tail = str(d.get("stable", "")), str(d.get("tail", ""))
-        sep = " " if stable and tail else ""
-        over = len(stable) + len(sep) + len(tail) - self.MAX_CHARS
-        if over > 0:  # keep the newest words
-            if over <= len(stable):
-                stable = "…" + stable[over:]
+        if not self.isVisible():
+            accents = {k: focus for k, _n, _fill, focus in ACCENTS}
+            self.accent = QColor(accents[read_appearance()["accent"]])
+            self.still = reduced_motion()
+            self.show()
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setBrush(QColor("#000000"))
+        p.setPen(QColor(BORDER))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), h / 2, h / 2)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(FG) if self.working else self.accent)
+        bw, gap = self.BAR_W, self.GAP
+        x = (w - (self.BARS * bw + (self.BARS - 1) * gap)) / 2
+        max_h = h - 16
+        t = time.monotonic()
+        for i in range(self.BARS):
+            if not self.working:
+                v = self.levels[i]
+            elif self.still:
+                v = 0.5
             else:
-                tail = "…" + tail[over - len(stable) - len(sep):]
-                stable = sep = ""
-        self.text.setText(
-            f'<span style="color:{FG}">{html.escape(stable + sep)}</span>'
-            f'<span style="color:{MUTED}">{html.escape(tail)}</span>')
-        screen = self.screen()  # the compositor puts it on the active one
-        width = screen.availableGeometry().width() if screen else 1200
-        self.text.setFixedWidth(min(720, int(width * 0.6)) - 34)
-        self.adjustSize()
-        self.show()
-        self.stale.start()
+                v = 0.25 + 0.25 * (1 + math.sin(t * 8 - i * 0.6))
+            bh = max(bw, v * max_h)
+            p.drawRoundedRect(QRectF(x, (h - bh) / 2, bw, bh),
+                              bw / 2, bw / 2)
+            x += bw + gap
+        p.end()
+
+
+def reduced_motion():
+    """Plasma's animation speed set to Instant."""
+    try:
+        with open(os.path.expanduser("~/.config/kdeglobals")) as f:
+            for line in f:
+                if line.startswith("AnimationDurationFactor="):
+                    return float(line.split("=", 1)[1]) == 0
+    except (OSError, ValueError):
+        pass
+    return False
 
 
 def tell_running_tray(msg):
@@ -2485,12 +2536,12 @@ def main():
             tap["pending"] = True
             tap_timer.start()
 
-    preview = LivePreview()
+    pill = Pill()
 
     def on_launch(msg):
         cmd, _sep, token = msg.partition(" ")
-        if cmd == "preview":
-            preview.update_from(token)
+        if cmd == "pill":
+            pill.update_from(token)
         elif cmd == "settings":
             if token:
                 os.environ["XDG_ACTIVATION_TOKEN"] = token
