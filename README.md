@@ -51,6 +51,10 @@ There's an Android version too: hold a key (the Essential key on Nothing
 phones), speak, let go, and the text lands in the field you're in, decoded
 on the phone with the same Parakeet model. See [android/](android/README.md).
 
+The Android app has moved into [Uplink](https://github.com/ieatfood314/uplink),
+which has the same dictation plus captures, reminders and a to-do list, and
+still syncs your words with desktop Squelch. `android/` is no longer updated.
+
 ## Install (Arch)
 
 ```

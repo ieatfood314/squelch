@@ -1,5 +1,8 @@
 # Squelch for Android
 
+**Moved:** this app is now part of [Uplink](https://github.com/ieatfood314/uplink),
+with the same dictation. This folder is no longer updated.
+
 Hold a key, speak, let go: the text lands in whatever field you're typing in.
 Same idea as desktop Squelch, on the phone's CPU, offline.
 

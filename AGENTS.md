@@ -24,6 +24,8 @@ Squelch ships as the AUR package `squelch`, built from GitHub tag tarballs. Neve
 regolith also pulls AUR releases through yay on its own, so a reinstall of the same version is expected.
 
 ## Shipping Android
+Retired 2026-11-11: the Android app moved into Uplink (`~/repos/uplink`), so make phone changes there. Desktop Squelch's sync hub still serves Uplink's Words sync, so keep its API compatible. The steps below are kept for reference.
+
 1. `cd android && ./release.sh X.Y.Z <versionCode>`. versionCode must go up every release (0.2.0 = 2).
 2. Tag `android-vX.Y.Z` (never `vX.Y.Z`, which is the desktop/AUR namespace), push it, then `gh release create android-vX.Y.Z android/build/squelch-X.Y.Z.apk`.
 3. Obtainium on halley tracks the GitHub releases. Only Android gets GitHub releases; desktop is tags only, so Obtainium never sees an APK-less latest release.
