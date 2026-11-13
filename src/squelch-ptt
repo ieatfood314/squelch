@@ -1671,6 +1671,150 @@ def stop_recording(proc):
         proc.kill()
 
 
+# ---------------- always-open mic ----------------
+# A hold used to start its own pw-record, and the start of a sentence
+# said as the key went down was lost: kanata (or HOLD_DELAY_S) only calls
+# it a hold 0.25 s after the press, and PipeWire suspends an idle mic
+# after 5 s, which pw-record then takes ~0.3 s to wake. So one pw-record
+# stays open on the mic, the tap keeps its last TAP_KEEP_S in memory, and
+# each hold's clip starts PREROLL_S before the key went down.
+PREROLL_S = 0.3      # audio kept from before the press
+TAP_KEEP_S = 3.0     # how far back the tap remembers
+TAP_STALE_S = 0.5    # no audio for this long: the tap's stream is gone
+FRAME_BYTES = 2 * MIC_CHANNELS
+
+
+def wav_header(data_bytes):
+    """pw-record's 44-byte header for a 16-bit clip of data_bytes. 0
+    while the clip still grows (read_growing_wav reads to the end)."""
+    return struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + data_bytes,
+                       b"WAVE", b"fmt ", 16, 1, MIC_CHANNELS, SR,
+                       SR * FRAME_BYTES, FRAME_BYTES, 16, b"data",
+                       data_bytes)
+
+
+class MicTap:
+    """The always-open pw-record, and the hold it's writing to (if any)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.target = None
+        self.ring = bytearray()  # the last TAP_KEEP_S of audio
+        self.t_end = 0.0         # when the newest of it arrived
+        self.sink = None         # file of the hold being recorded
+
+    def ensure(self, target):
+        """Have the tap open on target (None: the default source). True if
+        it already was, so it remembers the moments before the press."""
+        with self.lock:
+            if (self.proc is not None and self.proc.poll() is None
+                    and self.target == target
+                    and time.time() - self.t_end < TAP_STALE_S):
+                return True
+            old = self.proc
+            cmd = ["pw-record", "--raw", "--rate", str(SR), "--channels",
+                   str(MIC_CHANNELS), "--format", "s16", "--latency", "50ms",
+                   "-P", "{ application.name = Squelch, "
+                         "node.description = \"Squelch dictation\""
+                         + (", node.dont-reconnect = true" if target else "")
+                         + " }", "-"]
+            if target:
+                cmd[1:1] = ["--target", target]
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL,
+                                         bufsize=0)
+            self.target, self.ring, self.t_end = target, bytearray(), time.time()
+            threading.Thread(target=self.read, args=(self.proc,),
+                             daemon=True).start()
+        if old is not None:
+            threading.Thread(target=stop_recording, args=(old,),
+                             daemon=True).start()
+        return False
+
+    def restart(self):
+        with self.lock:
+            self.t_end = 0.0  # the next ensure opens a fresh stream
+
+    def watch(self):
+        """Reopen a stream that died (mic replugged, PipeWire restarted)
+        or follow a new mic from Settings before the next press needs it."""
+        while True:
+            time.sleep(5)
+            if not mic_resetting():
+                mic = find_mic()
+                if mic is not None:
+                    self.ensure(mic["target"])
+
+    def read(self, proc):
+        rest = b""
+        while True:
+            try:
+                d = proc.stdout.read(65536)
+            except (OSError, ValueError):
+                d = b""
+            if not d:
+                return
+            d = rest + d
+            cut = len(d) - len(d) % FRAME_BYTES
+            d, rest = d[:cut], d[cut:]
+            with self.lock:
+                if self.proc is not proc:
+                    return
+                self.ring += d
+                keep = int(TAP_KEEP_S * SR) * FRAME_BYTES
+                if len(self.ring) > keep:
+                    del self.ring[:len(self.ring) - keep]
+                self.t_end = time.time()
+                if self.sink is not None:
+                    try:
+                        self.sink.write(d)
+                        self.sink.flush()
+                    except (OSError, ValueError):
+                        pass
+
+    def begin(self, path, since):
+        """Write the tap to a new WAV at path from wall-clock time since,
+        as far back as it remembers. Returns the TapHold."""
+        with self.lock:
+            back = int(max(0.0, self.t_end - since) * SR) * FRAME_BYTES
+            f = open(path, "wb")
+            f.write(wav_header(0))
+            if back:
+                f.write(self.ring[-back:])
+            f.flush()
+            self.sink = f
+            return TapHold(self, f)
+
+
+class TapHold:
+    """One hold's share of the tap; poll() and stop() like the pw-record
+    a hold used to have."""
+
+    def __init__(self, tap, f):
+        self.tap, self.f = tap, f
+
+    def poll(self):
+        tap = self.tap
+        live = (tap.sink is self.f and tap.proc is not None
+                and tap.proc.poll() is None)
+        return None if live else 0
+
+    def stop(self):
+        with self.tap.lock:
+            if self.tap.sink is self.f:
+                self.tap.sink = None
+            if self.f.closed:
+                return
+            try:
+                size = self.f.tell() - WAV_HEADER
+                self.f.seek(0)
+                self.f.write(wav_header(size))
+            except (OSError, ValueError):
+                pass
+            self.f.close()
+
+
 def raw_frames(path):
     try:
         with wave.open(path, "rb") as w:
@@ -1779,6 +1923,7 @@ def watch_resume():
             continue
         time.sleep(10)  # let the sleep hook, USB and PipeWire settle
         last = suspended_seconds()
+        MIC_TAP.restart()
         if probe_mic():
             log("mic ok after resume")
         else:
@@ -2370,8 +2515,12 @@ def discard(path):
         pass
 
 
-def start_hold(code, jobs):
-    """Start recording for a held trigger; None if we can't."""
+MIC_TAP = MicTap()
+
+
+def start_hold(code, jobs, pressed):
+    """Start recording for a held trigger; None if we can't. pressed: when
+    the key went down (wall clock); the clip starts PREROLL_S before it."""
     if notify_engine_down():
         log("engine unavailable, ignoring press")
         return None
@@ -2390,13 +2539,17 @@ def start_hold(code, jobs):
         unmute_node(mic["id"])
     fd, path = tempfile.mkstemp(suffix="-raw.wav")
     os.close(fd)
-    proc = start_recording(mic["target"], path)
+    if not MIC_TAP.ensure(mic["target"]):
+        log("mic stream was closed, opened it: no audio from before the press")
+    now = time.time()
+    since = min(now, max(now - TAP_KEEP_S, pressed)) - PREROLL_S
+    proc = MIC_TAP.begin(path, since)
     source = {"virtual": mic["virtual"], "fed": None, "desc": mic["desc"]}
     if mic["virtual"] and mic["id"] is not None:
         threading.Thread(target=check_upstream, args=(mic, proc, source),
                          daemon=True).start()
     cap_s = max_hold_s(current_engine())
-    cap = threading.Timer(cap_s, stop_recording, [proc])
+    cap = threading.Timer(cap_s, proc.stop)
     cap.daemon = True
     cap.start()
     pill = Pill(path)
@@ -2410,7 +2563,7 @@ def start_hold(code, jobs):
 def end_hold(rec, jobs):
     held = time.time() - rec["t"]
     rec["cap"].cancel()
-    stop_recording(rec["proc"])
+    rec["proc"].stop()
     resume_players(rec["paused"])
     path, cap_s, live = rec["path"], rec["cap_s"], rec["live"]
     wedged = held >= MIN_HOLD_S and capture_dead(path, min(held, cap_s))
@@ -2439,13 +2592,17 @@ def drop_hold(rec):
 
 def abandon_hold(rec):
     rec["cap"].cancel()
-    stop_recording(rec["proc"])
+    rec["proc"].stop()
     resume_players(rec["paused"])
     drop_hold(rec)
 
 
 def main():
     threading.Thread(target=watch_resume, daemon=True).start()
+    mic = find_mic()
+    if mic is not None:
+        MIC_TAP.ensure(mic["target"])
+    threading.Thread(target=MIC_TAP.watch, daemon=True).start()
     jobs = queue.Queue()
     threading.Thread(target=utterance_worker, args=(jobs,),
                      daemon=True).start()
@@ -2468,7 +2625,7 @@ def main():
             lonely = not kbd.devs
         if pending and now - pending[1] >= HOLD_DELAY_S:
             if rec is None:
-                rec = start_hold(kbd.code, jobs)
+                rec = start_hold(kbd.code, jobs, pending[1])
                 if rec is not None:
                     rec["dev"] = pending[0]
             pending = None
@@ -2498,7 +2655,9 @@ def main():
                     continue
                 if ev.code == F24:  # kanata already timed the hold
                     if ev.value == 1 and rec is None:
-                        rec = start_hold(F24, jobs)
+                        # kanata sends F24 its hold timeout after the press
+                        rec = start_hold(F24, jobs,
+                                         ev.timestamp() - HOLD_DELAY_S)
                         if rec is not None:
                             rec["dev"] = path
                     elif ev.value == 0 and rec and rec["code"] == F24:
