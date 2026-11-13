@@ -1680,7 +1680,8 @@ def stop_recording(proc):
 # each hold's clip starts PREROLL_S before the key went down.
 PREROLL_S = 0.3      # audio kept from before the press
 TAP_KEEP_S = 3.0     # how far back the tap remembers
-TAP_STALE_S = 0.5    # no audio for this long: the tap's stream is gone
+TAP_STALE_S = 2.0    # no audio for this long: the tap's stream is gone
+TAP_FLUSH_S = 0.25   # on release, wait up to this for audio still in flight
 FRAME_BYTES = 2 * MIC_CHANNELS
 
 
@@ -1703,6 +1704,8 @@ class MicTap:
         self.ring = bytearray()  # the last TAP_KEEP_S of audio
         self.t_end = 0.0         # when the newest of it arrived
         self.sink = None         # file of the hold being recorded
+        self.last_stop = 0.0     # when the last hold's clip ended
+        self.fresh = threading.Condition(self.lock)  # new audio arrived
 
     def ensure(self, target):
         """Have the tap open on target (None: the default source). True if
@@ -1728,20 +1731,24 @@ class MicTap:
             threading.Thread(target=self.read, args=(self.proc,),
                              daemon=True).start()
         if old is not None:
-            threading.Thread(target=stop_recording, args=(old,),
+            threading.Thread(target=self.close, args=(old,),
                              daemon=True).start()
         return False
 
-    def restart(self):
-        with self.lock:
-            self.t_end = 0.0  # the next ensure opens a fresh stream
+    @staticmethod
+    def close(proc):
+        stop_recording(proc)
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
 
     def watch(self):
         """Reopen a stream that died (mic replugged, PipeWire restarted)
         or follow a new mic from Settings before the next press needs it."""
         while True:
             time.sleep(5)
-            if not mic_resetting():
+            if not mic_resetting() and self.sink is None:
                 mic = find_mic()
                 if mic is not None:
                     self.ensure(mic["target"])
@@ -1766,6 +1773,7 @@ class MicTap:
                 if len(self.ring) > keep:
                     del self.ring[:len(self.ring) - keep]
                 self.t_end = time.time()
+                self.fresh.notify_all()
                 if self.sink is not None:
                     try:
                         self.sink.write(d)
@@ -1775,24 +1783,27 @@ class MicTap:
 
     def begin(self, path, since):
         """Write the tap to a new WAV at path from wall-clock time since,
-        as far back as it remembers. Returns the TapHold."""
+        as far back as it remembers, but not into the last hold's clip.
+        Returns the TapHold."""
         with self.lock:
+            since = max(since, self.last_stop)
             back = int(max(0.0, self.t_end - since) * SR) * FRAME_BYTES
+            back = min(back, len(self.ring))
             f = open(path, "wb")
             f.write(wav_header(0))
             if back:
                 f.write(self.ring[-back:])
             f.flush()
             self.sink = f
-            return TapHold(self, f)
+            return TapHold(self, f, back / FRAME_BYTES / SR)
 
 
 class TapHold:
     """One hold's share of the tap; poll() and stop() like the pw-record
     a hold used to have."""
 
-    def __init__(self, tap, f):
-        self.tap, self.f = tap, f
+    def __init__(self, tap, f, pre_s):
+        self.tap, self.f, self.pre_s = tap, f, pre_s
 
     def poll(self):
         tap = self.tap
@@ -1801,9 +1812,17 @@ class TapHold:
         return None if live else 0
 
     def stop(self):
-        with self.tap.lock:
-            if self.tap.sink is self.f:
-                self.tap.sink = None
+        """End the clip with the audio up to now, some of which is still on
+        its way through pw-record and the pipe."""
+        tap, t = self.tap, time.time()
+        with tap.lock:
+            deadline = t + TAP_FLUSH_S
+            while (tap.sink is self.f and tap.t_end < t
+                   and time.time() < deadline):
+                tap.fresh.wait(deadline - time.time())
+            if tap.sink is self.f:
+                tap.sink = None
+                tap.last_stop = t
             if self.f.closed:
                 return
             try:
@@ -1923,7 +1942,6 @@ def watch_resume():
             continue
         time.sleep(10)  # let the sleep hook, USB and PipeWire settle
         last = suspended_seconds()
-        MIC_TAP.restart()
         if probe_mic():
             log("mic ok after resume")
         else:
@@ -2566,7 +2584,8 @@ def end_hold(rec, jobs):
     rec["proc"].stop()
     resume_players(rec["paused"])
     path, cap_s, live = rec["path"], rec["cap_s"], rec["live"]
-    wedged = held >= MIN_HOLD_S and capture_dead(path, min(held, cap_s))
+    wedged = held >= MIN_HOLD_S and capture_dead(
+        path, min(held, cap_s) + rec["proc"].pre_s)
     if wedged:
         log(f"recording got {raw_frames(path)} frames "
             f"in {held:.1f}s (mic wedged?)")
