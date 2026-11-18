@@ -8,19 +8,30 @@ added on one device and another word removed on a second both survive,
 stores the events, and answers with the merged dictionary and the other
 devices' events the caller hasn't got yet.
 
+Phones also send their dictations' audio and what was edited afterwards
+(POST /v1/archive, /v1/corrections), which go into the training archive
+named in ~/.config/squelch/archive (or --archive), like a desktop's.
+
 No auth: run it where only your own devices can reach it (behind
 Tailscale). Usage: squelch-sync-server [--port 4615] [--data DIR]
+[--archive DIR]
 """
 import argparse
+import base64
+import difflib
 import json
 import os
 import re
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 lock = threading.Lock()
 DATA = ""
+ARCHIVE = None           # training archive directory, if any
+archive_lock = threading.Lock()
+seen_corrections = None  # ids already in corrections.jsonl
 dictionary = []          # [{"term", "also_match"}]
 devices = {}             # id -> {"name": str, "events": [..], "last": ts}
 MAX_BODY = 32 << 20
@@ -191,6 +202,157 @@ def sync(req):
     return out
 
 
+# ---------------- training archive (phones) ----------------
+
+# Whether an edit can teach a model. A clip's label has to be what was
+# said: edits that swap a word for one that sounds like it (world → word,
+# Regulath → Regolith) or only touch punctuation and capitals are fixes to
+# what was heard. Adding, dropping or rewording words is you changing your
+# mind, which the audio doesn't back, so that dictation isn't trained on.
+# Neither is a clip whose start was cut off: it begins mid-word.
+
+def _sk(s):
+    """Rough sound key: consonants with look-alike spellings merged."""
+    s = re.sub(r"[^a-z0-9]", "", s.lower())
+    for a, b in (("ph", "f"), ("ck", "k"), ("c", "k"), ("q", "k"),
+                 ("z", "s"), ("x", "ks")):
+        s = s.replace(a, b)
+    s = s[:1] + re.sub(r"[aeiouwyh]", "", s[1:])
+    return re.sub(r"(.)\1+", r"\1", s)
+
+
+def sounds_alike(old, new):
+    a = re.sub(r"[^a-z0-9]", "", old.lower())
+    b = re.sub(r"[^a-z0-9]", "", new.lower())
+    if not a or not b:
+        return False
+    r = difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+    s = difflib.SequenceMatcher(None, _sk(old), _sk(new),
+                                autojunk=False).ratio()
+    return r >= 0.6 or (r >= 0.4 and s >= 0.75)
+
+
+def classify_edit(text, edited, cut=False):
+    """{"kind": kept|format|fix|start|rewrite|deleted, "train": bool,
+    "label": the words to train on or None, "fixes": [[old, new]]}."""
+    if not edited.strip():
+        return {"kind": "deleted", "train": False, "label": None,
+                "fixes": []}
+    tw, ew = text.split(), edited.split()
+    bare = lambda w: re.sub(r"[^\w]", "", w.lower())
+    tb, eb = [bare(w) for w in tw], [bare(w) for w in ew]
+    fixes, rewrite, changed, start = [], False, 0, False
+    if tb != eb:
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                None, tb, eb, autojunk=False).get_opcodes():
+            if tag == "equal":
+                continue
+            if tag == "insert" and i1 == 0 and cut:
+                start = True  # the cut-off words, put back
+                continue
+            changed += max(i2 - i1, j2 - j1)
+            old, new = " ".join(tw[i1:i2]), " ".join(ew[j1:j2])
+            if (tag == "replace" and max(i2 - i1, j2 - j1) <= 3
+                    and sounds_alike(old, new)):
+                fixes.append([old, new])
+            else:
+                rewrite = True
+    if rewrite or changed > max(2, len(tw) // 2):
+        kind = "rewrite"
+    elif fixes:
+        kind = "fix"
+    elif start:
+        kind = "start"
+    else:
+        kind = "kept" if text.strip() == edited.strip() else "format"
+    train = kind != "rewrite" and not cut
+    return {"kind": kind, "train": train,
+            "label": edited.strip() if train else None, "fixes": fixes}
+
+
+def archive_clip(req):
+    """One phone dictation: its audio (a 16 kHz mono WAV, base64) and
+    transcript, laid out like a desktop's archive."""
+    if not ARCHIVE:
+        raise LookupError("this hub keeps no archive")
+    uid = safe_id(req.get("id"))
+    ts = req.get("ts")
+    if not uid or not isinstance(ts, (int, float)):
+        raise ValueError("id and ts needed")
+    wav = base64.b64decode(req.get("wav") or "", validate=True)
+    if wav[:4] != b"RIFF":
+        raise ValueError("not a WAV")
+    day = time.strftime("%Y%m%d", time.localtime(ts))
+    d = os.path.join(ARCHIVE, "raw", day)
+    path = os.path.join(d, uid + ".raw.wav")
+    with archive_lock:
+        if os.path.exists(path):
+            return {"ok": True, "dup": True}
+        os.makedirs(d, exist_ok=True)
+        with open(path + ".tmp", "wb") as f:
+            f.write(wav)
+        os.replace(path + ".tmp", path)
+        text = str(req.get("text") or "")
+        with open(os.path.join(ARCHIVE, "transcripts.jsonl"), "a") as f:
+            f.write(json.dumps({
+                "id": uid, "ts": ts, "engine": req.get("engine"),
+                "words": len(text.split()), "audio_s": req.get("audio_s"),
+                "text": text, "device": safe_id(req.get("device")),
+                "cut": bool(req.get("cut"))}, ensure_ascii=False) + "\n")
+    return {"ok": True}
+
+
+def archive_corrections(req):
+    """Edits made to phone dictations afterwards, classified like the
+    desktop's (fix or rewrite) so only fixes become training labels."""
+    global seen_corrections
+    if not ARCHIVE:
+        raise LookupError("this hub keeps no archive")
+    items = req.get("items")
+    if not isinstance(items, list):
+        raise ValueError("items missing")
+    dev = safe_id(req.get("device"))
+    path = os.path.join(ARCHIVE, "corrections.jsonl")
+    with archive_lock:
+        if seen_corrections is None:
+            seen_corrections = set()
+            try:
+                with open(path) as f:
+                    for line in f:
+                        try:
+                            seen_corrections.add(json.loads(line).get("id"))
+                        except (ValueError, AttributeError):
+                            pass
+            except OSError:
+                pass
+        lines = []
+        for it in items:
+            if not isinstance(it, dict) or not safe_id(it.get("id")):
+                continue
+            uid = safe_id(it["id"])
+            if uid in seen_corrections:
+                continue
+            text = str(it.get("text") or "")
+            edited = str(it.get("edited") or "")
+            rec = {"ts": it.get("ts"), "id": uid, "device": dev,
+                   "engine": it.get("engine"), "app": it.get("app"),
+                   "how": it.get("how") or "a11y", "end": it.get("end"),
+                   "text": text, "edited": edited,
+                   "heard": it.get("heard"), "cut": bool(it.get("cut"))}
+            if it.get("guess"):
+                rec["guess"] = str(it["guess"])
+            if it.get("before"):
+                rec["before"] = str(it["before"])[-300:]
+            rec.update(classify_edit(text, edited, rec["cut"]))
+            lines.append(json.dumps(rec, ensure_ascii=False))
+            seen_corrections.add(uid)
+        if lines:
+            os.makedirs(ARCHIVE, exist_ok=True)
+            with open(path, "a") as f:
+                f.write("\n".join(lines) + "\n")
+    return {"ok": True, "saved": len(lines)}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
@@ -214,7 +376,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/v1/sync":
+        route = {"/v1/sync": sync, "/v1/archive": archive_clip,
+                 "/v1/corrections": archive_corrections}.get(self.path)
+        if route is None:
             return self._send(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -223,9 +387,13 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n) or b"{}")
             if not isinstance(req, dict):
                 raise ValueError("expected an object")
-            self._send(200, sync(req))
+            self._send(200, route(req))
+        except LookupError as e:
+            self._send(404, {"error": str(e)})
         except (ValueError, TypeError) as e:
             self._send(400, {"error": str(e)})
+        except OSError as e:
+            self._send(503, {"error": str(e)})
 
     def log_message(self, fmt, *args):
         if os.environ.get("SQUELCH_SYNC_VERBOSE"):
@@ -239,11 +407,22 @@ def main():
     ap.add_argument("--port", type=int, default=4615)
     ap.add_argument("--data", default=os.path.expanduser(
         "~/.local/share/squelch-sync"))
+    ap.add_argument("--archive", help="training archive directory "
+                    "(default: the one named in ~/.config/squelch/archive)")
     a = ap.parse_args()
     DATA = a.data
+    global ARCHIVE
+    ARCHIVE = a.archive
+    if not ARCHIVE:
+        try:
+            with open(os.path.expanduser("~/.config/squelch/archive")) as f:
+                ARCHIVE = os.path.expanduser(f.read().strip()) or None
+        except OSError:
+            pass
     load()
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
-    print(f"squelch-sync on {a.host}:{a.port}, data in {DATA}", flush=True)
+    print(f"squelch-sync on {a.host}:{a.port}, data in {DATA}"
+          + (f", archive in {ARCHIVE}" if ARCHIVE else ""), flush=True)
     srv.serve_forever()
 
 

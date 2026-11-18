@@ -74,6 +74,9 @@ ENGINE_SERVICES = {"parakeet": "squelch-parakeet.service",
                    "whisper": "squelch-whisper.service"}
 OPENROUTER_KEY_FILE = os.path.join(CONFIG_DIR, "openrouter.key")
 OPENROUTER_MODEL_FILE = os.path.join(CONFIG_DIR, "openrouter.model")
+# optional OpenAI-compatible endpoint tried when OpenRouter fails or has no key
+LLM_FALLBACK_FILE = os.path.join(CONFIG_DIR, "llm-fallback.json")
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 _MODEL_PREFERENCE = ("llama-3.1-8b", "llama-3-8b", "gemma-2-9b",
                      "mistral-7b", "qwen2", "phi-3", "gemma", "mistral")
 _NON_CHAT = ("embed", "tts", "whisper", "dall-e", "diffusion", "vision",
@@ -978,11 +981,29 @@ def openrouter_key():
         return None
 
 
-def _or_request(key, method, path, payload=None, timeout=20):
+def llm_fallback():
+    """(base_url, key, model) from llm-fallback.json, or None.
+
+    The file is {"url": "https://host/v1", "key_file": "~/path", "model": "id"}.
+    """
+    try:
+        with open(LLM_FALLBACK_FILE) as f:
+            cfg = json.load(f)
+        with open(os.path.expanduser(cfg["key_file"])) as f:
+            key = f.read().strip()
+        if cfg.get("url") and cfg.get("model") and key:
+            return cfg["url"].rstrip("/"), key, cfg["model"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _or_request(key, method, path, payload=None, timeout=20,
+                base=OPENROUTER_BASE):
     data = json.dumps(payload).encode() if payload is not None else None
     for attempt in range(4):
         req = urllib.request.Request(
-            "https://openrouter.ai/api/v1" + path, data=data,
+            base + path, data=data,
             headers={"Authorization": "Bearer " + key,
                      "Content-Type": "application/json",
                      "HTTP-Referer": "https://localhost/squelch",
@@ -1060,9 +1081,13 @@ def _parse_suggestions(text, term):
 
 
 def fetch_mishearings(term):
-    """Ask a free OpenRouter model what `term` sounds like. One small call."""
+    """Ask a free OpenRouter model what `term` sounds like. One small call.
+
+    Falls back to the llm-fallback.json endpoint when OpenRouter fails.
+    """
     key = openrouter_key()
-    if not key:
+    fallback = llm_fallback()
+    if not key and not fallback:
         raise RuntimeError("no OpenRouter key")
     prompt = (
         f'You generate training data for a speech-to-text fixer. The user '
@@ -1073,24 +1098,35 @@ def fetch_mishearings(term):
         f'example. Reply with ONLY a JSON array of strings, nothing else. '
         f'Example format: {list(_EXAMPLE_PHRASES)}')
     last = None
-    for i, model in enumerate(free_model_candidates(key)[:3]):
+    attempts = []
+    if key:
+        try:
+            attempts = [(OPENROUTER_BASE, key, m)
+                        for m in free_model_candidates(key)[:3]]
+        except Exception as e:
+            last = e
+    if fallback:
+        attempts.append(fallback)
+    for i, (base, akey, model) in enumerate(attempts):
         if i:
             time.sleep(2)  # be gentle with free-tier rate limits
         try:
             res = _or_request(
-                key, "POST", "/chat/completions",
+                akey, "POST", "/chat/completions",
                 {"model": model,
                  "messages": [{"role": "user", "content": prompt}],
-                 "max_tokens": 200, "temperature": 0.8}, timeout=30)
+                 "max_tokens": 200, "temperature": 0.8}, timeout=30,
+                base=base)
             msg = (res.get("choices") or [{}])[0].get("message") or {}
             text = msg.get("content") or msg.get("reasoning") or ""
             out = _parse_suggestions(text, term)
             if out:
-                try:
-                    with open(OPENROUTER_MODEL_FILE, "w") as f:
-                        f.write(model)
-                except OSError:
-                    pass
+                if base == OPENROUTER_BASE:
+                    try:
+                        with open(OPENROUTER_MODEL_FILE, "w") as f:
+                            f.write(model)
+                    except OSError:
+                        pass
                 return out
             last = "empty result"
         except Exception as e:
@@ -2013,7 +2049,7 @@ class SettingsWindow(QWidget):
         have = bool(openrouter_key())
         self.key_btn.setText("OpenRouter key: Set" if have
                              else "OpenRouter key: Not set")
-        self.or_status.setText("" if have
+        self.or_status.setText("" if have or llm_fallback()
                                else "No OpenRouter key: Suggest is off")
 
     def suggest(self):

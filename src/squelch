@@ -70,11 +70,14 @@ def merge_heard(entry, heard):
 
 
 def has_key():
+    """An OpenRouter key, or an llm-fallback.json endpoint, is configured."""
     try:
         with open(os.path.expanduser("~/.config/squelch/openrouter.key")) as f:
-            return bool(f.read().strip())
+            if f.read().strip():
+                return True
     except OSError:
-        return False
+        pass
+    return os.path.exists(os.path.expanduser("~/.config/squelch/llm-fallback.json"))
 
 
 def ai_suggest(term):

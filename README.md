@@ -129,6 +129,7 @@ config, Change moves it to the new key for you.
 | Dictionary: `squelch WORD [mishearings…]` | AI suggests what it sounds like when an OpenRouter key is configured (`~/.config/squelch/openrouter.key`, chmod 600); `--no-ai` skips that |
 | Dictionary editor | settings → Dictionary tab (Add/Suggest/Remove) |
 | OpenRouter key | settings → Dictionary tab; the button shows Set or Not set |
+| Suggestion fallback | optional `~/.config/squelch/llm-fallback.json`, `{"url": "https://host/v1", "key_file": "~/path/to/key", "model": "id"}`: any OpenAI-compatible endpoint, tried when OpenRouter fails or no key is set |
 | Learned mishearings | settings → Dictionary tab, under Possible mishearings (Add/Ignore) |
 | Analytics dashboard | settings → Analytics tab, or glance line on the tap card |
 
@@ -162,6 +163,35 @@ straight away and you get a notification. If it is made of real words
 for you to add or ignore. Dictionary words that are plain English are
 left alone, so ordinary speech never gets rewritten. Both need
 `aspell-en`. No gradients leave your machine, ever.
+
+Squelch also notices what you do to a dictation afterwards, so the archive
+can pair each clip with the words you meant. Until you move on (another
+dictation, Enter, a click elsewhere, the box emptied by sending, or two
+idle minutes) it watches the text it put in, and then appends a line to
+`~/.config/squelch/corrections.jsonl` (and `corrections.jsonl` in the
+archive, next to the audio, by the same `id`): the text as it went in, as
+you left it, and what kind of change it was. Swapping a word for one that
+sounds like it ("Regulath" → "Regolith") or fixing punctuation is a
+`fix`, and the edited text becomes the clip's `label`. Adding, dropping or
+rewording words is a `rewrite`, you changing your mind rather than Squelch
+mishearing, so that clip gets `"train": false` and no label, and a model
+trained on `label`s never learns words you didn't say. Clips whose start
+was cut off (below) aren't trained on either.
+
+It sees the text through accessibility (AT-SPI, which Squelch switches on),
+so it catches every edit, mouse ones included, in Qt, GTK and Firefox-based
+apps. Chromium and Electron apps (Chrome, VS Code, Obsidian…) only share
+the text in a page when started with `--force-renderer-accessibility`.
+Elsewhere it follows the keys you press: letters, Backspace, Delete and
+the arrows, up to the first click or jump it can't follow. Needs
+`python-gobject` for the accessibility part.
+
+If you were already talking when you pressed the key, the clip reaches
+back to the pause before you started, up to 5 seconds (the mic stays
+open, so the words are there). If you'd been talking even longer, the
+start is gone, and an LLM guesses the missing words from the rest and the
+text before the cursor (the `llm-fallback.json` endpoint, or OpenRouter).
+It waits up to 4 s for that, and only for those clips.
 
 Music (any MPRIS player) pauses while you hold the trigger and resumes on
 release, so it never bleeds into the mic.

@@ -145,9 +145,10 @@ def trim_spool():
 
 
 def archive_utterance(raw_wav, clean_wav, meta):
-    """Spool wavs locally now (fast), upload to the archive in background."""
+    """Spool wavs locally now (fast), upload to the archive in background.
+    Returns the utterance's name in the archive, or None."""
     if os.environ.get("STT_NO_STATS") or archive_root() is None:
-        return
+        return None
     global _spool_counter
     try:
         os.makedirs(SPOOL_DIR, exist_ok=True)
@@ -162,8 +163,9 @@ def archive_utterance(raw_wav, clean_wav, meta):
             json.dump(meta, f)
     except OSError as e:
         log("spool failed:", e)
-        return
+        return None
     threading.Thread(target=upload_spool, daemon=True).start()
+    return base
 
 
 def upload_spool():
@@ -178,6 +180,21 @@ def upload_spool():
         except OSError:
             return
         for name in names:
+            if name.endswith(".edit.json"):  # what you did to it after
+                try:
+                    with open(os.path.join(SPOOL_DIR, name)) as f:
+                        line = f.read().strip()
+                    json.loads(line)
+                    with open(os.path.join(root, "corrections.jsonl"),
+                              "a") as f:
+                        f.write(line + "\n")
+                    os.unlink(os.path.join(SPOOL_DIR, name))
+                except ValueError:
+                    discard(os.path.join(SPOOL_DIR, name))
+                except OSError as e:
+                    log("spool upload issue (will retry):", e)
+                    return
+                continue
             if not name.endswith(".json"):
                 continue
             base = name[:-5]
@@ -195,6 +212,7 @@ def upload_spool():
                 with open(os.path.join(root, "transcripts.jsonl"),
                           "a") as f:
                     f.write(json.dumps({
+                        "id": base,
                         "ts": meta["ts"], "engine": meta.get("engine"),
                         "words": meta.get("words"),
                         "audio_s": meta.get("audio_s"),
@@ -1523,6 +1541,8 @@ def type_text(text, table=None):
 def type_ydotool(text):
     if type_text(text):
         log("typed:", text[:80])
+        return True
+    return False
 
 
 def clipboard_only(text):
@@ -1539,13 +1559,18 @@ def clipboard_only(text):
 
 
 def output_text(text):
+    """Put text in; True if it went into the focused window."""
     mode = insertion_mode()
+    LAST_APP["class"] = None
     if mode == "type":
-        type_ydotool(text)
-    elif mode == "clipboard":
+        return type_ydotool(text)
+    if mode == "clipboard":
         clipboard_only(text)
-    else:
-        paste_text(text)
+        return False
+    return paste_text(text)
+
+
+LAST_APP = {"class": None}  # the window the last paste went to
 
 
 # Web editors (Word/Office online, Google Docs) handle paste themselves and
@@ -1615,6 +1640,7 @@ def paste_text(text):
     """
     fix_wayland_env()
     wclass = active_window_class()
+    LAST_APP["class"] = wclass
     if wclass in CTRL_V_CLASSES or (wclass or "").startswith(CTRL_V_PREFIXES):
         chord, chord_name = PASTE_CTRL_V, "Ctrl+V"
     else:
@@ -1633,7 +1659,7 @@ def paste_text(text):
         log("clipboard write failed:", e)
         notify_stt("Paste failed", "Couldn't reach the clipboard.",
                    urgency="normal")
-        return
+        return False
     time.sleep(0.25)
     try:
         r = subprocess.run(["ydotool", "key", *chord],
@@ -1642,12 +1668,12 @@ def paste_text(text):
             log("paste keystroke failed:", (r.stderr or "").strip()[:200])
             notify_stt("Paste failed", "Text is on the clipboard.",
                        urgency="normal")
-            return
+            return False
     except Exception as e:
         log("paste keystroke error:", e)
         notify_stt("Paste failed", "Text is on the clipboard.",
                    urgency="normal")
-        return
+        return False
     log(f"pasted via clipboard+{chord_name} ({wclass or 'unknown'}):",
         text[:80])
     time.sleep(0.4)
@@ -1658,6 +1684,7 @@ def paste_text(text):
                            stderr=subprocess.DEVNULL, timeout=10)
         except Exception as e:
             log("clipboard restore failed:", e)
+    return True
 
 
 # ---------------- recording ----------------
@@ -1729,12 +1756,59 @@ def stop_recording(proc):
 # it a hold 0.25 s after the press, and PipeWire suspends an idle mic
 # after 5 s, which pw-record then takes ~0.3 s to wake. So one pw-record
 # stays open on the mic, the tap keeps its last TAP_KEEP_S in memory, and
-# each hold's clip starts PREROLL_S before the key went down.
+# each hold's clip starts PREROLL_S before the key went down. If you were
+# already talking then, the clip goes back to the pause before you started
+# (speech_onset), as far back as the tap remembers.
 PREROLL_S = 0.3      # audio kept from before the press
-TAP_KEEP_S = 3.0     # how far back the tap remembers
+TAP_KEEP_S = 5.0     # how far back the tap remembers
 TAP_STALE_S = 2.0    # no audio for this long: the tap's stream is gone
 TAP_FLUSH_S = 0.25   # on release, wait up to this for audio still in flight
 FRAME_BYTES = 2 * MIC_CHANNELS
+ONSET_HOP = SR // 50  # 20 ms frames for finding where speech began
+ONSET_PAUSE = 15      # frames (0.3 s) of quiet before a sentence starts
+ONSET_KEEP = 5        # frames (0.1 s) of that quiet kept in the clip
+
+
+def frame_rms(pcm):
+    """RMS of each 20 ms frame of interleaved s16 mic audio, channels
+    averaged."""
+    a = np.frombuffer(bytes(pcm), dtype=np.int16)
+    a = a[:len(a) - len(a) % MIC_CHANNELS].reshape(-1, MIC_CHANNELS)
+    a = a.astype(np.float32).mean(axis=1)
+    n = len(a) // ONSET_HOP
+    frames = a[len(a) - n * ONSET_HOP:].reshape(n, ONSET_HOP)
+    return np.sqrt((frames ** 2).mean(axis=1))
+
+
+def speech_onset(ring, back, limit, noise=None):
+    """Where a clip that would start `back` bytes before the end of the
+    tap's ring should start instead: if speech is under way there, at the
+    pause before it, no further back than `limit` bytes. Returns (bytes
+    back, cut): cut is True when the speech goes back further than the
+    ring does, so its start is lost. noise: the room's level when quiet,
+    for a ring that is all speech."""
+    rms = frame_rms(ring)
+    n = len(rms)
+    if n < 25:
+        return back, False
+    floor, loud = np.percentile(rms, 10), np.percentile(rms, 95)
+    if noise:
+        floor = min(floor, noise)
+    thr = max(floor * 3.0, floor + (loud - floor) * 0.2, 60.0)
+    speech = rms > thr
+    fb = ONSET_HOP * FRAME_BYTES
+    start = n - back // fb   # the frame the clip starts at now
+    stop = max(0, n - limit // fb)  # the earliest frame it may start at
+    if start >= n or not speech[max(stop, start - 2):start + 3].any():
+        return back, False
+    quiet, i = 0, start
+    while i > stop:
+        i -= 1
+        quiet = 0 if speech[i] else quiet + 1
+        if quiet >= ONSET_PAUSE:
+            onset = min(start, i + quiet - ONSET_KEEP)
+            return max(back, (n - onset) * fb), False
+    return max(back, limit), stop == 0
 
 
 def wav_header(data_bytes):
@@ -1758,6 +1832,7 @@ class MicTap:
         self.sink = None         # file of the hold being recorded
         self.last_stop = 0.0     # when the last hold's clip ended
         self.fresh = threading.Condition(self.lock)  # new audio arrived
+        self.noise = None        # the room's level between words
 
     def ensure(self, target):
         """Have the tap open on target (None: the default source). True if
@@ -1817,6 +1892,12 @@ class MicTap:
             d = rest + d
             cut = len(d) - len(d) % FRAME_BYTES
             d, rest = d[:cut], d[cut:]
+            try:  # the quietest frame lately, rising slowly
+                q = float(frame_rms(d).min())
+                self.noise = (q if self.noise is None
+                              else min(self.noise * 1.002, max(q, 1.0)))
+            except ValueError:
+                pass  # less than a frame
             with self.lock:
                 if self.proc is not proc:
                     return
@@ -1835,27 +1916,42 @@ class MicTap:
 
     def begin(self, path, since):
         """Write the tap to a new WAV at path from wall-clock time since,
-        as far back as it remembers, but not into the last hold's clip.
-        Returns the TapHold."""
+        as far back as it remembers, but not into the last hold's clip,
+        or earlier if speech was already under way then. Returns the
+        TapHold."""
         with self.lock:
+            limit = int(max(0.0, self.t_end - self.last_stop) * SR) * FRAME_BYTES
+            limit = min(limit, len(self.ring))
             since = max(since, self.last_stop)
             back = int(max(0.0, self.t_end - since) * SR) * FRAME_BYTES
-            back = min(back, len(self.ring))
+            back = min(back, limit)
+            cut = False
+            if back:
+                try:
+                    nominal = back
+                    back, cut = speech_onset(self.ring, back, limit,
+                                             self.noise)
+                    if back > nominal:
+                        log(f"already talking at the press: clip starts "
+                            f"{(back - nominal) / FRAME_BYTES / SR:.1f}s "
+                            "earlier" + (", start still cut off" if cut else ""))
+                except Exception as e:
+                    log("speech onset failed:", e)
             f = open(path, "wb")
             f.write(wav_header(0))
             if back:
                 f.write(self.ring[-back:])
             f.flush()
             self.sink = f
-            return TapHold(self, f, back / FRAME_BYTES / SR)
+            return TapHold(self, f, back / FRAME_BYTES / SR, cut)
 
 
 class TapHold:
     """One hold's share of the tap; poll() and stop() like the pw-record
     a hold used to have."""
 
-    def __init__(self, tap, f, pre_s):
-        self.tap, self.f, self.pre_s = tap, f, pre_s
+    def __init__(self, tap, f, pre_s, cut=False):
+        self.tap, self.f, self.pre_s, self.cut = tap, f, pre_s, cut
 
     def poll(self):
         tap = self.tap
@@ -2093,9 +2189,11 @@ def gaming():
         return False
 
 
-def process_utterance(raw_path, record=True, max_s=None, source=None):
+def process_utterance(raw_path, record=True, max_s=None, source=None,
+                      info_out=None):
     """DSP + transcribe + clean up text. record=False skips stats, the
-    archive and vocabulary learning (for --process). Deletes raw_path."""
+    archive and vocabulary learning (for --process). Deletes raw_path.
+    info_out (a dict) gets the utterance's archive id and engine."""
     t0 = time.time()
     with tempfile.NamedTemporaryFile(suffix="-clean.wav",
                                      delete=False) as f:
@@ -2132,7 +2230,9 @@ def process_utterance(raw_path, record=True, max_s=None, source=None):
             meta = {"ts": t0, "engine": engine,
                     "audio_s": round(info["seconds"], 2),
                     "words": len(text.split()), "text": text}
-            archive_utterance(raw_path, clean_path, meta)
+            uid = archive_utterance(raw_path, clean_path, meta)
+            if info_out is not None:
+                info_out.update(id=uid, ts=t0, engine=engine)
             maybe_adapt_vocab(text)
         stats({"outcome": "ok" if text else "empty", "engine": engine,
                "audio_s": round(info["seconds"], 2),
@@ -2418,6 +2518,7 @@ class LiveTyper:
         self.jobs = jobs
         self.sure = []     # (word, confidence, end) the model is sure of
         self.typed = []    # the words in the text box, after cleanup
+        self.out = ""      # everything typed into it, spaces and all
         self.passes = []   # [(clip seconds, words)] of the recent passes
         self.onset = float("inf")  # earliest end of a pass's first word
         self.table = None  # the layout's keys, looked up off the key loop
@@ -2522,6 +2623,7 @@ class LiveTyper:
         else:
             log("typed live:", text[:80])
         self.typed += words
+        self.out += text
 
     def finish(self, text):
         """After release: add what the full-clip transcript has beyond the
@@ -2543,7 +2645,782 @@ class LiveTyper:
             clipboard_only(rest)
         else:
             log("typed the rest:", rest[:80])
+            self.out += rest
         return True
+
+
+# ---------------- edits made after a dictation (training data) ----------------
+# After each dictation Squelch watches what you do to the text it put in,
+# and saves the transcript next to the version you left it as, so the
+# archive pairs audio with the right words. Through accessibility (AT-SPI)
+# when the app shares its text, which catches every edit; otherwise from
+# the keys you press, which loses track at a click or a jump elsewhere.
+
+CORRECTIONS_FILE = os.path.expanduser("~/.config/squelch/corrections.jsonl")
+EDIT_IDLE_S = 120.0     # untouched this long: done with it
+EDIT_MAX_S = 600.0      # watched no longer than this
+EDIT_FIELD_MAX = 200000  # characters; bigger fields aren't read
+EDIT_CONTEXT = 300      # characters before the dictation kept as context
+
+
+def edited_region(t0, a, b, t):
+    """Where t0[a:b] is in t, by a character diff. Text typed right
+    before or after it stays outside; edits that reach into it are in.
+    (a, b) in t, or None if the diff is too big to work out."""
+    n0, n1 = len(t0), len(t)
+    lim = min(n0, n1)
+    p = 0
+    while p < lim and t0[p] == t[p]:
+        p += 1
+    s = 0
+    while s < lim - p and t0[n0 - 1 - s] == t[n1 - 1 - s]:
+        s += 1
+    mid0, mid1 = t0[p:n0 - s], t[p:n1 - s]
+    if len(mid0) * len(mid1) > 4e7:
+        return None
+    ops = []
+    if p:
+        ops.append(("equal", 0, p, 0, p))
+    if mid0 or mid1:
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                None, mid0, mid1, autojunk=False).get_opcodes():
+            ops.append((tag, i1 + p, i2 + p, j1 + p, j2 + p))
+    if s:
+        ops.append(("equal", n0 - s, n0, n1 - s, n1))
+    a2 = b2 = None
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "equal":
+            if a2 is None and i1 <= a < i2:
+                a2 = j1 + a - i1
+            if i1 < b <= i2:
+                b2 = j1 + b - i1
+            continue
+        inside = (i1 < b and i2 > a) if i1 < i2 else a < i1 < b
+        if inside:
+            if a2 is None:
+                a2 = j1
+            b2 = j2
+    if a2 is None or b2 is None or b2 < a2:
+        return None
+    return a2, b2
+
+
+class EditWatch:
+    """One dictation's text, from when it went in to when you're done
+    with it. t0 is the text it went into, t0[a:b] the dictation."""
+
+    def __init__(self, utt, how, t0, a, b, obj=None):
+        self.utt, self.how, self.t0, self.a, self.b = utt, how, t0, a, b
+        self.obj = obj
+        self.cur = t0
+        self.region = t0[a:b]
+        self.started = self.changed = time.time()
+
+    def update(self, t):
+        """A new look at the text. Returns why the watch is over, if it
+        is: "sent" (the box emptied), "deleted", "lost" (can't follow)."""
+        if t == self.cur:
+            return None
+        r = edited_region(self.t0, self.a, self.b, t)
+        if r is None:
+            return "lost"
+        self.cur, self.changed = t, time.time()
+        new = t[r[0]:r[1]]
+        if new.strip():
+            self.region = new
+            return None
+        if not t.strip():
+            return "sent"  # the whole box went at once: keep the last look
+        self.region = ""
+        return "deleted"
+
+    def record(self, why):
+        heard = self.t0[self.a:self.b].strip()
+        edited = self.region.strip()
+        u = self.utt
+        rec = {"ts": u.get("ts"), "id": u.get("id"), "engine": u.get("engine"),
+               "app": u.get("app"), "how": self.how, "end": why,
+               "text": heard, "edited": edited,
+               "heard": u.get("heard"), "cut": bool(u.get("cut"))}
+        rec.update(classify_edit(heard, edited, rec["cut"]))
+        if u.get("guess"):
+            rec["guess"] = u["guess"]
+        if self.how == "a11y":
+            rec["before"] = self.t0[max(0, self.a - EDIT_CONTEXT):self.a]
+        return rec
+
+
+# Whether an edit can teach a model. A clip's label has to be what was
+# said: edits that swap a word for one that sounds like it (world → word,
+# Regulath → Regolith) or only touch punctuation and capitals are fixes to
+# what was heard. Adding, dropping or rewording words is you changing your
+# mind, which the audio doesn't back, so that dictation isn't trained on.
+# Neither is a clip whose start was cut off: it begins mid-word.
+
+def _sk(s):
+    """Rough sound key: consonants with look-alike spellings merged."""
+    s = re.sub(r"[^a-z0-9]", "", s.lower())
+    for a, b in (("ph", "f"), ("ck", "k"), ("c", "k"), ("q", "k"),
+                 ("z", "s"), ("x", "ks")):
+        s = s.replace(a, b)
+    s = s[:1] + re.sub(r"[aeiouwyh]", "", s[1:])
+    return re.sub(r"(.)\1+", r"\1", s)
+
+
+def sounds_alike(old, new):
+    a = re.sub(r"[^a-z0-9]", "", old.lower())
+    b = re.sub(r"[^a-z0-9]", "", new.lower())
+    if not a or not b:
+        return False
+    r = difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+    s = difflib.SequenceMatcher(None, _sk(old), _sk(new),
+                                autojunk=False).ratio()
+    return r >= 0.6 or (r >= 0.4 and s >= 0.75)
+
+
+def classify_edit(text, edited, cut=False):
+    """{"kind": kept|format|fix|start|rewrite|deleted, "train": bool,
+    "label": the words to train on or None, "fixes": [[old, new]]}."""
+    if not edited.strip():
+        return {"kind": "deleted", "train": False, "label": None,
+                "fixes": []}
+    tw, ew = text.split(), edited.split()
+    bare = lambda w: re.sub(r"[^\w]", "", w.lower())
+    tb, eb = [bare(w) for w in tw], [bare(w) for w in ew]
+    fixes, rewrite, changed, start = [], False, 0, False
+    if tb != eb:
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                None, tb, eb, autojunk=False).get_opcodes():
+            if tag == "equal":
+                continue
+            if tag == "insert" and i1 == 0 and cut:
+                start = True  # the cut-off words, put back
+                continue
+            changed += max(i2 - i1, j2 - j1)
+            old, new = " ".join(tw[i1:i2]), " ".join(ew[j1:j2])
+            if (tag == "replace" and max(i2 - i1, j2 - j1) <= 3
+                    and sounds_alike(old, new)):
+                fixes.append([old, new])
+            else:
+                rewrite = True
+    if rewrite or changed > max(2, len(tw) // 2):
+        kind = "rewrite"
+    elif fixes:
+        kind = "fix"
+    elif start:
+        kind = "start"
+    else:
+        kind = "kept" if text.strip() == edited.strip() else "format"
+    train = kind != "rewrite" and not cut
+    return {"kind": kind, "train": train,
+            "label": edited.strip() if train else None, "fixes": fixes}
+
+
+def save_edit(rec):
+    """corrections.jsonl here, and in the archive next to the audio."""
+    if os.environ.get("STT_NO_STATS"):
+        return
+    line = json.dumps(rec, ensure_ascii=False)
+    try:
+        with open(CORRECTIONS_FILE, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        log("corrections write failed:", e)
+    if rec.get("id") and archive_root() is not None:
+        try:
+            os.makedirs(SPOOL_DIR, exist_ok=True)
+            with open(os.path.join(SPOOL_DIR, rec["id"] + ".edit.json"),
+                      "w") as f:
+                f.write(line)
+        except OSError as e:
+            log("spool failed:", e)
+            return
+        threading.Thread(target=upload_spool, daemon=True).start()
+
+
+# Keys that move the cursor somewhere the key-following can't see (or
+# change text it can't see) end the watch with what it had up to then.
+K = evdev.ecodes
+KEY_MODS = {K.KEY_LEFTSHIFT: "shift", K.KEY_RIGHTSHIFT: "shift",
+            K.KEY_LEFTCTRL: "ctrl", K.KEY_RIGHTCTRL: "ctrl",
+            K.KEY_LEFTALT: "alt", K.KEY_RIGHTALT: "altgr",
+            K.KEY_LEFTMETA: "meta", K.KEY_RIGHTMETA: "meta"}
+KEY_IGNORED = {K.KEY_CAPSLOCK, K.KEY_NUMLOCK, K.KEY_ESC, K.KEY_F24,
+               K.KEY_COMPOSE, K.KEY_SCROLLLOCK, K.KEY_PAUSE}
+CLICKS = {K.BTN_LEFT, K.BTN_RIGHT, K.BTN_MIDDLE, K.BTN_SIDE, K.BTN_EXTRA,
+          K.BTN_TOUCH, K.BTN_TOOL_FINGER}
+
+
+class KeyEdit:
+    """The dictation as a line of text, edited by following the keys
+    pressed after it: letters, Backspace, Delete, Left and Right (with
+    Ctrl for whole words)."""
+
+    def __init__(self, text, table):
+        self.buf, self.cur = text, len(text)
+        self.chars = {}
+        for ch, (code, shift) in table.items():
+            self.chars.setdefault((code, bool(shift)), ch)
+
+    def _word_left(self):
+        j = self.cur
+        while j > 0 and self.buf[j - 1].isspace():
+            j -= 1
+        while j > 0 and not self.buf[j - 1].isspace():
+            j -= 1
+        return j
+
+    def _word_right(self):
+        j, n = self.cur, len(self.buf)
+        while j < n and self.buf[j].isspace():
+            j += 1
+        while j < n and not self.buf[j].isspace():
+            j += 1
+        return j
+
+    def key(self, code, mods):
+        """Apply one key press. None, or why it can't follow any more."""
+        ctrl = "ctrl" in mods
+        if code in (K.KEY_ENTER, K.KEY_KPENTER):
+            return "enter"
+        if code == K.KEY_BACKSPACE:
+            if self.cur == 0:
+                return "moved"
+            j = self._word_left() if ctrl else self.cur - 1
+            self.buf = self.buf[:j] + self.buf[self.cur:]
+            self.cur = j
+            return None
+        if code == K.KEY_DELETE:
+            if self.cur < len(self.buf):
+                j = self._word_right() if ctrl else self.cur + 1
+                self.buf = self.buf[:self.cur] + self.buf[j:]
+            return None
+        if code in (K.KEY_LEFT, K.KEY_RIGHT):
+            if "shift" in mods:
+                return "moved"  # a selection
+            if code == K.KEY_LEFT:
+                if self.cur == 0:
+                    return "moved"
+                self.cur = self._word_left() if ctrl else self.cur - 1
+            else:
+                if self.cur >= len(self.buf):
+                    return "moved"
+                self.cur = self._word_right() if ctrl else self.cur + 1
+            return None
+        if ctrl or {"alt", "altgr", "meta"} & mods:
+            return "moved"  # a shortcut: paste, undo, select all...
+        ch = self.chars.get((code, "shift" in mods))
+        if ch is None:
+            return "moved"  # Home, Up, Tab, Page Down...
+        self.buf = self.buf[:self.cur] + ch + self.buf[self.cur:]
+        self.cur += 1
+        return None
+
+
+class A11y:
+    """AT-SPI on its own thread (GLib's loop): which object has focus,
+    and the text of the one being watched."""
+
+    def __init__(self, edits):
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi, GLib
+        self.Atspi, self.GLib = Atspi, GLib
+        self.edits = edits
+        self.focused = None
+        self.watched = None    # the object (focus may sit inside it)
+        self.pending = False   # a snapshot is coming
+        self.listening = False
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.ready = threading.Event()
+        self.thread.start()
+        self.ready.wait(5)
+
+    def run(self):
+        Atspi, GLib = self.Atspi, self.GLib
+        try:
+            enable_accessibility()
+            Atspi.init()
+            Atspi.set_timeout(1000, 15000)  # a hung app mustn't hold us up
+            self.on_focus_l = Atspi.EventListener.new(self.on_focus)
+            self.on_focus_l.register("object:state-changed:focused")
+            self.on_text_l = Atspi.EventListener.new(self.on_text)
+            GLib.timeout_add(2000, self.poll)
+        except Exception as e:
+            log("accessibility unavailable, following keys only:", e)
+            self.ready.set()
+            return
+        self.ok = True
+        self.ready.set()
+        Atspi.event_main()
+
+    def call(self, fn, *args, timeout=2.0):
+        """Run fn in the AT-SPI thread and return what it returns."""
+        if threading.current_thread() is self.thread:
+            return fn(*args)
+        box, done = [], threading.Event()
+
+        def go():
+            try:
+                box.append(fn(*args))
+            except Exception as e:
+                log("accessibility:", e)
+            done.set()
+            return False
+        self.GLib.idle_add(go)
+        done.wait(timeout)
+        return box[0] if box else None
+
+    def on_focus(self, ev):
+        if not ev.detail1:
+            return
+        self.focused = ev.source
+        w = self.watched
+        if w is not None and not self.within(ev.source, w):
+            self.edits.finish("focus")
+
+    def within(self, obj, root, depth=8):
+        """obj is root or inside it."""
+        try:
+            while obj is not None and depth > 0:
+                if obj is root:
+                    return True
+                obj = obj.get_parent()
+                depth -= 1
+        except Exception:
+            pass
+        return False
+
+    def on_text(self, ev):
+        w = self.watched
+        if w is None or self.pending or not self.within(ev.source, w):
+            return
+        self.pending = True
+        self.GLib.timeout_add(50, self.snapshot)
+
+    def poll(self):
+        if self.watched is not None and not self.pending:
+            self.snapshot()
+        return True
+
+    def snapshot(self):
+        self.pending = False
+        if self.watched is None:
+            return False
+        t = self.read(self.watched)
+        if t is not None:
+            self.edits.seen(t)
+        return False
+
+    def text_of(self, obj, depth=0):
+        """obj's text with the objects embedded in it (web pages put each
+        paragraph of a text box in its own) filled in."""
+        Atspi = self.Atspi
+        n = Atspi.Text.get_character_count(obj)
+        if n > EDIT_FIELD_MAX:
+            return None
+        t = Atspi.Text.get_text(obj, 0, n) or ""
+        if "￼" not in t or depth > 3:
+            return t
+        out, k = [], 0
+        for i, ch in enumerate(t):
+            if ch != "￼":
+                out.append(ch)
+                continue
+            child = None
+            try:
+                link = Atspi.Hypertext.get_link(
+                    obj, Atspi.Hypertext.get_link_index(obj, i))
+                child = Atspi.Hyperlink.get_object(link, 0)
+            except Exception:
+                try:
+                    child = obj.get_child_at_index(k)
+                except Exception:
+                    child = None
+            k += 1
+            sub = None
+            if child is not None and "Text" in (child.get_interfaces() or []):
+                sub = self.text_of(child, depth + 1)
+            out.append(sub if sub is not None else "")
+        return "".join(out)
+
+    def read(self, obj):
+        try:
+            return self.text_of(obj)
+        except Exception:
+            return None
+
+    def _start(self, inserted):
+        """(object, text, a, b) for where `inserted` just went, or None."""
+        obj = self.focused
+        if obj is None:
+            return None
+        try:
+            if not obj.get_state_set().contains(self.Atspi.StateType.FOCUSED):
+                return None
+            if "Text" not in (obj.get_interfaces() or []):
+                return None
+            t = self.text_of(obj)
+            caret = self.Atspi.Text.get_caret_offset(obj)
+        except Exception:
+            return None
+        if t is None:
+            return None
+        flat = "￼" in (self.Atspi.Text.get_text(obj, 0, 64) or "")
+        span = locate(t, inserted, -1 if flat else caret)
+        if span is None:
+            return None
+        return obj, t, span[0], span[1]
+
+    def start(self, inserted):
+        return self.call(self._start, inserted)
+
+    def _watch(self, obj):
+        self.watched = obj
+        if not self.listening:
+            self.on_text_l.register("object:text-changed")
+            self.listening = True
+
+    def watch(self, obj):
+        self.call(self._watch, obj)
+
+    def _unwatch(self):
+        self.watched = None
+        if self.listening:
+            try:
+                self.on_text_l.deregister("object:text-changed")
+            except Exception:
+                pass
+            self.listening = False
+
+    def unwatch(self):
+        self.call(self._unwatch)
+
+    def _context(self):
+        obj = self.focused
+        try:
+            n = self.Atspi.Text.get_caret_offset(obj)
+            if n <= 0:
+                return ""
+            return self.Atspi.Text.get_text(obj, max(0, n - EDIT_CONTEXT), n)
+        except Exception:
+            return ""
+
+    def context(self):
+        """Up to EDIT_CONTEXT characters before the cursor."""
+        return self.call(self._context, timeout=0.5) or ""
+
+
+def locate(t, inserted, caret):
+    """(a, b) of `inserted` in t, the copy just before the cursor (or the
+    only copy when the cursor isn't known), with its trailing space."""
+    needle = inserted.strip()
+    if not needle:
+        return None
+    hits, i = [], t.find(needle)
+    while i >= 0:
+        hits.append(i)
+        i = t.find(needle, i + 1)
+    if not hits:
+        return None
+    if caret >= 0:
+        i = min(hits, key=lambda h: abs(h + len(needle) - caret))
+        if abs(i + len(needle) - caret) > 2:
+            return None
+    elif len(hits) == 1:
+        i = hits[0]
+    else:
+        return None
+    b = i + len(needle)
+    if inserted.endswith(" ") and t[b:b + 1] == " ":
+        b += 1
+    return i, b
+
+
+def enable_accessibility():
+    """Ask apps to share their text (org.a11y.Status IsEnabled). Firefox
+    picks it up at once; Chromium and Electron apps when next started."""
+    try:
+        r = subprocess.run(
+            ["busctl", "--user", "get-property", "org.a11y.Bus",
+             "/org/a11y/bus", "org.a11y.Status", "IsEnabled"],
+            capture_output=True, text=True, timeout=5)
+        if r.stdout.strip() == "b true":
+            return
+        subprocess.run(
+            ["busctl", "--user", "set-property", "org.a11y.Bus",
+             "/org/a11y/bus", "org.a11y.Status", "IsEnabled", "b", "true"],
+            capture_output=True, timeout=5)
+        log("turned accessibility on, so edits to dictations can be seen")
+    except Exception as e:
+        log("couldn't turn accessibility on:", e)
+
+
+class Edits:
+    """The watch on the last dictation; at most one at a time."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.watch = None
+        self.gen = 0           # bumped when a new dictation begins
+        self.keys = None       # KeyEdit while following keys
+        # wakes the key loop to open the mice when key-following starts
+        self.wake_r, self.wake_w = os.pipe()
+        os.set_blocking(self.wake_r, False)
+        self.mods = set()
+        self.a11y = None
+        if not os.environ.get("STT_NO_STATS"):
+            try:
+                a = A11y(self)
+                if getattr(a, "ok", False):
+                    self.a11y = a
+            except Exception as e:
+                log("accessibility unavailable, following keys only:", e)
+        threading.Thread(target=self.tick, daemon=True).start()
+
+    @property
+    def following_keys(self):
+        return self.keys is not None
+
+    def start(self, utt, inserted):
+        """Watch `inserted`, which just went in. Returns at once: finding
+        it can wait on the app."""
+        self.finish("next")
+        if os.environ.get("STT_NO_STATS") or not inserted.strip():
+            return
+        gen = self.gen
+        threading.Thread(target=self._start, args=(utt, inserted, gen),
+                         daemon=True).start()
+
+    def _start(self, utt, inserted, gen):
+        got = None
+        if self.a11y is not None:
+            for _ in range(6):  # a paste can take a moment to show up
+                got = self.a11y.start(inserted)
+                if got is not None or self.gen != gen:
+                    break
+                time.sleep(0.15)
+        if self.gen != gen:
+            return  # the next dictation started meanwhile
+        if got is not None:
+            obj, t, a, b = got
+            w = EditWatch(utt, "a11y", t, a, b, obj)
+            with self.lock:
+                if self.gen != gen:
+                    return
+                self.watch, self.keys = w, None
+            self.a11y.watch(obj)
+            log(f"watching edits to the dictation ({utt.get('app') or 'app'}, "
+                "accessibility)")
+        else:
+            w = EditWatch(utt, "keys", inserted, 0, len(inserted))
+            ke = KeyEdit(inserted, current_keymap())
+            with self.lock:
+                if self.gen != gen:
+                    return
+                self.watch, self.keys = w, ke
+            try:
+                os.write(self.wake_w, b"k")
+            except OSError:
+                pass
+            log("watching edits to the dictation (keys)")
+
+    def seen(self, text):
+        """A new look at the watched text (a11y thread)."""
+        with self.lock:
+            w = self.watch
+            why = w.update(text) if w is not None else None
+        if why:
+            self.finish(why)
+
+    def on_key(self, code, value):
+        """Every key event from the keyboards (main loop)."""
+        mod = KEY_MODS.get(code)
+        if mod:
+            if value:
+                self.mods.add(mod)
+            else:
+                self.mods.discard(mod)
+            return
+        if value == 0 or self.keys is None:
+            return
+        if code in CLICKS:
+            self.finish("click")
+            return
+        if code in KEY_IGNORED:
+            return
+        why = None
+        with self.lock:
+            ke, w = self.keys, self.watch
+            if ke is None or w is None:
+                return
+            why = ke.key(code, self.mods)
+            if why is None:
+                why = w.update(ke.buf)
+        if why:
+            self.finish(why)
+
+    def finish(self, why):
+        with self.lock:
+            if why == "next":
+                self.gen += 1  # a watch still being set up is stale now
+            w, self.watch, self.keys = self.watch, None, None
+        if w is None:
+            return
+        if w.how == "a11y" and self.a11y is not None:
+            self.a11y.unwatch()
+        rec = w.record(why)
+        log(f"dictation {rec['kind']} ({why}, {w.how})"
+            + (f": {rec['edited'][:80]!r}"
+               if rec["kind"] not in ("kept", "deleted") else ""))
+        save_edit(rec)
+
+    def context(self):
+        return self.a11y.context() if self.a11y is not None else ""
+
+    def tick(self):
+        while True:
+            time.sleep(5)
+            w, now = self.watch, time.time()
+            if w is not None and (now - w.changed > EDIT_IDLE_S
+                                  or now - w.started > EDIT_MAX_S):
+                self.finish("idle")
+
+
+# ---------------- guessing a start that was cut off ----------------
+# When you were already talking further back than the mic remembers, the
+# first words of the sentence never made it into the clip. An LLM guesses
+# them from what you said and the text before the cursor. Only then: it
+# costs a round trip, and a guess can be wrong (the edit watch records
+# whether you kept it).
+
+LLM_FALLBACK_FILE = os.path.expanduser("~/.config/squelch/llm-fallback.json")
+OPENROUTER_KEY_FILE = os.path.expanduser("~/.config/squelch/openrouter.key")
+OPENROUTER_MODEL_FILE = os.path.expanduser("~/.config/squelch/openrouter.model")
+GUESS_WAIT_S = 4.0     # the dictation goes in without a guess after this
+GUESS_MAX_WORDS = 5    # words a guess may add
+GUESS_PROMPT = """A speech-to-text recording started late: the speaker was \
+already talking, so the first word or few words of what they said are \
+missing, and the first word heard may be just the end of a word.
+
+Text already in the box, before where this goes (may be empty):
+<<<{before}>>>
+
+What was heard:
+<<<{heard}>>>
+
+If it can stand on its own as the start of a sentence, return it \
+unchanged: only add words when the start is clearly missing. Then \
+put the most likely missing words in front (at most {most}), fix the first \
+heard word if it is a fragment, and fix the capitalization. Change nothing \
+else. Reply with only JSON: {{"text": "..."}}"""
+
+
+def llm_endpoints():
+    """(base url, key, model): llm-fallback.json, then OpenRouter's last
+    working free model."""
+    out = []
+    try:
+        with open(LLM_FALLBACK_FILE) as f:
+            cfg = json.load(f)
+        with open(os.path.expanduser(cfg["key_file"])) as f:
+            key = f.read().strip()
+        if cfg.get("url") and cfg.get("model") and key:
+            out.append((cfg["url"].rstrip("/"), key, cfg["model"]))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    try:
+        with open(OPENROUTER_KEY_FILE) as f:
+            key = f.read().strip()
+        with open(OPENROUTER_MODEL_FILE) as f:
+            model = f.read().strip()
+        if key and model:
+            out.append(("https://openrouter.ai/api/v1", key, model))
+    except OSError:
+        pass
+    return out
+
+
+def first_json(text):
+    """The first JSON object in an LLM's reply, or None."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    i = text.find("{")
+    while i >= 0:
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(text[i:])
+            if isinstance(obj, dict):
+                return obj
+        except ValueError:
+            pass
+        i = text.find("{", i + 1)
+    return None
+
+
+def ask_llm(prompt, wait_s):
+    deadline = time.time() + wait_s
+    for url, key, model in llm_endpoints():
+        left = deadline - time.time()
+        if left < 0.5:
+            break
+        try:
+            req = urllib.request.Request(
+                url + "/chat/completions",
+                data=json.dumps({"model": model, "temperature": 0.2,
+                                 "max_tokens": 400, "messages": [
+                                     {"role": "user", "content": prompt}]
+                                 }).encode(),
+                headers={"Authorization": "Bearer " + key,
+                         "Content-Type": "application/json",
+                         "HTTP-Referer": "https://localhost/squelch",
+                         "X-Title": "Squelch"})
+            with urllib.request.urlopen(req, timeout=left) as r:
+                res = json.load(r)
+            msg = (res.get("choices") or [{}])[0].get("message") or {}
+            got = first_json(msg.get("content") or "")
+            if got is not None:
+                return got
+        except Exception as e:
+            log(f"llm ({model}):", str(e)[:120])
+    return None
+
+
+def split_start(text):
+    """(first sentence, rest); a long first sentence is cut at 20 words."""
+    words = text.split(" ")
+    for i, w in enumerate(words[:20]):
+        if w.endswith((".", "?", "!")) and i < len(words) - 1:
+            return " ".join(words[:i + 1]), " ".join(words[i + 1:])
+    return " ".join(words[:20]), " ".join(words[20:])
+
+
+def checked_guess(heard, new):
+    """new if it is heard with at most GUESS_MAX_WORDS in front (its first
+    word may change), else None."""
+    hw = [_bare(w) for w in heard.split()]
+    nw = [_bare(w) for w in new.split()]
+    keep = hw[1:]
+    if not nw or len(nw) < len(hw) or len(nw) - len(keep) > GUESS_MAX_WORDS + 1:
+        return None
+    if keep and nw[len(nw) - len(keep):] != keep:
+        return None
+    return new
+
+
+def guess_start(text, before=""):
+    """text with its cut-off start guessed, or None to leave it."""
+    if not llm_endpoints():
+        return None
+    head, rest = split_start(text)
+    got = ask_llm(GUESS_PROMPT.format(before=before[-EDIT_CONTEXT:],
+                                      heard=head, most=GUESS_MAX_WORDS),
+                  GUESS_WAIT_S)
+    new = (got or {}).get("text")
+    if not isinstance(new, str):
+        return None
+    new = checked_guess(head, new.strip())
+    if not new or new == head:
+        return None
+    return (new + " " + rest).strip() if rest else new
 
 
 def utterance_worker(jobs):
@@ -2551,26 +3428,40 @@ def utterance_worker(jobs):
     so a new hold starts recording at once even while the last one is
     still being pasted."""
     while True:
-        rec_path, held, cap_s, source, live, pill = jobs.get()
+        rec_path, held, cap_s, source, live, pill, cut = jobs.get()
         try:
             if live:
                 live.halt()
-            text = process_utterance(rec_path, max_s=cap_s, source=source)
+            utt = {}
+            text = process_utterance(rec_path, max_s=cap_s, source=source,
+                                     info_out=utt)
             if held > cap_s:
                 notify_stt("Dictation cut short",
                            f"Kept the first {duration(cap_s)}.",
                            urgency="normal")
+            utt.update(heard=text, cut=cut)
+            if text and cut and not (live and live.typed):
+                guessed = guess_start(text, EDITS.context())
+                if guessed:
+                    log(f"start was cut off, guessed: {guessed[:80]!r}")
+                    utt["guess"] = guessed
+                    text = guessed
+            inserted = ""
             if text and live and live.finish(text):
-                pass
+                inserted = live.out
             elif text:
                 if os.environ.get("STT_DRY_RUN"):
                     log(f"DRYRUN would type: {text[:120]!r}")
-                else:
-                    output_text(text + " ")
+                elif output_text(text + " "):
+                    inserted = text + " "
             elif live and live.typed:
                 log("full pass found no speech, keeping the live words")
+                inserted = live.out
             else:
                 log("no speech, typing nothing")
+            if inserted and not os.environ.get("STT_DRY_RUN"):
+                utt["app"] = LAST_APP.get("class")
+                EDITS.start(utt, inserted)
         except Exception as e:
             log("utterance failed:", e)
         finally:
@@ -2597,6 +3488,9 @@ def start_hold(code, jobs, pressed):
     if mic_resetting():
         log("mic reset in progress, ignoring press")
         return None
+    # done with the last dictation's text (off this loop: it may wait on
+    # an app over accessibility)
+    threading.Thread(target=EDITS.finish, args=("next",), daemon=True).start()
     paused = playing_players()
     pause_players(paused)
     mic = find_mic()
@@ -2650,7 +3544,8 @@ def end_hold(rec, jobs):
     if held > cap_s:
         log(f"held {held:.0f}s, keeping the first {cap_s:.0f}s")
     rec["pill"].working()
-    jobs.put((path, held, cap_s, rec["source"], live, rec["pill"]))
+    jobs.put((path, held, cap_s, rec["source"], live, rec["pill"],
+              rec["proc"].cut))
 
 
 def drop_hold(rec):
@@ -2668,7 +3563,46 @@ def abandon_hold(rec):
     drop_hold(rec)
 
 
+class Pointers:
+    """Mice and touchpads, open only while an edit is followed by keys: a
+    click puts the cursor where the keys can't follow it."""
+
+    def __init__(self):
+        self.devs = {}
+
+    def sync(self, want, skip):
+        if want and not self.devs:
+            for path in glob.glob("/dev/input/event*"):
+                if path in skip:
+                    continue
+                try:
+                    d = evdev.InputDevice(path)
+                    keys = d.capabilities().get(evdev.ecodes.EV_KEY, [])
+                except OSError:
+                    continue
+                if ("ydotoold" not in d.name.lower() and
+                        (K.BTN_LEFT in keys or K.BTN_TOUCH in keys)):
+                    self.devs[path] = d
+                else:
+                    d.close()
+        elif not want and self.devs:
+            self.close()
+
+    def close(self):
+        for d in self.devs.values():
+            try:
+                d.close()
+            except OSError:
+                pass
+        self.devs.clear()
+
+
+EDITS = None
+
+
 def main():
+    global EDITS
+    EDITS = Edits()
     threading.Thread(target=watch_resume, daemon=True).start()
     mic = find_mic()
     if mic is not None:
@@ -2678,6 +3612,7 @@ def main():
     threading.Thread(target=utterance_worker, args=(jobs,),
                      daemon=True).start()
     kbd = Keyboards()
+    mice = Pointers()
     rec = None       # the recording while the trigger is held
     pending = None   # (path, press time) of a direct trigger press
     last_scan = 0.0
@@ -2703,13 +3638,31 @@ def main():
         timeout = 2.0
         if pending:
             timeout = max(0.0, pending[1] + HOLD_DELAY_S - now)
+        mice.sync(EDITS.following_keys, kbd.devs)
         by_fd = {d.fd: path for path, d in kbd.devs.items()}
+        mouse_fd = {d.fd: d for d in mice.devs.values()}
         try:
-            ready, _, _ = select.select(list(by_fd), [], [], timeout)
+            ready, _, _ = select.select(
+                list(by_fd) + list(mouse_fd) + [EDITS.wake_r], [], [],
+                timeout)
         except (OSError, ValueError):
             ready = []  # a device vanished mid-select; rescan
             last_scan = 0.0
         for fd in ready:
+            if fd == EDITS.wake_r:
+                try:
+                    os.read(fd, 64)
+                except OSError:
+                    pass
+                continue
+            if fd in mouse_fd:
+                try:
+                    for ev in mouse_fd[fd].read():
+                        if ev.type == evdev.ecodes.EV_KEY:
+                            EDITS.on_key(ev.code, ev.value)
+                except OSError:
+                    mice.close()
+                continue
             path = by_fd[fd]
             try:
                 events = list(kbd.devs[path].read())
@@ -2724,6 +3677,8 @@ def main():
             for ev in events:
                 if ev.type != evdev.ecodes.EV_KEY:
                     continue
+                if ev.code not in (F24, kbd.code):
+                    EDITS.on_key(ev.code, ev.value)
                 if ev.code == F24:  # kanata already timed the hold
                     if ev.value == 1 and rec is None:
                         # kanata sends F24 its hold timeout after the press

@@ -12,6 +12,8 @@ depends=('python' 'python-evdev' 'python-numpy' 'python-pyqt6' 'ydotool'
          'glib2' 'layer-shell-qt')
 makedepends=('git' 'cmake' 'vulkan-headers' 'spirv-headers')
 optdepends=('aspell-en: learn your vocabulary and mishearings'
+            'python-gobject: see edits to dictations through accessibility'
+            'at-spi2-core: see edits to dictations through accessibility'
             'kanata: stop the trigger key doing its own job too')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "whisper.cpp::git+https://github.com/ggml-org/whisper.cpp.git#commit=0c7be696371069e0baa2515ed7aa08d5a5473aa6")
