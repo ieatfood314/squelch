@@ -1573,6 +1573,18 @@ def output_text(text):
 LAST_APP = {"class": None}  # the window the last paste went to
 
 
+def primary_selection():
+    """The text selected last (Wayland's primary selection): "" if none,
+    None if it can't be read."""
+    fix_wayland_env()
+    try:
+        r = subprocess.run(["wl-paste", "--primary", "--no-newline"],
+                           capture_output=True, timeout=1)
+    except Exception:
+        return None
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+
+
 # Web editors (Word/Office online, Google Docs) handle paste themselves and
 # ignore Shift+Insert, so browsers get Ctrl+V. V sits on the same key in
 # QWERTY and Colemak, so the keycode still means "v".
@@ -2190,10 +2202,12 @@ def gaming():
 
 
 def process_utterance(raw_path, record=True, max_s=None, source=None,
-                      info_out=None):
+                      info_out=None, cut=False):
     """DSP + transcribe + clean up text. record=False skips stats, the
     archive and vocabulary learning (for --process). Deletes raw_path.
-    info_out (a dict) gets the utterance's archive id and engine."""
+    info_out (a dict) gets the utterance's archive id and engine, and for
+    a clip that was cut (it starts mid-speech) how sure Parakeet was of
+    the first word."""
     t0 = time.time()
     with tempfile.NamedTemporaryFile(suffix="-clean.wav",
                                      delete=False) as f:
@@ -2211,8 +2225,15 @@ def process_utterance(raw_path, record=True, max_s=None, source=None,
         log(f"cleaned {info['seconds']:.2f}s in {time.time()-t0:.2f}s")
         t1 = time.time()
         engine = current_engine()
+        first_p = None
         try:
-            text = transcribe(clean_path, engine)
+            if cut and engine == "parakeet":
+                text, words = transcribe_parakeet(clean_path, words=True)
+                text = clean_text(text)
+                if text and words:
+                    first_p = round(float(words[0][1]), 3)
+            else:
+                text = transcribe(clean_path, engine)
         except Exception as e:
             log(f"[{engine}] transcribe failed: {e}")
             if not notify_engine_down():
@@ -2226,10 +2247,14 @@ def process_utterance(raw_path, record=True, max_s=None, source=None,
         transcribe_s = time.time() - t1
         text = tidy(text)
         log(f"[{engine}] transcribed in {transcribe_s:.2f}s: {text[:120]!r}")
+        if first_p is not None and info_out is not None:
+            info_out["first_p"] = first_p
         if record:
             meta = {"ts": t0, "engine": engine,
                     "audio_s": round(info["seconds"], 2),
                     "words": len(text.split()), "text": text}
+            if first_p is not None:
+                meta.update(cut=True, first_p=first_p)
             uid = archive_utterance(raw_path, clean_path, meta)
             if info_out is not None:
                 info_out.update(id=uid, ts=t0, engine=engine)
@@ -2705,6 +2730,9 @@ def edited_region(t0, a, b, t):
     return a2, b2
 
 
+UNSURE_ENDS = ("moved", "lost")
+
+
 class EditWatch:
     """One dictation's text, from when it went in to when you're done
     with it. t0 is the text it went into, t0[a:b] the dictation."""
@@ -2743,8 +2771,13 @@ class EditWatch:
                "text": heard, "edited": edited,
                "heard": u.get("heard"), "cut": bool(u.get("cut"))}
         rec.update(classify_edit(heard, edited, rec["cut"]))
+        if why in UNSURE_ENDS and rec["kind"] != "deleted":
+            # it lost track, so edits after that went unseen
+            rec.update(train=False, label=None, unsure=True)
         if u.get("guess"):
             rec["guess"] = u["guess"]
+        if u.get("first_p") is not None:
+            rec["first_p"] = u["first_p"]
         if self.how == "a11y":
             rec["before"] = self.t0[max(0, self.a - EDIT_CONTEXT):self.a]
         return rec
@@ -2778,6 +2811,17 @@ def sounds_alike(old, new):
     return r >= 0.6 or (r >= 0.4 and s >= 0.75)
 
 
+FILLERS = {"um", "umm", "uh", "uhm", "er", "erm", "ah", "hmm", "mm"}
+
+
+def stray_words(words, i, j):
+    """words[i:j] are fillers or repeat the words next to them."""
+    gone, n = words[i:j], j - i
+    return n <= 3 and (all(w in FILLERS for w in gone)
+                       or words[max(0, i - n):i] == gone
+                       or words[j:j + n] == gone)
+
+
 def classify_edit(text, edited, cut=False):
     """{"kind": kept|format|fix|start|rewrite|deleted, "train": bool,
     "label": the words to train on or None, "fixes": [[old, new]]}."""
@@ -2798,6 +2842,9 @@ def classify_edit(text, edited, cut=False):
                 continue
             changed += max(i2 - i1, j2 - j1)
             old, new = " ".join(tw[i1:i2]), " ".join(ew[j1:j2])
+            if tag == "delete" and stray_words(tb, i1, i2):
+                fixes.append([old, ""])  # an um, or a word heard twice
+                continue
             if (tag == "replace" and max(i2 - i1, j2 - j1) <= 3
                     and sounds_alike(old, new)):
                 fixes.append([old, new])
@@ -2838,8 +2885,9 @@ def save_edit(rec):
         threading.Thread(target=upload_spool, daemon=True).start()
 
 
-# Keys that move the cursor somewhere the key-following can't see (or
-# change text it can't see) end the watch with what it had up to then.
+# Keys that change text or move the cursor where the key-following can't
+# see end the watch with what it had up to then. A click doesn't: the edit
+# after it is placed once it's done (see KeyEdit.click).
 K = evdev.ecodes
 KEY_MODS = {K.KEY_LEFTSHIFT: "shift", K.KEY_RIGHTSHIFT: "shift",
             K.KEY_LEFTCTRL: "ctrl", K.KEY_RIGHTCTRL: "ctrl",
@@ -2847,20 +2895,82 @@ KEY_MODS = {K.KEY_LEFTSHIFT: "shift", K.KEY_RIGHTSHIFT: "shift",
             K.KEY_LEFTMETA: "meta", K.KEY_RIGHTMETA: "meta"}
 KEY_IGNORED = {K.KEY_CAPSLOCK, K.KEY_NUMLOCK, K.KEY_ESC, K.KEY_F24,
                K.KEY_COMPOSE, K.KEY_SCROLLLOCK, K.KEY_PAUSE}
-CLICKS = {K.BTN_LEFT, K.BTN_RIGHT, K.BTN_MIDDLE, K.BTN_SIDE, K.BTN_EXTRA,
-          K.BTN_TOUCH, K.BTN_TOOL_FINGER}
+# Right and middle clicks can change text unseen (a spelling suggestion,
+# a middle-click paste).
+CLICKS_OTHER = {K.BTN_RIGHT, K.BTN_MIDDLE}
+CLICK_BURST_S = 0.4    # presses closer than this are one double/triple click
+TAP_MAX_S = 0.25       # a touchpad touch shorter than this may be a tap-click
+DRAG_MIN = 6           # pointer travel (in mouse counts) that makes a drag
+PLACE_MIN = 0.7        # how alike a placed fix must sound...
+PLACE_MARGIN = 0.15    # ...and how much better than the next place
+
+
+def _edit_score(old, new):
+    """How an edit from old to new reads: ("same"|"format"|"fix"|
+    "rewrite", how alike the changed words sound, the new words)."""
+    if old == new:
+        return "same", 1.0, ""
+    i, n, m = 0, len(old), len(new)
+    while i < min(n, m) and old[i] == new[i]:
+        i += 1
+    j = 0
+    while j < min(n, m) - i and old[n - 1 - j] == new[m - 1 - j]:
+        j += 1
+    a = i                            # widen to whole words
+    while a > 0 and not old[a - 1].isspace():
+        a -= 1
+    b, c = n - j, m - j
+    while b < n and not old[b].isspace():
+        b += 1
+        c += 1
+    o, w = old[a:b], new[a:c]
+    bare = lambda s: re.sub(r"[^\w]", "", s.lower())
+    if bare(o) == bare(w):
+        return "format", 1.0, w
+    if not o.strip() or not w.strip() or max(len(o.split()),
+                                             len(w.split())) > 3:
+        return "rewrite", 0.0, w
+    if not sounds_alike(o, w):
+        return "rewrite", 0.0, w
+    r = difflib.SequenceMatcher(None, bare(o), bare(w), autojunk=False).ratio()
+    if len(o.split()) != len(w.split()):
+        r *= 0.5  # words run together or split: rarely the fix meant
+    return "fix", r, w
+
+
+def known_words(words):
+    """{word: is it a word?}: aspell's, or one of yours (the dictionary,
+    learned vocabulary). None if aspell can't run."""
+    words = {w for w in words if w}
+    spelled = _spell_known(words)
+    if spelled is None:
+        return None
+    try:
+        terms, _subs = load_dictionary()
+        mine = {t.lower() for t in terms + read_vocab()}
+    except Exception:
+        mine = set()
+    return {w: spelled[w] or w.lower() in mine for w in words}
 
 
 class KeyEdit:
     """The dictation as a line of text, edited by following the keys
     pressed after it: letters, Backspace, Delete, Left and Right (with
-    Ctrl for whole words)."""
+    Ctrl for whole words).
+
+    After a click the cursor could be anywhere, so the keys pile up until
+    the next click (or Enter, or the end of the watch). Then the edit is
+    tried at every place the click could have put the cursor (or every
+    word a double-click could have picked, or the text a selection holds),
+    and kept where it makes a clear fix."""
 
     def __init__(self, text, table):
         self.buf, self.cur = text, len(text)
         self.chars = {}
         for ch, (code, shift) in table.items():
             self.chars.setdefault((code, bool(shift)), ch)
+        self.lost = None     # after a click: {"sel", "ops", "prim"}
+        self.placed = None   # "guess" once an edit was placed by sound
 
     def _word_left(self):
         j = self.cur
@@ -2878,8 +2988,22 @@ class KeyEdit:
             j += 1
         return j
 
+    def _char(self, code, mods):
+        if {"ctrl", "alt", "altgr", "meta"} & mods:
+            return None
+        return self.chars.get((code, "shift" in mods))
+
     def key(self, code, mods):
         """Apply one key press. None, or why it can't follow any more."""
+        mods = frozenset(mods)
+        if self.lost is not None:
+            if code in (K.KEY_ENTER, K.KEY_KPENTER):
+                return self.settle() or "enter"
+            self.lost["ops"].append((code, mods))
+            return None
+        return self._key(code, mods)
+
+    def _key(self, code, mods):
         ctrl = "ctrl" in mods
         if code in (K.KEY_ENTER, K.KEY_KPENTER):
             return "enter"
@@ -2907,13 +3031,152 @@ class KeyEdit:
                     return "moved"
                 self.cur = self._word_right() if ctrl else self.cur + 1
             return None
+        if code == K.KEY_TAB and {"alt", "meta"} & mods:
+            return "left"  # switched windows
         if ctrl or {"alt", "altgr", "meta"} & mods:
             return "moved"  # a shortcut: paste, undo, select all...
-        ch = self.chars.get((code, "shift" in mods))
+        ch = self._char(code, mods)
         if ch is None:
             return "moved"  # Home, Up, Tab, Page Down...
         self.buf = self.buf[:self.cur] + ch + self.buf[self.cur:]
         self.cur += 1
+        return None
+
+    def click(self, sel, prim=None):
+        """A click put the cursor somewhere unknown: sel is "caret" (one
+        click), "word" (double), "line" (triple) or "span" (a drag), prim
+        the selected text if the app shared it. None, or why it can't
+        follow any more (the edit after the last click couldn't be
+        placed)."""
+        why = self.settle() if self.lost is not None else None
+        if why:
+            return why
+        self.lost = {"sel": sel, "ops": [], "prim": prim}
+        return None
+
+    def selected(self, prim):
+        """The selected text arrived after the click."""
+        if self.lost is not None:
+            self.lost["prim"] = prim
+
+    def _replay(self, cur, sel, ops, buf=None):
+        k = KeyEdit.__new__(KeyEdit)
+        k.buf = self.buf if buf is None else buf
+        k.cur, k.chars, k.lost = cur, self.chars, None
+        for code, mods in ops:
+            if sel is not None:
+                s, e = sel
+                sel = None
+                if code in (K.KEY_BACKSPACE, K.KEY_DELETE):
+                    k.buf, k.cur = k.buf[:s] + k.buf[e:], s
+                    continue
+                if code in (K.KEY_LEFT, K.KEY_RIGHT) and "shift" not in mods:
+                    k.cur = s if code == K.KEY_LEFT else e
+                    continue
+                if self._char(code, mods) is None:
+                    return None
+                k.buf, k.cur = k.buf[:s] + k.buf[e:], s
+            if k._key(code, mods) is not None:
+                return None
+        return k.buf
+
+    def _places(self, sel, prim):
+        """(cursor, selection) pairs the click could have left."""
+        b = self.buf
+        words = [m.span() for m in re.finditer(r"\S+", b)]
+        if sel == "caret":
+            return [(p, None) for p in range(len(b) + 1)]
+        if prim is not None:
+            hits = []
+            for p in (prim, prim.strip()):
+                i = b.find(p) if p else -1
+                while i >= 0:
+                    hits.append((i + len(p), (i, i + len(p))))
+                    i = b.find(p, i + 1)
+                if hits:
+                    break
+            return hits  # nothing: the selection is outside the dictation
+        if sel == "word":
+            return [(e, (s, e)) for s, e in words]
+        if sel == "line":
+            return [(len(b), (0, len(b)))]
+        return [(words[j][1], (words[i][0], words[j][1]))
+                for i in range(len(words))
+                for j in range(i, min(len(words), i + 8))]
+
+    def _try(self, cur, sel, ops, reach):
+        """Replay ops from one place, on just the text around it: (start,
+        end, new text for buf[start:end]) or None if they can't run."""
+        b = self.buf
+        lo = max(0, min(cur, sel[0] if sel else cur) - reach)
+        hi = min(len(b), max(cur, sel[1] if sel else cur) + reach)
+        while lo > 0 and not b[lo - 1].isspace():
+            lo -= 1
+        while hi < len(b) and not b[hi].isspace():
+            hi += 1
+        got = self._replay(cur - lo, (sel[0] - lo, sel[1] - lo) if sel
+                           else None, ops, b[lo:hi])
+        return None if got is None else (lo, hi, got)
+
+    def settle(self):
+        """Place the keys typed since the last click. None, or "lost"."""
+        lost, self.lost = self.lost, None
+        ops = lost["ops"]
+        if not ops:
+            return None
+        prim = lost["prim"] if lost["prim"] and lost["prim"].strip() else None
+        places = self._places(lost["sel"], prim)
+        if not places:
+            return None  # edited somewhere else in the box
+        if len(places) == 1 and prim is not None:
+            got = self._replay(places[0][0], places[0][1], ops)
+            if got is None:
+                return "lost"
+            self.buf, self.cur = got, len(got)
+            return None
+        # each key reaches one character (Ctrl: a word) from the last
+        reach = len(ops) + 40 * sum("ctrl" in m for _c, m in ops) + 2
+        seen = {}  # (start, end, replacement) -> (kind, score, new words)
+        for cur, sel in places:
+            t = self._try(cur, sel, ops, reach)
+            if t is None:
+                continue
+            lo, hi, got = t
+            old = self.buf[lo:hi]
+            i = 0
+            while i < min(len(old), len(got)) and old[i] == got[i]:
+                i += 1
+            j = 0
+            while (j < min(len(old), len(got)) - i
+                   and old[-1 - j] == got[-1 - j]):
+                j += 1
+            key = (lo + i, hi - j, got[i:len(got) - j])
+            if key not in seen:
+                seen[key] = _edit_score(old, got)
+        if not seen:
+            return "lost"
+        if len(seen) == 1:  # it comes out the same wherever it went
+            (a, b, new), = seen
+            self.buf = self.buf[:a] + new + self.buf[b:]
+            self.cur = a + len(new)
+            return None
+        fixes = [[sc, key, w] for key, (kind, sc, w) in seen.items()
+                 if kind == "fix"]
+        known = known_words({x for f in fixes for x in
+                             re.findall(r"[^\W_]+(?:'[^\W_]+)*", f[2])})
+        if known is not None:
+            for f in fixes:  # a fix makes real words
+                if not all(known.get(x, True) for x in
+                           re.findall(r"[^\W_]+(?:'[^\W_]+)*", f[2])):
+                    f[0] *= 0.5
+        fixes.sort(key=lambda f: -f[0])
+        if not fixes or fixes[0][0] < PLACE_MIN or (
+                len(fixes) > 1 and fixes[0][0] - fixes[1][0] < PLACE_MARGIN):
+            return "lost"
+        a, b, new = fixes[0][1]
+        self.buf = self.buf[:a] + new + self.buf[b:]
+        self.cur = a + len(new)
+        self.placed = "guess"
         return None
 
 
@@ -2940,6 +3203,12 @@ class A11y:
         Atspi, GLib = self.Atspi, self.GLib
         try:
             enable_accessibility()
+            # Short-lived Qt tools (a 30 s RGB poll, say) join the bus and
+            # leave before their objects can be read; that's not news.
+            GLib.log_set_handler(
+                "atspi", GLib.LogLevelFlags.LEVEL_MASK,
+                lambda dom, lvl, msg, *_: None if "GetItems" in (msg or "")
+                else GLib.log_default_handler(dom, lvl, msg, None))
             Atspi.init()
             Atspi.set_timeout(1000, 15000)  # a hung app mustn't hold us up
             self.on_focus_l = Atspi.EventListener.new(self.on_focus)
@@ -3168,6 +3437,12 @@ class Edits:
         self.wake_r, self.wake_w = os.pipe()
         os.set_blocking(self.wake_r, False)
         self.mods = set()
+        self.press = None      # (button, when) while one is down
+        self.travel = 0        # pointer travel since that press
+        self.touch_clicked = False
+        self.fingers = 1
+        self.last_click, self.burst = 0.0, 0
+        self.prim = None       # the selected text, last we looked
         self.a11y = None
         if not os.environ.get("STT_NO_STATS"):
             try:
@@ -3213,6 +3488,9 @@ class Edits:
             log(f"watching edits to the dictation ({utt.get('app') or 'app'}, "
                 "accessibility)")
         else:
+            if not utt.get("app"):
+                utt["app"] = active_window_class()  # typed, not pasted
+            self.prim = primary_selection()
             w = EditWatch(utt, "keys", inserted, 0, len(inserted))
             ke = KeyEdit(inserted, current_keymap())
             with self.lock:
@@ -3242,12 +3520,18 @@ class Edits:
             else:
                 self.mods.discard(mod)
             return
-        if value == 0 or self.keys is None:
+        if self.keys is None:
             return
-        if code in CLICKS:
-            self.finish("click")
+        if code in (K.BTN_LEFT, K.BTN_TOUCH, K.BTN_TOOL_DOUBLETAP,
+                    K.BTN_TOOL_TRIPLETAP):
+            self.on_button(code, value)
             return
-        if code in KEY_IGNORED:
+        if value == 0:
+            return
+        if code in CLICKS_OTHER:
+            self.finish("lost")
+            return
+        if code in KEY_IGNORED or code >= K.BTN_MISC and code < K.KEY_OK:
             return
         why = None
         with self.lock:
@@ -3260,16 +3544,87 @@ class Edits:
         if why:
             self.finish(why)
 
+    def on_motion(self, value):
+        """Pointer travel (main loop): a press that moves is a drag."""
+        if self.press is not None:
+            self.travel += abs(value)
+
+    def on_button(self, code, value):
+        """Mouse buttons and touchpad touches while following keys."""
+        now = time.monotonic()
+        if code in (K.BTN_TOOL_DOUBLETAP, K.BTN_TOOL_TRIPLETAP):
+            if value:
+                self.fingers = 2  # a scroll or a right-click tap
+            return
+        if value == 1:
+            if code == K.BTN_LEFT:
+                self.touch_clicked = True  # a clickpad press: not a tap
+            if code == K.BTN_TOUCH:
+                self.touch_clicked, self.fingers = False, 1
+            self.press, self.travel = (code, now), 0
+            return
+        if value != 0 or self.press is None or self.press[0] != code:
+            return
+        held = now - self.press[1]
+        self.press = None
+        if code == K.BTN_TOUCH and (held > TAP_MAX_S or self.touch_clicked
+                                    or self.fingers > 1):
+            return  # moving the pointer or scrolling, not a tap
+        self.burst = self.burst + 1 if now - self.last_click < CLICK_BURST_S else 1
+        self.last_click = now
+        if code == K.BTN_LEFT and self.travel >= DRAG_MIN:
+            sel = "span"
+        else:
+            sel = ("caret", "word", "line")[min(self.burst, 3) - 1]
+        why = None
+        with self.lock:
+            ke, w = self.keys, self.watch
+            if ke is None or w is None:
+                return
+            if self.burst > 1 and ke.lost is not None and not ke.lost["ops"]:
+                ke.lost["sel"] = sel  # the second click of a double-click
+            else:
+                why = ke.click(sel) or w.update(ke.buf)
+            lost = ke.lost
+        if why:
+            self.finish(why)
+            return
+        threading.Thread(target=self.after_click, args=(ke, lost, sel),
+                         daemon=True).start()
+
+    def after_click(self, ke, lost, sel):
+        """What the click picked, and whether it went to another window."""
+        time.sleep(0.15)
+        if sel != "caret":
+            prim = primary_selection()
+            if prim is not None and prim != self.prim:
+                self.prim = prim
+                ke.selected(prim)  # the app shared what it selected
+        app = self.watch.utt.get("app") if self.watch is not None else None
+        now = active_window_class() if app else None
+        if now and now != app:
+            with self.lock:
+                if self.keys is not ke:
+                    return
+                if ke.lost is lost:
+                    ke.lost = None  # the keys since went to that window
+            self.finish("left")
+
     def finish(self, why):
         with self.lock:
             if why == "next":
                 self.gen += 1  # a watch still being set up is stale now
-            w, self.watch, self.keys = self.watch, None, None
+            w, ke, self.watch, self.keys = self.watch, self.keys, None, None
+            if w is not None and ke is not None and ke.lost is not None:
+                why = ke.settle() or w.update(ke.buf) or why
+            placed = ke.placed if ke is not None else None
         if w is None:
             return
         if w.how == "a11y" and self.a11y is not None:
             self.a11y.unwatch()
         rec = w.record(why)
+        if placed:
+            rec["placed"] = placed  # an edit after a click, placed by sound
         log(f"dictation {rec['kind']} ({why}, {w.how})"
             + (f": {rec['edited'][:80]!r}"
                if rec["kind"] not in ("kept", "deleted") else ""))
@@ -3301,7 +3656,7 @@ GUESS_WAIT_S = 4.0     # the dictation goes in without a guess after this
 GUESS_MAX_WORDS = 5    # words a guess may add
 GUESS_PROMPT = """A speech-to-text recording started late: the speaker was \
 already talking, so the first word or few words of what they said are \
-missing, and the first word heard may be just the end of a word.
+missing. {first_note}
 
 Text already in the box, before where this goes (may be empty):
 <<<{before}>>>
@@ -3310,10 +3665,20 @@ What was heard:
 <<<{heard}>>>
 
 If it can stand on its own as the start of a sentence, return it \
-unchanged: only add words when the start is clearly missing. Then \
-put the most likely missing words in front (at most {most}), fix the first \
-heard word if it is a fragment, and fix the capitalization. Change nothing \
-else. Reply with only JSON: {{"text": "..."}}"""
+unchanged: only add words when the start is clearly missing. Otherwise \
+put the most likely missing words in front (at most {most}), replace or \
+drop the first heard word if it was a bent fragment, and fix the \
+capitalization. Change nothing else. Reply with only JSON: \
+{{"text": "..."}}"""
+# The recognizer reads a clipped word as whichever whole word fits the
+# sentence best, so the first word of a cut clip is suspect; more so when
+# it wasn't sure of it.
+FIRST_SURE = 0.6
+FIRST_NOTE = ("The first word heard may be the end of a longer word that "
+              "the recognizer turned into a word that fits.")
+FIRST_NOTE_UNSURE = ("The recognizer was unsure of the first word heard, "
+                     "\"{w}\": it is probably the end of a cut-off word that it "
+                     "turned into a word that fits.")
 
 
 def llm_endpoints():
@@ -3395,7 +3760,7 @@ def split_start(text):
 
 def checked_guess(heard, new):
     """new if it is heard with at most GUESS_MAX_WORDS in front (its first
-    word may change), else None."""
+    word may change or go), else None."""
     hw = [_bare(w) for w in heard.split()]
     nw = [_bare(w) for w in new.split()]
     keep = hw[1:]
@@ -3406,19 +3771,24 @@ def checked_guess(heard, new):
     return new
 
 
-def guess_start(text, before=""):
-    """text with its cut-off start guessed, or None to leave it."""
+def guess_start(text, before="", first_p=None):
+    """text with its cut-off start guessed (unchanged if it reads as a
+    whole sentence), or None if no answer came. first_p: how sure the
+    recognizer was of the first word."""
     if not llm_endpoints():
         return None
     head, rest = split_start(text)
-    got = ask_llm(GUESS_PROMPT.format(before=before[-EDIT_CONTEXT:],
-                                      heard=head, most=GUESS_MAX_WORDS),
-                  GUESS_WAIT_S)
+    note = FIRST_NOTE
+    if first_p is not None and first_p < FIRST_SURE and head.split():
+        note = FIRST_NOTE_UNSURE.format(w=head.split()[0])
+    got = ask_llm(GUESS_PROMPT.format(
+        before=before[-EDIT_CONTEXT:], heard=head, most=GUESS_MAX_WORDS,
+        first_note=note), GUESS_WAIT_S)
     new = (got or {}).get("text")
     if not isinstance(new, str):
         return None
     new = checked_guess(head, new.strip())
-    if not new or new == head:
+    if not new:
         return None
     return (new + " " + rest).strip() if rest else new
 
@@ -3434,18 +3804,22 @@ def utterance_worker(jobs):
                 live.halt()
             utt = {}
             text = process_utterance(rec_path, max_s=cap_s, source=source,
-                                     info_out=utt)
+                                     info_out=utt,
+                                     cut=cut and not (live and live.typed))
             if held > cap_s:
                 notify_stt("Dictation cut short",
                            f"Kept the first {duration(cap_s)}.",
                            urgency="normal")
             utt.update(heard=text, cut=cut)
             if text and cut and not (live and live.typed):
-                guessed = guess_start(text, EDITS.context())
-                if guessed:
+                guessed = guess_start(text, EDITS.context(),
+                                      utt.get("first_p"))
+                if guessed and guessed != text:
                     log(f"start was cut off, guessed: {guessed[:80]!r}")
                     utt["guess"] = guessed
                     text = guessed
+                elif guessed:
+                    log("start was cut off, but it reads as a sentence")
             inserted = ""
             if text and live and live.finish(text):
                 inserted = live.out
@@ -3565,7 +3939,7 @@ def abandon_hold(rec):
 
 class Pointers:
     """Mice and touchpads, open only while an edit is followed by keys: a
-    click puts the cursor where the keys can't follow it."""
+    click moves the cursor, so the edit after it has to be placed."""
 
     def __init__(self):
         self.devs = {}
@@ -3660,6 +4034,9 @@ def main():
                     for ev in mouse_fd[fd].read():
                         if ev.type == evdev.ecodes.EV_KEY:
                             EDITS.on_key(ev.code, ev.value)
+                        elif ev.type == evdev.ecodes.EV_REL and ev.code in (
+                                K.REL_X, K.REL_Y):
+                            EDITS.on_motion(ev.value)
                 except OSError:
                     mice.close()
                 continue
@@ -3675,6 +4052,9 @@ def main():
                     pending = None
                 continue
             for ev in events:
+                if ev.type == evdev.ecodes.EV_REL and ev.code in (
+                        K.REL_X, K.REL_Y):
+                    EDITS.on_motion(ev.value)  # a mouse that has keys too
                 if ev.type != evdev.ecodes.EV_KEY:
                     continue
                 if ev.code not in (F24, kbd.code):

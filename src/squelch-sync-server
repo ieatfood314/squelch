@@ -232,6 +232,17 @@ def sounds_alike(old, new):
     return r >= 0.6 or (r >= 0.4 and s >= 0.75)
 
 
+FILLERS = {"um", "umm", "uh", "uhm", "er", "erm", "ah", "hmm", "mm"}
+
+
+def stray_words(words, i, j):
+    """words[i:j] are fillers or repeat the words next to them."""
+    gone, n = words[i:j], j - i
+    return n <= 3 and (all(w in FILLERS for w in gone)
+                       or words[max(0, i - n):i] == gone
+                       or words[j:j + n] == gone)
+
+
 def classify_edit(text, edited, cut=False):
     """{"kind": kept|format|fix|start|rewrite|deleted, "train": bool,
     "label": the words to train on or None, "fixes": [[old, new]]}."""
@@ -252,6 +263,9 @@ def classify_edit(text, edited, cut=False):
                 continue
             changed += max(i2 - i1, j2 - j1)
             old, new = " ".join(tw[i1:i2]), " ".join(ew[j1:j2])
+            if tag == "delete" and stray_words(tb, i1, i2):
+                fixes.append([old, ""])  # an um, or a word heard twice
+                continue
             if (tag == "replace" and max(i2 - i1, j2 - j1) <= 3
                     and sounds_alike(old, new)):
                 fixes.append([old, new])
@@ -344,6 +358,9 @@ def archive_corrections(req):
             if it.get("before"):
                 rec["before"] = str(it["before"])[-300:]
             rec.update(classify_edit(text, edited, rec["cut"]))
+            if rec["end"] in ("moved", "lost") and rec["kind"] != "deleted":
+                # it lost track, so edits after that went unseen
+                rec.update(train=False, label=None, unsure=True)
             lines.append(json.dumps(rec, ensure_ascii=False))
             seen_corrections.add(uid)
         if lines:

@@ -166,32 +166,44 @@ left alone, so ordinary speech never gets rewritten. Both need
 
 Squelch also notices what you do to a dictation afterwards, so the archive
 can pair each clip with the words you meant. Until you move on (another
-dictation, Enter, a click elsewhere, the box emptied by sending, or two
+dictation, Enter, switching windows, the box emptied by sending, or two
 idle minutes) it watches the text it put in, and then appends a line to
 `~/.config/squelch/corrections.jsonl` (and `corrections.jsonl` in the
 archive, next to the audio, by the same `id`): the text as it went in, as
 you left it, and what kind of change it was. Swapping a word for one that
-sounds like it ("Regulath" → "Regolith") or fixing punctuation is a
-`fix`, and the edited text becomes the clip's `label`. Adding, dropping or
-rewording words is a `rewrite`, you changing your mind rather than Squelch
-mishearing, so that clip gets `"train": false` and no label, and a model
-trained on `label`s never learns words you didn't say. Clips whose start
-was cut off (below) aren't trained on either.
+sounds like it ("Regulath" → "Regolith"), deleting an "um" or a word heard
+twice, or fixing punctuation is a `fix`, and the edited text becomes the
+clip's `label`. Adding, dropping or rewording words is a `rewrite`, you
+changing your mind rather than Squelch mishearing, so that clip gets
+`"train": false` and no label, and a model trained on `label`s never learns
+words you didn't say. Clips whose start was cut off (below) aren't trained
+on either, nor are ones where it lost track of the text (`"unsure": true`).
 
 It sees the text through accessibility (AT-SPI, which Squelch switches on),
 so it catches every edit, mouse ones included, in Qt, GTK and Firefox-based
 apps. Chromium and Electron apps (Chrome, VS Code, Obsidian…) only share
 the text in a page when started with `--force-renderer-accessibility`.
-Elsewhere it follows the keys you press: letters, Backspace, Delete and
-the arrows, up to the first click or jump it can't follow. Needs
-`python-gobject` for the accessibility part.
+Add the flag to an app's launcher (for a Flathub Obsidian, a line in
+`~/.var/app/md.obsidian.Obsidian/config/obsidian/user-flags.conf`) to get
+the same there; it costs the app a little memory and CPU. Elsewhere it
+follows the keys
+you press: letters, Backspace, Delete and the arrows. A click moves the
+cursor somewhere it can't see, so the keys after a click are placed when
+you're done: where the selected text sits (double-clicks and drags), or
+else the one place where they turn a word into a real word that sounds
+like it (`"placed": "guess"`). If no place stands out, it stops there and
+the clip isn't trained on. Needs `python-gobject` for the accessibility
+part and `aspell-en` for placing.
 
 If you were already talking when you pressed the key, the clip reaches
 back to the pause before you started, up to 5 seconds (the mic stays
 open, so the words are there). If you'd been talking even longer, the
 start is gone, and an LLM guesses the missing words from the rest and the
 text before the cursor (the `llm-fallback.json` endpoint, or OpenRouter).
-It waits up to 4 s for that, and only for those clips.
+Parakeet reads a clipped word as whichever whole word fits the sentence,
+so the guess may replace or drop the first word heard, and is told when
+Parakeet was unsure of it. It waits up to 4 s for that, and only for those
+clips.
 
 Music (any MPRIS player) pauses while you hold the trigger and resumes on
 release, so it never bleeds into the mic.
