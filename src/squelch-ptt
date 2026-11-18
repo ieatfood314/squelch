@@ -1238,6 +1238,56 @@ def numbers_to_digits(text, all_digits=False):
     return _NUM_RUN_RE.sub(repl, text)
 
 
+_DIGIT_WORDS = {"zero": "0", "one": "1", "two": "2", "three": "3",
+                "four": "4", "five": "5", "six": "6", "seven": "7",
+                "eight": "8", "nine": "9"}
+_PN_DIGIT = r"(?:(?i:%s)|\d+)" % "|".join(_DIGIT_WORDS)
+_PN_GROUP = r"%s(?:[\s-]+%s)*" % (_PN_DIGIT, _PN_DIGIT)
+_PN_CAPS = r"[A-Z]{2,5}"
+# "seven four HCT two seven three", "74 HCT 273", "NE five five five"
+_PART_RE = re.compile(
+    r"(?<![\w-])(?:(?P<lead>%s)\s+(?P<mid>%s)(?:\s+(?P<trail>%s))?"
+    r"|(?P<pre>%s)\s+(?P<num>%s))(?![\w-])"
+    % (_PN_GROUP, _PN_CAPS, _PN_GROUP, _PN_CAPS, _PN_GROUP))
+
+
+def _pn_digits(group):
+    """'seven four' / '74' / 'two 73' -> ('74', spoken words?): any said as
+    words, or 'all' when every one was."""
+    toks = [t for t in re.split(r"[\s-]+", group) if t]
+    out = [_DIGIT_WORDS.get(t.lower(), t) for t in toks]
+    said = [t.lower() in _DIGIT_WORDS for t in toks]
+    return "".join(out), "all" if all(said) else any(said)
+
+
+def part_numbers(text):
+    """Join spoken chip and part numbers: 'seven four HCT two seven three'
+    -> '74HCT273', 'NE five five five' -> 'NE555'. Needs capital letters
+    (2-5, as the model writes acronyms) and, so ordinary counts stay
+    apart ('two USB cables', 'USB 3'), two or more digits before them, or
+    three or more after them with at least one said as a word."""
+
+    def repl(m):
+        span = m.group(0)
+        if m.group("pre"):
+            num, spoken = _pn_digits(m.group("num"))
+            if len(num) < 3 or not spoken:
+                return span
+            return m.group("pre") + num
+        lead, lead_spoken = _pn_digits(m.group("lead"))
+        if len(lead) < 2:
+            return span
+        trail = m.group("trail")
+        if not trail:
+            # '74 HCT' alone may just be a count, and 'two 30 PM' a time
+            # ('two thirty PM' after numbers_to_digits); 'seven four HCT'
+            # is neither
+            return lead + m.group("mid") if lead_spoken == "all" else span
+        return lead + m.group("mid") + _pn_digits(trail)[0]
+
+    return _PART_RE.sub(repl, text)
+
+
 def transcribe(wav_path, engine, partial=False):
     if engine == "whisper":
         return clean_text(transcribe_whisper(wav_path, partial))
@@ -1261,7 +1311,9 @@ def tidy(text):
     if do_defill:
         text = defiller(text)
     if do_numbers:
+        text = part_numbers(text)
         text = numbers_to_digits(text, all_digits=do_all)
+        text = part_numbers(text)  # 'seventy four HCT' is '74 HCT' by now
     return apply_dictionary(text)
 
 

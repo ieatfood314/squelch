@@ -27,7 +27,8 @@ no cloud, no accounts.
   libxkbcommon), so Colemak or a layout switched mid-session types
   correctly; characters it has no key for are pasted
 - **Text cleanup**: filler words (um/uh/ah…) removed, number words over ten
-  (optionally all) written as digits, custom dictionary with AI-suggested
+  (optionally all) written as digits, spoken part numbers joined
+  ("seven four HCT two seven three" → 74HCT273), custom dictionary with AI-suggested
   mishearings via OpenRouter, and mishearings learned from your own
   dictation
 - **Game mode**: models unload once a game has been fullscreen for 10 s and
