@@ -29,7 +29,7 @@ regolith also pulls AUR releases through yay on its own, so a reinstall of the s
 Since 2026-11-19 regolith and mars run the engine through the `nullspace` package, not `squelch`, so steps 5 to 7 go through a Nullspace release instead: bump `_squelch` in the nullspace repo's `desktop/PKGBUILD` and follow its AGENTS.md (Desktop, Shipping). Build the squelch package (steps 1 to 4) only to publish it for people who want dictation alone; don't install it on those two, since it would replace Nullspace's engine.
 
 ## Nullspace, the phone side
-Retired 2026-11-11: the Android app moved into Uplink, renamed Nullspace in November 2026 (`~/repos/uplink` on nas, GitHub `ieatfood314/nullspace`), so make phone changes there. Squelch and Nullspace are separate products, promoted separately, that work together through the sync hub. So:
+Retired 2026-11-11: the Android app moved into Nullspace (`~/repos/nullspace` on nas, GitHub `ieatfood314/nullspace`), so make phone changes there. Squelch and Nullspace are separate products, promoted separately, that work together through the sync hub. So:
 
 - **Carry dictation changes over.** When you change how Squelch dictates (filler and cleanup rules, the dictionary format or matching, guess-start, the archive or corrections format, edit capture), make the same change in Nullspace's `Dictation.kt`, `Cleanup.kt`, `Words.kt`, `EditWatch.kt` or `Archive.kt`, or tell Aidan it still needs doing. Nullspace's AGENTS.md says the same the other way round.
 - **Keep the hub's API compatible.** Nullspace's Words sync calls `/v1/sync`, `/v1/archive` and `/v1/corrections` (the README's "The hub's API" table). Add fields rather than rename or remove them; phones update on their own schedule.
