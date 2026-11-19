@@ -3215,6 +3215,15 @@ class A11y:
             self.on_focus_l.register("object:state-changed:focused")
             self.on_text_l = Atspi.EventListener.new(self.on_text)
             GLib.timeout_add(2000, self.poll)
+            # A Plasma restart switches accessibility off again (seen
+            # 2026-11-18), so turn it back on whenever it goes off.
+            from gi.repository import Gio
+            self.reenabled = 0.0
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self.bus.signal_subscribe(
+                None, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                "/org/a11y/bus", "org.a11y.Status", Gio.DBusSignalFlags.NONE,
+                self.on_status)
         except Exception as e:
             log("accessibility unavailable, following keys only:", e)
             self.ready.set()
@@ -3222,6 +3231,18 @@ class A11y:
         self.ok = True
         self.ready.set()
         Atspi.event_main()
+
+    def on_status(self, _conn, _sender, _path, _iface, _signal, params,
+                  *_):
+        changed = params.unpack()[1]
+        if changed.get("IsEnabled") is not False:
+            return
+        now = time.time()
+        if now - self.reenabled < 60:
+            return  # something keeps switching it off; don't fight it
+        self.reenabled = now
+        log("accessibility was switched off; switching it back on")
+        threading.Timer(2.0, enable_accessibility).start()
 
     def call(self, fn, *args, timeout=2.0):
         """Run fn in the AT-SPI thread and return what it returns."""
