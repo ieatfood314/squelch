@@ -358,6 +358,11 @@ def archive_corrections(req):
             if it.get("before"):
                 rec["before"] = str(it["before"])[-300:]
             rec.update(classify_edit(text, edited, rec["cut"]))
+            if it.get("tidied"):
+                # Nullspace's tidy pass cut repeats and false starts that are
+                # still in the audio, so the text isn't what was said: keep
+                # the record and its word fixes, but not as a label.
+                rec.update(tidied=True, train=False, label=None)
             if rec["end"] in ("moved", "lost") and rec["kind"] != "deleted":
                 # it lost track, so edits after that went unseen
                 rec.update(train=False, label=None, unsure=True)

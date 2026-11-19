@@ -36,8 +36,9 @@ no cloud, no accounts.
   going fullscreen don't count
 - **Analytics**: all-time words/WPM/latency plus last-60-minutes WPM and a
   7-day table, in the tap popup and a fullscreen dashboard
-- **Sync**: dictionary and analytics shared between your computers and the
-  phone app through a small hub you run yourself ([Sync](#sync))
+- **Sync**: dictionary and analytics shared between your computers and
+  your phone (through [Nullspace](#phone)) with a small hub you run
+  yourself ([Sync](#sync))
 - **Everything survives reboot** via systemd user services
 
 Tested on EndeavourOS / KDE Plasma 6 / Wayland, AMD RX 5700,
@@ -48,13 +49,31 @@ small tweaks.
 
 ## Phone
 
-There's an Android version too: hold a key (the Essential key on Nothing
-phones), speak, let go, and the text lands in the field you're in, decoded
-on the phone with the same Parakeet model. See [android/](android/README.md).
+Squelch's dictation on Android lives in
+[Nullspace](https://github.com/ieatfood314/nullspace), a separate app:
+hold a key (the Essential key on Nothing phones), speak, let go, and the
+text lands in the field you're in, decoded on the phone with the same
+Parakeet model. Nullspace also catches screenshots, voice notes and
+reminders, and works on its own.
 
-The Android app has moved into [Uplink](https://github.com/ieatfood314/uplink),
-which has the same dictation plus captures, reminders and a to-do list, and
-still syncs your words with desktop Squelch. `android/` is no longer updated.
+Together they share what you've taught them. Point Nullspace at your
+Squelch [sync hub](#sync) and you get:
+
+- **One dictionary.** Words you add on the phone or a computer, and the
+  mishearings they fix, reach every device, deletions included.
+- **One set of analytics.** The tray's Analytics tab and the phone's
+  settings both add up every device.
+- **One training archive** (if your hub keeps one, see below). The phone's
+  dictation audio and the edits you make afterwards land in the same
+  archive as your computers', ready for fine-tuning.
+
+To set it up, on the phone: Nullspace → Settings → **Words sync → Set up**,
+paste your hub's address (the same one as `~/.config/squelch/sync`, like
+`https://squelch.your-tailnet.ts.net`) and tap **Save**. It syncs on Wi-Fi
+only, when you open the app and around each dictation. To also send the
+phone's recordings to your archive, turn on **Keep recordings** below it.
+
+`android/` here is the old Squelch for Android, no longer updated.
 
 ## Install (Arch)
 
@@ -229,8 +248,8 @@ behind …".
 
 ### Sync
 
-Your dictionary and analytics can follow you between computers and the
-[phone app](android/README.md). One machine runs the hub, which every
+Your dictionary and analytics can follow you between computers and
+[Nullspace](#phone) on your phone. One machine runs the hub, which every
 device can reach (it has no login, so keep it on a private network such as
 Tailscale):
 
@@ -252,11 +271,27 @@ systemctl --user enable --now squelch-sync.timer squelch-sync.path
 ```
 
 The computer syncs whenever its dictionary or stats change, and every 3
-minutes to pick up everyone else's. On the phone, put the same address under
-Sync. Words added or removed anywhere reach every device, deletions
-included, and the Analytics tab adds up every device (with a per-device
-line once there's more than one). `squelch-sync --status` shows when it last
-synced.
+minutes to pick up everyone else's. On the phone, put the same address
+under Nullspace's Words sync. Words added or removed anywhere reach every
+device, deletions included, and the Analytics tab adds up every device
+(with a per-device line once there's more than one). `squelch-sync --status`
+shows when it last synced.
+
+To collect phones' recordings too, name a training archive folder in
+`~/.config/squelch/archive` on the hub's machine (or start it with
+`--archive DIR`). Without one, phones keep their clips and try again later.
+
+#### The hub's API
+
+For anyone building another client (Nullspace is one). No auth; JSON in
+and out.
+
+| Endpoint | Body | Answer |
+|---|---|---|
+| `GET /v1/status` | | `{"squelch-sync": 1, words, devices}` (per device: `name`, `events`, `last`) |
+| `POST /v1/sync` | `device` (a stable id), `name`, `dictionary: {mine, base}` (your entries now, and as of your last sync; entries are `{term, also_match: [...]}`), `stats: {events, have}` (new dictation events, and the newest `ts` you hold per other device) | `dictionary` (merged three ways), `stats: {pushed, devices}` (other devices' events after what you have) |
+| `POST /v1/archive` | one clip: `id`, `ts`, `device`, `engine`, `audio_s`, `text` (as heard), `cut` (the mic opened mid-word), `wav` (16 kHz mono WAV, base64) | `{ok}`, or 404 when the hub keeps no archive |
+| `POST /v1/corrections` | `device`, `items`: per dictation `id`, `ts`, `app`, `text` (as inserted), `edited` (what you left it as), `heard`, `cut`, `end` (why the watch ended), and optionally `before` (300 characters of what was in the box), `guess` (a guessed start for a cut-off clip) and `tidied` (an LLM cut repeats from it, so it isn't used as a label) | `{ok, saved}` |
 
 ## Layout
 
@@ -269,7 +304,7 @@ synced.
 - `src/squelch-mic-reset` — root helper: power-cycle a USB mic's port
 - `systemd/` — user units · `systemd/system/` — mic-reset template unit
 - `polkit/` — lets wheel users' squelch-ptt start the mic-reset unit · `kanata/snippet.kbd` — optional kanata tap-hold for the trigger
-- `android/` — the Android app
+- `android/` — the old Android app, now [Nullspace](https://github.com/ieatfood314/nullspace)
 
 Runtime state lives in `~/.config/squelch/` (engine, filters, dictionary,
 mic, hotkey, archive, vram.json, stats, sync, key; other devices' stats in stats.d/). Models in `~/.local/share/whisper.cpp/models` and

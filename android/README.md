@@ -1,7 +1,8 @@
 # Squelch for Android
 
-**Moved:** this app is now part of [Uplink](https://github.com/ieatfood314/uplink),
-with the same dictation. This folder is no longer updated.
+**Moved:** Squelch on Android is now [Nullspace](https://github.com/ieatfood314/nullspace),
+with the same dictation plus captures, reminders and a to-do list. This
+folder is no longer updated. See [Phone](../README.md#phone).
 
 Hold a key, speak, let go: the text lands in whatever field you're typing in.
 Same idea as desktop Squelch, on the phone's CPU, offline.
