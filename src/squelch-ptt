@@ -667,16 +667,18 @@ def node_muted(info):
 
 def find_mic():
     """{"target": node name or None, "usb": USB id or None, "id": node id
-    or None, "muted": bool, "virtual": bool, "desc": str} for the mic to
-    record from, or None if the configured mic is missing. Target None
-    means PipeWire's default source. Virtual: not a hardware device, so
-    the real mic is somewhere upstream of it."""
+    or None, "serial": its object.serial or None, "muted": bool,
+    "virtual": bool, "desc": str} for the mic to record from, or None if
+    the configured mic is missing. Target None means PipeWire's default
+    source. Virtual: not a hardware device, so the real mic is somewhere
+    upstream of it. A replugged mic comes back as a new node with a new
+    serial (ids are reused, serials never are)."""
     want = configured_mic()
     objs = pw_objects()
     if objs is None:
         return None if want else {"target": None, "usb": None, "id": None,
-                                  "muted": False, "virtual": False,
-                                  "desc": ""}
+                                  "serial": None, "muted": False,
+                                  "virtual": False, "desc": ""}
     sources, default = [], None
     for o in objs:
         info = o.get("info") or {}
@@ -706,6 +708,7 @@ def find_mic():
         _last_mic_usb["id"] = usb
     return {"target": pick.get("node.name") if want else None, "usb": usb,
             "id": pick.get("squelch.id") if pick else None,
+            "serial": pick.get("object.serial") if pick else None,
             "muted": bool(pick and pick.get("squelch.muted")),
             "virtual": bool(pick and "device.id" not in pick),
             "desc": (pick.get("node.description") or pick.get("node.name")
@@ -840,6 +843,7 @@ def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None,
         # Exact zeros: a live mic always has some noise floor, so this is
         # a mute unmute_node couldn't see or undo (e.g. in hardware), or a
         # virtual source nothing feeds.
+        MIC_TAP.stale()
         source = source or {}
         if source.get("virtual") and source.get("fed") is False:
             log(f"recording is all zeros and no mic feeds "
@@ -1851,10 +1855,13 @@ def wav_header(data_bytes):
 class MicTap:
     """The always-open pw-record, and the hold it's writing to (if any)."""
 
+    STALE = "stale"  # node of a tap that must reopen
+
     def __init__(self):
         self.lock = threading.Lock()
         self.proc = None
         self.target = None
+        self.node = None         # the mic node's serial when it opened
         self.ring = bytearray()  # the last TAP_KEEP_S of audio
         self.t_end = 0.0         # when the newest of it arrived
         self.sink = None         # file of the hold being recorded
@@ -1862,14 +1869,25 @@ class MicTap:
         self.fresh = threading.Condition(self.lock)  # new audio arrived
         self.noise = None        # the room's level between words
 
-    def ensure(self, target):
-        """Have the tap open on target (None: the default source). True if
-        it already was, so it remembers the moments before the press."""
+    def ensure(self, target, node=None):
+        """Have the tap open on target (None: the default source), whose
+        node has serial node. True if it already was, so it remembers the
+        moments before the press. A stream left over from before the mic
+        was replugged can stay linked to something that feeds it silence
+        (2026-11-19: zeros through EasyEffects after the C920's hub
+        dropped), and it looks alive, so a new node reopens it too."""
         with self.lock:
             if (self.proc is not None and self.proc.poll() is None
                     and self.target == target
+                    and (node is None or self.node == node)
                     and time.time() - self.t_end < TAP_STALE_S):
                 return True
+            if (self.proc is not None and self.proc.poll() is None
+                    and self.target == target and node is not None):
+                log("last clip was all zeros, reopening the mic stream"
+                    if self.node is MicTap.STALE else
+                    f"mic node changed ({self.node} -> {node}), "
+                    "reopening the mic stream")
             old = self.proc
             cmd = ["pw-record", "--raw", "--rate", str(SR), "--channels",
                    str(MIC_CHANNELS), "--format", "s16", "--latency", "50ms",
@@ -1883,12 +1901,19 @@ class MicTap:
                                          stderr=subprocess.DEVNULL,
                                          bufsize=0)
             self.target, self.ring, self.t_end = target, bytearray(), time.time()
+            self.node = node
             threading.Thread(target=self.read, args=(self.proc,),
                              daemon=True).start()
         if old is not None:
             threading.Thread(target=self.close, args=(old,),
                              daemon=True).start()
         return False
+
+    def stale(self):
+        """The tap delivered a clip of exact zeros: have watch() open a
+        fresh stream before the next press, whatever fed it silence."""
+        with self.lock:
+            self.node = MicTap.STALE
 
     @staticmethod
     def close(proc):
@@ -1906,7 +1931,7 @@ class MicTap:
             if not mic_resetting() and self.sink is None:
                 mic = find_mic()
                 if mic is not None:
-                    self.ensure(mic["target"])
+                    self.ensure(mic["target"], mic["serial"])
 
     def read(self, proc):
         rest = b""
@@ -4049,7 +4074,7 @@ def start_hold(code, jobs, pressed, note=None):
         unmute_node(mic["id"])
     fd, path = tempfile.mkstemp(suffix="-raw.wav")
     os.close(fd)
-    if not MIC_TAP.ensure(mic["target"]):
+    if not MIC_TAP.ensure(mic["target"], mic["serial"]):
         log("mic stream was closed, opened it: no audio from before the press")
     now = time.time()
     since = min(now, max(now - TAP_KEEP_S, pressed)) - PREROLL_S
@@ -4173,7 +4198,7 @@ def main():
     threading.Thread(target=watch_resume, daemon=True).start()
     mic = find_mic()
     if mic is not None:
-        MIC_TAP.ensure(mic["target"])
+        MIC_TAP.ensure(mic["target"], mic["serial"])
     threading.Thread(target=MIC_TAP.watch, daemon=True).start()
     jobs = queue.Queue()
     threading.Thread(target=utterance_worker, args=(jobs,),
