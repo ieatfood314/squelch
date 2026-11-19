@@ -1323,8 +1323,23 @@ def transcribe_words(wav_path):
     return [(str(w), float(p), float(end)) for w, p, end in words]
 
 
+# Parakeet's tokenizer glues a leading apostrophe onto what comes before
+# it: right for "don't", wrong for "want,'cause". After , ; : ! ? an
+# apostrophe then a letter or digit starts a clipped word ('cause, 'em,
+# 'til, '90s), so it gets its space back. After a period only when a
+# capital follows, so "U.S.'s" stays as it is.
+APOS_GLUE_RE = re.compile(r"(?:(?<=[,;:!?])|(?<=\.)(?=['\u2019][A-Z]))"
+                          r"(?=['\u2019][^\W_])")
+
+
+def space_clipped_words(text):
+    """'want,'cause' -> 'want, 'cause'."""
+    return APOS_GLUE_RE.sub(" ", text)
+
+
 def tidy(text):
     """The cleanup filters from Settings, then your dictionary."""
+    text = space_clipped_words(text)
     do_defill, do_numbers, do_all = text_filters()
     if do_defill:
         text = defiller(text)
