@@ -3278,6 +3278,22 @@ class KeyEdit:
         return None
 
 
+def a11y_bus_check():
+    """Raise unless the accessibility bus takes connections. libatspi
+    aborts the whole process when it can't reach it (seen 2026-11-19, a
+    stale bus_0 left by another session), so test it first."""
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    addr = bus.call_sync(
+        "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress",
+        None, GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE, 3000,
+        None).unpack()[0]
+    Gio.DBusConnection.new_for_address_sync(
+        addr, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+        | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+        None, None).close_sync(None)
+
+
 class A11y:
     """AT-SPI on its own thread (GLib's loop): which object has focus,
     and the text of the one being watched."""
@@ -3307,6 +3323,7 @@ class A11y:
                 "atspi", GLib.LogLevelFlags.LEVEL_MASK,
                 lambda dom, lvl, msg, *_: None if "GetItems" in (msg or "")
                 else GLib.log_default_handler(dom, lvl, msg, None))
+            a11y_bus_check()
             Atspi.init()
             Atspi.set_timeout(1000, 15000)  # a hung app mustn't hold us up
             self.on_focus_l = Atspi.EventListener.new(self.on_focus)
