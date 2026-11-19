@@ -30,6 +30,8 @@ Retired 2026-11-11: the Android app moved into Uplink, renamed Nullspace in Nove
 - **Keep the hub's API compatible.** Nullspace's Words sync calls `/v1/sync`, `/v1/archive` and `/v1/corrections` (the README's "The hub's API" table). Add fields rather than rename or remove them; phones update on their own schedule.
 - **Keep the README's Phone section current.** It's how Squelch users find Nullspace and set up the pairing.
 
+- **Nullspace on the desktop** (`desktop/` in that repo, AUR `nullspace`, which depends on `squelch`) gets the trigger key's taps from squelch-ptt over its socket: `Gestures`, `note_for` and `end_note` in squelch-ptt, `nullspace_on` in squelch-tray (which hides its icon and ignores taps while Nullspace answers). The README's "Nullspace on the desktop" section has the protocol; change it on both sides. Without Nullspace running nothing here changes, so Squelch alone stays a dictation-only product.
+
 The old Android release steps below are kept for reference.
 
 1. `cd android && ./release.sh X.Y.Z <versionCode>`. versionCode must go up every release (0.2.0 = 2).

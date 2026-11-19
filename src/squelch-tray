@@ -16,6 +16,7 @@ import os
 import pwd
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -2199,6 +2200,26 @@ class SettingsWindow(QWidget):
             super().keyPressEvent(event)
 
 
+# The Nullspace desktop app, when it runs, is the face of Squelch: it has the
+# tray icon, and taps of the trigger key are its gestures (squelch-ptt sends
+# them). This tray then only draws the pill and opens Settings when asked.
+NULLSPACE_SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+                                f"nullspace-{os.getuid()}")
+
+
+def nullspace_on():
+    if not os.path.exists(NULLSPACE_SOCKET):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            s.connect(NULLSPACE_SOCKET)
+            s.sendall(b"ping\n")
+        return True
+    except OSError:
+        return False
+
+
 class TriggerWatcher:
     """Passive listener on every keyboard that can send the trigger: a
     kanata tap (F23) or a quick press of the trigger key itself pops the
@@ -2563,6 +2584,8 @@ def main():
     def on_menu_tap():
         if settings.hk_capture.active:
             return  # pressing the trigger to pick it again
+        if nullspace_on():
+            return  # its gestures
         if tap["pending"]:
             # double tap: straight to settings, tap card stays closed
             tap["pending"] = False
@@ -2585,8 +2608,14 @@ def main():
 
     app.watcher = TriggerWatcher(on_menu_tap)  # keep it alive
     app.listener = LaunchListener(on_launch)
+    def follow_nullspace():
+        tray.setVisible(not nullspace_on())
+
+    ns_timer = QTimer()
+    ns_timer.timeout.connect(follow_nullspace)
+    ns_timer.start(3000)
     refresh()
-    tray.show()
+    follow_nullspace()
     if want_settings:
         QTimer.singleShot(0, lambda: open_settings(None))
     sys.exit(app.exec())

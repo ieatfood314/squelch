@@ -592,6 +592,7 @@ MIN_CAP_S = 30.0        # always allowed, even with VRAM tight
 FALLBACK_CAP_S = 120.0  # Parakeet up but free VRAM unknown
 PARAKEET_LIMITS_URL = "http://127.0.0.1:1894/limits"
 F24 = evdev.ecodes.KEY_F24  # emitted by kanata while the trigger is held
+F23 = evdev.ecodes.KEY_F23  # emitted by kanata for a tap of the trigger
 # A trigger key read straight from the keyboard counts as held once it's
 # down this long, the same hold timeout kanata's tap-hold uses; shorter is
 # a tap (the tray's popup).
@@ -2321,6 +2322,88 @@ def duration(seconds):
 TRAY_SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
                            f"squelch-tray-{os.getuid()}")
 _hold_ids = iter(range(1, 1 << 62))
+
+
+# ---------------- Nullspace ----------------
+# With the Nullspace desktop app running, the trigger key does what the
+# Essential key does on Nullspace for Android: hold to dictate as always,
+# press to capture the screen, press then hold for a voice note, double
+# press to open Nullspace. A hold while a screenshot's card is showing is a
+# note about that screenshot. The tray leaves taps to this loop then.
+NULLSPACE_SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+                                f"nullspace-{os.getuid()}")
+# holds the uid of the screenshot whose card is showing
+NULLSPACE_CARD = NULLSPACE_SOCKET + "-card"
+GAP_S = 0.38  # a second press this soon after a tap makes it a double
+
+
+def nullspace_send(line):
+    """Tell the Nullspace app something. False if it isn't running."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            s.connect(NULLSPACE_SOCKET)
+            s.sendall(line.encode() + b"\n")
+        return True
+    except OSError:
+        return False
+
+
+def nullspace_on():
+    return os.path.exists(NULLSPACE_SOCKET) and nullspace_send("ping")
+
+
+def nullspace_card():
+    try:
+        with open(NULLSPACE_CARD) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+class Gestures:
+    """Taps and holds of the trigger key, told apart the way the phone does.
+    A tap waits `wait` for a second press: a second tap opens Nullspace, a
+    second press that's held is a voice note, and nothing is a capture."""
+
+    def __init__(self):
+        self.tap_at = None   # when the last unanswered tap ended
+        self.wait = GAP_S
+        self.second = False  # the key is down for the second time
+
+    def down(self, t):
+        """The trigger key itself went down (not kanata)."""
+        self.second = self.tap_at is not None and t - self.tap_at < self.wait
+        if self.second:
+            self.tap_at = None
+
+    def tap(self, t, wait=GAP_S):
+        """A tap ended: "open" if it was the second, else None for now.
+        kanata's taps wait longer, since its hold only shows up as F24 its
+        hold timeout after the press."""
+        if self.second or (self.tap_at is not None
+                           and t - self.tap_at < self.wait):
+            self.tap_at, self.second = None, False
+            return "open"
+        self.tap_at, self.wait = t, wait
+        return None
+
+    def hold(self, t):
+        """A hold started. True when it's the second press: a voice note."""
+        second = self.second or (self.tap_at is not None
+                                 and t - self.tap_at < self.wait)
+        self.tap_at, self.second = None, False
+        return second
+
+    def due(self, t):
+        """"capture" once a tap has gone unanswered for `wait`."""
+        if self.tap_at is not None and t - self.tap_at >= self.wait:
+            self.tap_at = None
+            return "capture"
+        return None
+
+    def deadline(self):
+        return None if self.tap_at is None else self.tap_at + self.wait
 LEVEL_EVERY_S = 0.05   # how often the pill gets the mic level
 WAV_HEADER = 44        # pw-record's; its sizes are only filled in on exit
 
@@ -3834,11 +3917,16 @@ def utterance_worker(jobs):
     so a new hold starts recording at once even while the last one is
     still being pasted."""
     while True:
-        rec_path, held, cap_s, source, live, pill, cut = jobs.get()
+        rec_path, held, cap_s, source, live, pill, cut, note = jobs.get()
         try:
             if live:
                 live.halt()
             utt = {}
+            if note is not None:
+                text = process_utterance(rec_path, max_s=cap_s, source=source,
+                                         info_out=utt, cut=cut)
+                end_note(note, text)
+                continue
             text = process_utterance(rec_path, max_s=cap_s, source=source,
                                      info_out=utt,
                                      cut=cut and not (live and live.typed))
@@ -3889,9 +3977,22 @@ def discard(path):
 MIC_TAP = MicTap()
 
 
-def start_hold(code, jobs, pressed):
+def end_note(note, text):
+    """Hand a voice note's text to Nullspace ("" when nothing was said)."""
+    if os.environ.get("STT_DRY_RUN"):
+        log(f"DRYRUN note: {text[:120]!r}")
+    if nullspace_send("note-end " + json.dumps({**note, "text": text or ""})):
+        if text:
+            log("voice note sent to Nullspace")
+    elif text:
+        notify_stt("Nullspace isn't running", text, urgency="normal")
+
+
+def start_hold(code, jobs, pressed, note=None):
     """Start recording for a held trigger; None if we can't. pressed: when
-    the key went down (wall clock); the clip starts PREROLL_S before it."""
+    the key went down (wall clock); the clip starts PREROLL_S before it.
+    note: a voice note for Nullspace ({"about": a screenshot's uid or None})
+    rather than dictation."""
     if notify_engine_down():
         log("engine unavailable, ignoring press")
         return None
@@ -3899,8 +4000,11 @@ def start_hold(code, jobs, pressed):
         log("mic reset in progress, ignoring press")
         return None
     # done with the last dictation's text (off this loop: it may wait on
-    # an app over accessibility)
-    threading.Thread(target=EDITS.finish, args=("next",), daemon=True).start()
+    # an app over accessibility). A voice note types nothing, so the
+    # dictation before it can still be edited.
+    if note is None:
+        threading.Thread(target=EDITS.finish, args=("next",),
+                         daemon=True).start()
     paused = playing_players()
     pause_players(paused)
     mic = find_mic()
@@ -3927,11 +4031,15 @@ def start_hold(code, jobs, pressed):
     cap.daemon = True
     cap.start()
     pill = Pill(path)
-    live = LiveTyper(path, cap_s, source, jobs) if live_enabled() else None
-    log(f"recording... (cap {duration(cap_s)}{', live' if live else ''})")
+    live = (LiveTyper(path, cap_s, source, jobs)
+            if note is None and live_enabled() else None)
+    if note is not None:
+        nullspace_send("note-start " + json.dumps(note))
+    what = "voice note" if note is not None else "recording"
+    log(f"{what}... (cap {duration(cap_s)}{', live' if live else ''})")
     return {"proc": proc, "path": path, "paused": paused, "code": code,
             "t": time.time(), "cap": cap, "cap_s": cap_s, "source": source,
-            "live": live, "pill": pill}
+            "live": live, "pill": pill, "note": note}
 
 
 def end_hold(rec, jobs):
@@ -3955,13 +4063,15 @@ def end_hold(rec, jobs):
         log(f"held {held:.0f}s, keeping the first {cap_s:.0f}s")
     rec["pill"].working()
     jobs.put((path, held, cap_s, rec["source"], live, rec["pill"],
-              rec["proc"].cut))
+              rec["proc"].cut, rec["note"]))
 
 
 def drop_hold(rec):
     """Forget a hold that isn't going to be transcribed."""
     if rec["live"]:
         rec["live"].cancel()
+    if rec["note"] is not None:
+        end_note(rec["note"], "")
     rec["pill"].end()
     discard(rec["path"])
 
@@ -4010,6 +4120,17 @@ class Pointers:
 EDITS = None
 
 
+def note_for(second):
+    """What a hold that just started is: None for dictation, or a voice note
+    for Nullspace, about the screenshot whose card shows if there is one."""
+    if not nullspace_on():
+        return None
+    about = nullspace_card()
+    if about or second:
+        return {"about": about}
+    return None
+
+
 def main():
     global EDITS
     EDITS = Edits()
@@ -4024,7 +4145,8 @@ def main():
     kbd = Keyboards()
     mice = Pointers()
     rec = None       # the recording while the trigger is held
-    pending = None   # (path, press time) of a direct trigger press
+    pending = None   # (path, press time, code) of a press not yet a hold
+    gest = Gestures()
     last_scan = 0.0
     lonely = False   # logged that no keyboard has the key
     while True:
@@ -4041,13 +4163,18 @@ def main():
             lonely = not kbd.devs
         if pending and now - pending[1] >= HOLD_DELAY_S:
             if rec is None:
-                rec = start_hold(kbd.code, jobs, pending[1])
+                rec = start_hold(pending[2], jobs, pending[1],
+                                 note_for(gest.hold(now)))
                 if rec is not None:
                     rec["dev"] = pending[0]
             pending = None
+        if gest.due(now) and nullspace_on():
+            nullspace_send("capture")
         timeout = 2.0
         if pending:
             timeout = max(0.0, pending[1] + HOLD_DELAY_S - now)
+        if gest.deadline() is not None:
+            timeout = min(timeout, max(0.0, gest.deadline() - now))
         mice.sync(EDITS.following_keys, kbd.devs)
         by_fd = {d.fd: path for path, d in kbd.devs.items()}
         mouse_fd = {d.fd: d for d in mice.devs.values()}
@@ -4095,11 +4222,31 @@ def main():
                     continue
                 if ev.code not in (F24, kbd.code):
                     EDITS.on_key(ev.code, ev.value)
-                if ev.code == F24:  # kanata already timed the hold
+                if ev.code == F23:
+                    # A kanata tap: down and up together. Pressed again soon
+                    # after a tap and held, kanata repeats the tap (F23
+                    # stays down) instead of sending F24, so a long F23 is
+                    # the hold of a tap-then-hold: a voice note. Without
+                    # Nullspace a tap is the tray's, as before.
+                    if (ev.value == 1 and rec is None and pending is None
+                            and nullspace_on()):
+                        pending = (path, time.time(), F23)
+                        gest.down(pending[1])
+                    elif ev.value == 0:
+                        if pending and pending[2] == F23:
+                            pending = None
+                            if (gest.tap(time.time(), GAP_S + HOLD_DELAY_S)
+                                    == "open" and nullspace_on()):
+                                nullspace_send("open")
+                        elif rec and rec["code"] == F23:
+                            end_hold(rec, jobs)
+                            rec = None
+                elif ev.code == F24:  # kanata already timed the hold
                     if ev.value == 1 and rec is None:
                         # kanata sends F24 its hold timeout after the press
                         rec = start_hold(F24, jobs,
-                                         ev.timestamp() - HOLD_DELAY_S)
+                                         ev.timestamp() - HOLD_DELAY_S,
+                                         note_for(gest.hold(time.time())))
                         if rec is not None:
                             rec["dev"] = path
                     elif ev.value == 0 and rec and rec["code"] == F24:
@@ -4107,10 +4254,15 @@ def main():
                         rec = None
                 elif ev.code == kbd.code:
                     if ev.value == 1 and rec is None and pending is None:
-                        pending = (path, time.time())
+                        pending = (path, time.time(), kbd.code)
+                        gest.down(pending[1])
                     elif ev.value == 0:
-                        if pending and pending[0] == path:
+                        if pending and pending[0] == path and (
+                                pending[2] == kbd.code):
                             pending = None  # a tap
+                            if (gest.tap(time.time()) == "open"
+                                    and nullspace_on()):
+                                nullspace_send("open")
                         elif rec and rec["code"] == kbd.code:
                             end_hold(rec, jobs)
                             rec = None

@@ -1,7 +1,8 @@
 # Squelch — push-to-talk speech-to-text on your GPU
 
 Hold **Menu**, speak, release — the transcription appears at your cursor in
-well under a second. Optionally the words are typed while you speak. Tap
+well under a second. (With [Nullspace](#nullspace-on-the-desktop) the same
+key also captures the screen and takes voice notes.) Optionally the words are typed while you speak. Tap
 **Menu** for a settings popup. Fully on-device,
 no cloud, no accounts.
 
@@ -74,6 +75,29 @@ only, when you open the app and around each dictation. To also send the
 phone's recordings to your archive, turn on **Keep recordings** below it.
 
 `android/` here is the old Squelch for Android, no longer updated.
+
+## Nullspace on the desktop
+
+Nullspace has a Linux app too (AUR `nullspace`), built on Squelch: Squelch
+does the speech and reads the key, Nullspace does the rest. With both
+installed and Nullspace running, the trigger key does what the phone's
+Essential key does:
+
+| Press | Does |
+|---|---|
+| Hold | Dictation, as always |
+| Tap | Captures the screen and its text into your Nullspace list; a card shows it, and holding the key while it shows adds a voice note about it |
+| Tap, then hold | A voice note |
+| Double tap | Opens Nullspace |
+
+Squelch's tray icon and tap card step aside while Nullspace runs, and come
+back when you quit it. Nullspace's tray menu has a **Dictation** entry that opens these settings. Squelch on its own is unchanged.
+
+How they talk: Nullspace listens on `$XDG_RUNTIME_DIR/nullspace-<uid>`.
+squelch-ptt sends it `capture`, `open`, `note-start {"about": …}` and
+`note-end {"about": …, "text": …}` (a voice note's transcript is handed
+over instead of typed), and reads `nullspace-<uid>-card` for the
+screenshot a hold would be a note about.
 
 ## Install (Arch)
 
