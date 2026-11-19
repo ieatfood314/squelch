@@ -17,7 +17,7 @@ optdepends=('aspell-en: learn your vocabulary and mishearings'
             'kanata: stop the trigger key doing its own job too')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "whisper.cpp::git+https://github.com/ggml-org/whisper.cpp.git#commit=0c7be696371069e0baa2515ed7aa08d5a5473aa6")
-sha256sums=('2cf1c263767bef41997e82775fcebd097e54126d01825aa5243b5d7443b146ad'
+sha256sums=('7db127986dc8d792c5dc04c698334d5a42299a4333b5932051296654747ae678'
             'SKIP')
 options=('!debug')
 
