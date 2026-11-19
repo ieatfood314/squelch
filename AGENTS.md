@@ -8,6 +8,9 @@ The README covers what squelch does and its file layout. This file covers where 
 - **The sync hub runs on nas** (`squelch-sync-server` user unit, a copy of `src/squelch-sync-server` at `~/.local/bin/squelch-sync-server`, served as https://squelch.dwelf-sirius.ts.net). When that file changes: `cp src/squelch-sync-server ~/.local/bin/ && systemctl --user restart squelch-sync-server`.
 - **Android builds on nas** with `~/.local/android-toolchain` and the signing key in `~/.config/squelch-android/`. Gradle uses about 3 GB; `release.sh` stops its daemon when done, so do the same after any other Gradle run (with `JAVA_HOME=~/.local/android-toolchain/jdk17`, since nas has no system Java).
 
+## Dictation speed
+Transcription must never take more than 1 second per 50 words, on every device (mars and regolith, and the phone through Nullspace). Aidan set this rule on 2026-11-19. Check it in the logs (`transcribed in Xs` from squelch-ptt and the parakeet server). Anything that runs between letting go of the key and the text going in gets a hard deadline and is skipped when it misses it; guess-start gets 0.6 s (`GUESS_WAIT_S`), on Groq direct through `llm-fast.json`. A change that makes dictation slower needs Aidan's OK first.
+
 ## Shipping the desktop app (AUR)
 Squelch ships as the AUR package `squelch`, built from GitHub tag tarballs. Never hand-copy files into `/usr`; that drifted from the repo before 0.6.0. Releases are cut from main, so merge a feature branch before tagging; 0.8.0 shipped without the `live-typing` branch that regolith had been trying. To try a branch on regolith, stop the squelch-ptt service first: a second squelch-ptt run by hand next to it answers every hold too, which doubles every dictation (this happened 2026-11-07 to 11-08). Run from `~/repos/squelch` on nas:
 
