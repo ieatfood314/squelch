@@ -3923,9 +3923,14 @@ def utterance_worker(jobs):
                 live.halt()
             utt = {}
             if note is not None:
-                text = process_utterance(rec_path, max_s=cap_s, source=source,
-                                         info_out=utt, cut=cut)
-                end_note(note, text)
+                text = ""
+                try:
+                    text = process_utterance(rec_path, max_s=cap_s,
+                                             source=source, info_out=utt,
+                                             cut=cut)
+                finally:
+                    # always, or Nullspace's card waits for it
+                    end_note(note, text)
                 continue
             text = process_utterance(rec_path, max_s=cap_s, source=source,
                                      info_out=utt,
@@ -4056,6 +4061,10 @@ def end_hold(rec, jobs):
         recover_mic_async("short capture")
     elif held < MIN_HOLD_S:
         log(f"tap ({held:.2f}s), ignoring")
+        note = rec["note"]
+        if note is not None and note.get("about") is None:
+            # a second press let go just after it became a hold: a double
+            nullspace_send("open")
     if wedged or held < MIN_HOLD_S:
         drop_hold(rec)
         return
