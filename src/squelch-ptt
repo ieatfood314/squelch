@@ -3790,9 +3790,12 @@ class Edits:
 # whether you kept it).
 
 LLM_FALLBACK_FILE = os.path.expanduser("~/.config/squelch/llm-fallback.json")
+# Same format, tried first for the guess: an endpoint that answers in well
+# under GUESS_WAIT_S (Groq direct, say), since the dictation waits on it.
+LLM_FAST_FILE = os.path.expanduser("~/.config/squelch/llm-fast.json")
 OPENROUTER_KEY_FILE = os.path.expanduser("~/.config/squelch/openrouter.key")
 OPENROUTER_MODEL_FILE = os.path.expanduser("~/.config/squelch/openrouter.model")
-GUESS_WAIT_S = 4.0     # the dictation goes in without a guess after this
+GUESS_WAIT_S = 0.6     # the dictation goes in without a guess after this
 GUESS_MAX_WORDS = 5    # words a guess may add
 GUESS_PROMPT = """A speech-to-text recording started late: the speaker was \
 already talking, so the first word or few words of what they said are \
@@ -3822,18 +3825,19 @@ FIRST_NOTE_UNSURE = ("The recognizer was unsure of the first word heard, "
 
 
 def llm_endpoints():
-    """(base url, key, model): llm-fallback.json, then OpenRouter's last
-    working free model."""
+    """(base url, key, model): llm-fast.json, llm-fallback.json, then
+    OpenRouter's last working free model."""
     out = []
-    try:
-        with open(LLM_FALLBACK_FILE) as f:
-            cfg = json.load(f)
-        with open(os.path.expanduser(cfg["key_file"])) as f:
-            key = f.read().strip()
-        if cfg.get("url") and cfg.get("model") and key:
-            out.append((cfg["url"].rstrip("/"), key, cfg["model"]))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        pass
+    for path in (LLM_FAST_FILE, LLM_FALLBACK_FILE):
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+            with open(os.path.expanduser(cfg["key_file"])) as f:
+                key = f.read().strip()
+            if cfg.get("url") and cfg.get("model") and key:
+                out.append((cfg["url"].rstrip("/"), key, cfg["model"]))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
     try:
         with open(OPENROUTER_KEY_FILE) as f:
             key = f.read().strip()
@@ -3865,7 +3869,7 @@ def ask_llm(prompt, wait_s):
     deadline = time.time() + wait_s
     for url, key, model in llm_endpoints():
         left = deadline - time.time()
-        if left < 0.5:
+        if left < min(0.5, wait_s / 2):
             break
         try:
             req = urllib.request.Request(
@@ -3877,7 +3881,9 @@ def ask_llm(prompt, wait_s):
                 headers={"Authorization": "Bearer " + key,
                          "Content-Type": "application/json",
                          "HTTP-Referer": "https://localhost/squelch",
-                         "X-Title": "Squelch"})
+                         "X-Title": "Squelch",
+                         # Groq's Cloudflare front refuses Python-urllib
+                         "User-Agent": "Squelch"})
             with urllib.request.urlopen(req, timeout=left) as r:
                 res = json.load(r)
             msg = (res.get("choices") or [{}])[0].get("message") or {}

@@ -242,11 +242,14 @@ If you were already talking when you pressed the key, the clip reaches
 back to the pause before you started, up to 5 seconds (the mic stays
 open, so the words are there). If you'd been talking even longer, the
 start is gone, and an LLM guesses the missing words from the rest and the
-text before the cursor (the `llm-fallback.json` endpoint, or OpenRouter).
-Parakeet reads a clipped word as whichever whole word fits the sentence,
-so the guess may replace or drop the first word heard, and is told when
-Parakeet was unsure of it. It waits up to 4 s for that, and only for those
-clips.
+text before the cursor (`llm-fast.json` if you made one, else the
+`llm-fallback.json` endpoint, or OpenRouter). Parakeet reads a clipped
+word as whichever whole word fits the sentence, so the guess may replace
+or drop the first word heard, and is told when Parakeet was unsure of it.
+It waits up to 0.6 s for that, and only for those clips; past that the
+text goes in as heard. `llm-fast.json` has the same format as
+`llm-fallback.json` and is for an endpoint that answers well inside that,
+such as Groq (`https://api.groq.com/openai/v1`) with `qwen/qwen3.8-27b`.
 
 Music (any MPRIS player) pauses while you hold the trigger and resumes on
 release, so it never bleeds into the mic.
