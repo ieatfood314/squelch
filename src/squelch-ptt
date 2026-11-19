@@ -512,7 +512,7 @@ def learn_mishearings(texts):
         add_mishearings(auto)
         for term, heard in auto:
             log(f"learned: {heard!r} -> {term}")
-        notify_stt("Squelch learned a word",
+        notify_stt(f"{BRAND} learned a word",
                    ", ".join(f"{h} → {t}" for t, h in auto))
     if review:
         with open(LEARNED_FILE + ".lock", "w") as lock:
@@ -560,7 +560,7 @@ def notify_stt(summary, body="", urgency="low"):
         return
     _last_notify[summary] = now
     try:
-        subprocess.run(["notify-send", "-a", "Squelch", "-u", urgency,
+        subprocess.run(["notify-send", "-a", BRAND, "-u", urgency,
                         summary, body],
                        timeout=5, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
@@ -1873,8 +1873,8 @@ class MicTap:
             old = self.proc
             cmd = ["pw-record", "--raw", "--rate", str(SR), "--channels",
                    str(MIC_CHANNELS), "--format", "s16", "--latency", "50ms",
-                   "-P", "{ application.name = Squelch, "
-                         "node.description = \"Squelch dictation\""
+                   "-P", f"{{ application.name = {BRAND}, "
+                         f"node.description = \"{BRAND} dictation\""
                          + (", node.dont-reconnect = true" if target else "")
                          + " }", "-"]
             if target:
@@ -2203,7 +2203,7 @@ class Keyboards:
 def notify_engine_down():
     if engine_available():
         return False
-    notify_stt("Squelch paused",
+    notify_stt(f"{BRAND} paused",
                "Models are unloaded while a game is fullscreen."
                if gaming() else "Speech engine isn't running.")
     return True
@@ -2330,6 +2330,10 @@ _hold_ids = iter(range(1, 1 << 62))
 # press to capture the screen, press then hold for a voice note, double
 # press to open Nullspace. A hold while a screenshot's card is showing is a
 # note about that screenshot. The tray leaves taps to this loop then.
+# Nullspace's package carries this engine (and replaces the squelch package),
+# so there the name people see is Nullspace's.
+BRAND = "Nullspace" if os.path.exists("/usr/bin/nullspace-desktop") else "Squelch"
+
 NULLSPACE_SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
                                 f"nullspace-{os.getuid()}")
 # holds the uid of the screenshot whose card is showing

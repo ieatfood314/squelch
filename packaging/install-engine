@@ -1,0 +1,33 @@
+#!/bin/bash
+# Install the dictation engine into a package root. Run from the source tree:
+#   packaging/install-engine <pkgdir> <whisper.cpp build dir> [--no-launcher]
+# Squelch's PKGBUILD uses it, and so does Nullspace's (which carries this
+# engine and replaces the squelch package), so the two can't drift apart.
+# --no-launcher leaves out the Squelch app-menu entry: inside Nullspace,
+# dictation settings are opened from Nullspace's own.
+set -e
+pkgdir=$1 build=$2 launcher=1
+[ "$3" = --no-launcher ] && launcher=
+[ -n "$pkgdir" ] && [ -d "$build/bin" ] || { echo "usage: $0 <pkgdir> <build dir> [--no-launcher]" >&2; exit 2; }
+
+install -Dm755 "$build/bin/whisper-server" "$build/bin/whisper-cli" \
+  "$build/bin/parakeet-cli" -t "$pkgdir/usr/bin/"
+install -d "$pkgdir/usr/lib/"
+for f in "$build/bin"/libwhisper.so* "$build/bin"/libparakeet.so* \
+         "$build/bin"/libggml*.so*; do
+  [ -e "$f" ] || continue
+  cp -d "$f" "$pkgdir/usr/lib/$(basename "$f")"
+done
+chmod 755 "$pkgdir"/usr/lib/lib*.so*
+install -Dm755 src/squelch src/squelch-ptt src/squelch-parakeet-server \
+  src/squelch-tray src/squelch-vram src/squelch-setup-models \
+  src/squelch-mic-reset src/squelch-sync src/squelch-sync-server \
+  -t "$pkgdir/usr/bin/"
+install -Dm644 systemd/*.service systemd/*.timer systemd/*.path \
+  -t "$pkgdir/usr/lib/systemd/user/"
+install -Dm644 systemd/system/squelch-mic-reset@.service \
+  -t "$pkgdir/usr/lib/systemd/system/"
+install -Dm644 polkit/50-squelch.rules -t "$pkgdir/usr/share/polkit-1/rules.d/"
+if [ -n "$launcher" ]; then
+  install -Dm644 desktop/squelch.desktop -t "$pkgdir/usr/share/applications/"
+fi

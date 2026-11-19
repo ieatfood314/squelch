@@ -78,10 +78,11 @@ phone's recordings to your archive, turn on **Keep recordings** below it.
 
 ## Nullspace on the desktop
 
-Nullspace has a Linux app too (AUR `nullspace`), built on Squelch: Squelch
-does the speech and reads the key, Nullspace does the rest. With both
-installed and Nullspace running, the trigger key does what the phone's
-Essential key does:
+Nullspace has a Linux app too (AUR `nullspace`) with Squelch's engine
+inside: the `nullspace` package replaces this one, and everything you see
+says Nullspace. Squelch stays for when you want dictation and nothing else.
+With Nullspace running, the trigger key does what the phone's Essential key
+does:
 
 | Press | Does |
 |---|---|
@@ -90,8 +91,7 @@ Essential key does:
 | Tap, then hold | A voice note |
 | Double tap | Opens Nullspace |
 
-Squelch's tray icon and tap card step aside while Nullspace runs, and come
-back when you quit it. Nullspace's tray menu has a **Dictation** entry that opens these settings. Squelch on its own is unchanged.
+Nullspace's tray menu has a **Dictation** entry that opens these settings.
 
 How they talk: Nullspace listens on `$XDG_RUNTIME_DIR/nullspace-<uid>`.
 squelch-ptt sends it `capture`, `open`, `note-start {"about": …}` and

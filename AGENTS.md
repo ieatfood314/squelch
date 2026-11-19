@@ -23,6 +23,8 @@ Squelch ships as the AUR package `squelch`, built from GitHub tag tarballs. Neve
 
 regolith also pulls AUR releases through yay on its own, so a reinstall of the same version is expected.
 
+Since 2026-11-19 regolith and mars run the engine through the `nullspace` package, not `squelch`, so steps 5 to 7 go through a Nullspace release instead: bump `_squelch` in the nullspace repo's `desktop/PKGBUILD` and follow its AGENTS.md (Desktop, Shipping). Build the squelch package (steps 1 to 4) only to publish it for people who want dictation alone; don't install it on those two, since it would replace Nullspace's engine.
+
 ## Nullspace, the phone side
 Retired 2026-11-11: the Android app moved into Uplink, renamed Nullspace in November 2026 (`~/repos/uplink` on nas, GitHub `ieatfood314/nullspace`), so make phone changes there. Squelch and Nullspace are separate products, promoted separately, that work together through the sync hub. So:
 
@@ -30,7 +32,7 @@ Retired 2026-11-11: the Android app moved into Uplink, renamed Nullspace in Nove
 - **Keep the hub's API compatible.** Nullspace's Words sync calls `/v1/sync`, `/v1/archive` and `/v1/corrections` (the README's "The hub's API" table). Add fields rather than rename or remove them; phones update on their own schedule.
 - **Keep the README's Phone section current.** It's how Squelch users find Nullspace and set up the pairing.
 
-- **Nullspace on the desktop** (`desktop/` in that repo, AUR `nullspace`, which depends on `squelch`) gets the trigger key's taps from squelch-ptt over its socket: `Gestures`, `note_for` and `end_note` in squelch-ptt, `nullspace_on` in squelch-tray (which hides its icon and ignores taps while Nullspace answers). The README's "Nullspace on the desktop" section has the protocol; change it on both sides. Without Nullspace running nothing here changes, so Squelch alone stays a dictation-only product.
+- **Nullspace on the desktop** (`desktop/` in that repo, AUR `nullspace`). Its package carries this engine and replaces `squelch` (provides/conflicts): its PKGBUILD pins a Squelch tag (`_squelch`) and runs `packaging/install-engine ... --no-launcher`, so after a Squelch release bump `_squelch` there and release Nullspace too, and keep its depends and whisper.cpp commit in step with this PKGBUILD. With `/usr/bin/nullspace-desktop` present the engine says `BRAND` = Nullspace everywhere people see it (notifications, the mixer stream, settings) and squelch-tray never shows its icon. It gets the trigger key's taps from squelch-ptt over its socket: `Gestures`, `note_for` and `end_note` in squelch-ptt, `nullspace_on` in squelch-tray (which hides its icon and ignores taps while Nullspace answers). The README's "Nullspace on the desktop" section has the protocol; change it on both sides. Without Nullspace running nothing here changes, so Squelch alone stays a dictation-only product.
 
 The old Android release steps below are kept for reference.
 

@@ -1,6 +1,6 @@
 # Maintainer: Aidan Heeney <aidan.heeney@proton.me>
 pkgname=squelch
-pkgver=0.11.1
+pkgver=0.12.0
 pkgrel=1
 pkgdesc='Push-to-talk speech-to-text on GPU: Parakeet/Whisper, mic-array beamforming, Menu-key dictation'
 arch=('x86_64')
@@ -29,30 +29,8 @@ build() {
 }
 
 package() {
-  install -Dm755 "$srcdir/build/bin/whisper-server" \
-    "$srcdir/build/bin/whisper-cli" "$srcdir/build/bin/parakeet-cli" \
-    -t "$pkgdir/usr/bin/"
-  install -d "$pkgdir/usr/lib/"
-  for f in "$srcdir/build/bin"/libwhisper.so* \
-           "$srcdir/build/bin"/libparakeet.so* \
-           "$srcdir/build/bin"/libggml*.so*; do
-    [ -e "$f" ] || continue
-    cp -d "$f" "$pkgdir/usr/lib/$(basename "$f")"
-  done
-  chmod 755 "$pkgdir"/usr/lib/lib*.so*
   cd "$srcdir/$pkgname-$pkgver"
-  install -Dm755 src/squelch src/squelch-ptt src/squelch-parakeet-server \
-    src/squelch-tray src/squelch-vram src/squelch-setup-models \
-    src/squelch-mic-reset src/squelch-sync src/squelch-sync-server \
-    -t "$pkgdir/usr/bin/"
-  install -Dm644 systemd/*.service systemd/*.timer systemd/*.path \
-    -t "$pkgdir/usr/lib/systemd/user/"
-  install -Dm644 systemd/system/squelch-mic-reset@.service -t \
-    "$pkgdir/usr/lib/systemd/system/"
-  install -Dm644 polkit/50-squelch.rules -t \
-    "$pkgdir/usr/share/polkit-1/rules.d/"
-  install -Dm644 desktop/squelch.desktop -t \
-    "$pkgdir/usr/share/applications/"
+  packaging/install-engine "$pkgdir" "$srcdir/build"
   install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
   install -Dm644 README.md kanata/snippet.kbd -t \
     "$pkgdir/usr/share/doc/$pkgname/"

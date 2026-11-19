@@ -1188,7 +1188,7 @@ class EnginePopup(QWidget):
         inner.setContentsMargins(16, 16, 16, 16)
         inner.setSpacing(8)
 
-        inner.addWidget(label("Squelch", "title"))
+        inner.addWidget(label(BRAND, "title"))
         self.radios = {}
         for key, text in ENGINES:
             rb = QRadioButton(text)
@@ -1298,7 +1298,7 @@ class SettingsWindow(QWidget):
         super().__init__(
             None,
             Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
-        self.setWindowTitle("Squelch")
+        self.setWindowTitle("Dictation" if BRAND == "Nullspace" else "Squelch")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.on_engine = on_engine
         self.on_filters = on_filters
@@ -2203,6 +2203,10 @@ class SettingsWindow(QWidget):
 # The Nullspace desktop app, when it runs, is the face of Squelch: it has the
 # tray icon, and taps of the trigger key are its gestures (squelch-ptt sends
 # them). This tray then only draws the pill and opens Settings when asked.
+# Nullspace's package carries this engine (and replaces the squelch package),
+# so there the name people see is Nullspace's.
+BRAND = "Nullspace" if os.path.exists("/usr/bin/nullspace-desktop") else "Squelch"
+
 NULLSPACE_SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
                                 f"nullspace-{os.getuid()}")
 
@@ -2503,8 +2507,8 @@ def main():
     token = os.environ.get("XDG_ACTIVATION_TOKEN", "")
     if tell_running_tray(f"settings {token}" if want_settings else "ping"):
         return
-    app.setApplicationName("Squelch")
-    app.setDesktopFileName("squelch")
+    app.setApplicationName(BRAND)
+    app.setDesktopFileName(BRAND.lower())
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(app_style(read_appearance()))
 
@@ -2512,7 +2516,7 @@ def main():
     if icon.isNull():
         icon = fallback_icon()
     tray = QSystemTrayIcon(icon)
-    tray.setToolTip("Squelch")
+    tray.setToolTip(BRAND)
 
     menu = QMenu()
     group = QActionGroup(menu)
@@ -2546,7 +2550,7 @@ def main():
         cur = read_engine()
         for key, a in actions.items():
             a.setChecked(key == cur)
-        tray.setToolTip(f"Squelch · {ENGINE_NAMES[cur]}")
+        tray.setToolTip(f"{BRAND} · {ENGINE_NAMES[cur]}")
 
     def on_show():
         refresh()
@@ -2609,7 +2613,9 @@ def main():
     app.watcher = TriggerWatcher(on_menu_tap)  # keep it alive
     app.listener = LaunchListener(on_launch)
     def follow_nullspace():
-        tray.setVisible(not nullspace_on())
+        # Inside Nullspace its own tray is the only one; this one keeps
+        # the pill and the dictation settings.
+        tray.setVisible(BRAND != "Nullspace" and not nullspace_on())
 
     ns_timer = QTimer()
     ns_timer.timeout.connect(follow_nullspace)

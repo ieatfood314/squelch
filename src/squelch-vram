@@ -19,6 +19,10 @@ import subprocess
 import threading
 import time
 
+# Nullspace's package carries this engine (and replaces the squelch package),
+# so there the name people see is Nullspace's.
+BRAND = "Nullspace" if os.path.exists("/usr/bin/nullspace-desktop") else "Squelch"
+
 ENGINE_FILE = os.path.expanduser("~/.config/squelch/engine")
 STATE_FILE = os.path.expanduser("~/.config/squelch/state.json")
 ENGINES_ENV = os.path.expanduser("~/.config/squelch/engines.env")
@@ -86,7 +90,7 @@ def log(*a):
 
 def notify(summary, body=""):
     try:
-        subprocess.run(["notify-send", "-a", "Squelch", "-u", "low",
+        subprocess.run(["notify-send", "-a", BRAND, "-u", "low",
                         summary, body],
                        timeout=5, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
@@ -271,11 +275,11 @@ def main():
                 gaming = bool(apps)
                 if gaming:
                     log("game fullscreen:", ", ".join(apps))
-                    notify("Squelch paused",
+                    notify(f"{BRAND} paused",
                            f"Models unloaded for {apps[0]}.")
                 else:
                     log("game gone")
-                    notify("Squelch resumed",
+                    notify(f"{BRAND} resumed",
                            f"{ENGINE_NAMES[current_engine()]} is loading.")
 
             want = None if gaming else current_engine()
