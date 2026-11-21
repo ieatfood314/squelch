@@ -149,14 +149,21 @@ pinned by SHA-256.
 
 ### Trigger key
 
-Any key works: Settings → General → Change, then press it. Read straight
-from the keyboard, the key also keeps doing its normal job (Caps Lock
-still toggles caps), so pick one you don't otherwise use, like Menu,
-Scroll Lock, Pause or F13–F24. To stop the key's own action too, bind it
-with [kanata](https://github.com/jtroo/kanata) instead: add the tap-hold
-from [kanata/snippet.kbd](kanata/snippet.kbd), check it with
-`kanata --check` and restart kanata. Once that binding is in your kanata
-config, Change moves it to the new key for you.
+Any key works: Settings → General → Change, then press it. With
+[kanata](https://github.com/jtroo/kanata), choosing Shift, Ctrl, Alt or Meta
+binds it as Squelch's own F23/F24 key, so applications never see that modifier
+held.
+Other keys keep their normal job (Caps Lock still toggles caps), so pick one
+you don't otherwise use, like Menu, Scroll Lock, Pause or F13–F24. To stop
+another key's action too, add the tap-hold from
+[kanata/snippet.kbd](kanata/snippet.kbd), check it with `kanata --check` and
+restart kanata. Change moves an existing binding to the new key for you.
+
+Kanata is optional. Without it, a modifier trigger's live words wait until
+you let go rather than becoming shortcuts such as Ctrl+Shift+I. If Shift,
+Ctrl, Alt, AltGr or Meta is still held after dictation ends, Squelch waits
+half a second, then leaves the text on the clipboard instead of sending a
+modified paste chord.
 
 ## Usage
 

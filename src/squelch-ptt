@@ -1663,8 +1663,8 @@ def current_keymap():
 
 
 def key_events(text, table):
-    """Split text into runs: ("keys", [ydotool events]) for what the
-    layout can type, ("paste", str) for the rest (é, —, emoji)."""
+    """Split text into (kind, events-or-text, raw text) runs: "keys" for
+    what the layout can type, "paste" for the rest (é, —, emoji)."""
     runs = []
     for ch in text:
         if ch == "\n":
@@ -1676,20 +1676,24 @@ def key_events(text, table):
                 ev = [f"{KEY_LEFTSHIFT}:1", *ev, f"{KEY_LEFTSHIFT}:0"]
         else:
             if runs and runs[-1][0] == "paste":
-                runs[-1] = ("paste", runs[-1][1] + ch)
+                kind, val, raw = runs[-1]
+                runs[-1] = (kind, val + ch, raw + ch)
             else:
-                runs.append(("paste", ch))
+                runs.append(("paste", ch, ch))
             continue
         if runs and runs[-1][0] == "keys":
             runs[-1][1].extend(ev)
+            runs[-1] = ("keys", runs[-1][1], runs[-1][2] + ch)
         else:
-            runs.append(("keys", ev))
+            runs.append(("keys", ev, ch))
     return runs
 
 
 def ydotool_keys(events):
     if not events:
         return True
+    if shortcut_mods():
+        return False  # a modifier arrived after type_text's first check
     try:
         r = subprocess.run(["ydotool", "key", "-d", str(TYPE_DELAY_MS),
                             *events], capture_output=True, text=True,
@@ -1704,16 +1708,41 @@ def ydotool_keys(events):
     return False
 
 
+SHORTCUT_MODS = {"shift", "ctrl", "alt", "altgr", "meta"}
+MODIFIER_WAIT_S = 0.5
+
+
+def shortcut_mods():
+    return EDITS.mods & SHORTCUT_MODS if EDITS is not None else set()
+
+
+def modifiers_clear(wait_s):
+    """Wait briefly for safe, unmodified output; False if still held."""
+    deadline = time.monotonic() + wait_s
+    while shortcut_mods():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
 def type_text(text, table=None):
     """Type text through the active layout; characters it has no key for
-    are pasted. False if typing failed."""
+    are pasted. False if typing failed. Never turn a held modifier plus a
+    letter (Ctrl+Shift+I in Electron) into an application shortcut."""
+    if shortcut_mods():
+        return paste_text(text)
     table = current_keymap() if table is None else table
-    for kind, val in key_events(text, table):
-        if kind == "keys":
-            if not ydotool_keys(val):
-                return False
-        else:
-            paste_text(val)
+    runs = key_events(text, table)
+    for i, (kind, val, raw) in enumerate(runs):
+        if shortcut_mods():
+            return paste_text("".join(run[2] for run in runs[i:]))
+        ok = ydotool_keys(val) if kind == "keys" else paste_text(val)
+        if not ok:
+            # Never lose the uninserted suffix, even if a modifier arrived
+            # after the first check or only part of this run went in.
+            clipboard_only("".join(run[2] for run in runs[i:]))
+            return False
     return True
 
 
@@ -1827,8 +1856,12 @@ def paste_text(text):
     Keycode injectors (ydotool type / wtype) emit physical keycodes, which the
     compositor maps through the active layout — under Colemak that mangles
     text. Shift+Insert uses no letter keys, so it pastes correctly under any
-    layout. The previous clipboard content is saved and restored.
+    layout. The previous clipboard content is saved and restored. If a modifier
+    stays held, leave the text copied rather than send a modified paste chord.
     """
+    if not modifiers_clear(MODIFIER_WAIT_S):
+        clipboard_only(text)
+        return False
     fix_wayland_env()
     wclass = active_window_class()
     LAST_APP["class"] = wclass
@@ -1852,6 +1885,9 @@ def paste_text(text):
                    urgency="normal")
         return False
     time.sleep(0.25)
+    if shortcut_mods():
+        clipboard_only(text)  # a modifier arrived during clipboard setup
+        return False
     try:
         r = subprocess.run(["ydotool", "key", *chord],
                            capture_output=True, text=True, timeout=30)
@@ -2353,9 +2389,11 @@ class Keyboards:
                 keys = d.capabilities().get(evdev.ecodes.EV_KEY, [])
             except OSError:
                 continue
-            # ydotoold's virtual keyboard is our own paste
+            # ydotoold's virtual keyboard is our own paste. Keep secondary
+            # keyboards too: their modifiers still shape our typed letters.
             if not override and ("ydotoold" in d.name.lower() or
-                                 (code not in keys and F24 not in keys)):
+                                 (code not in keys and F24 not in keys
+                                  and not set(KEY_MODS).intersection(keys))):
                 d.close()
                 self.skipped.add(path)
                 continue
@@ -2373,13 +2411,17 @@ class Keyboards:
                 d.close()
             except OSError:
                 pass
+            if EDITS is not None:
+                EDITS.device_lost(path)
 
     def close(self):
-        for d in self.devs.values():
+        for path, d in self.devs.items():
             try:
                 d.close()
             except OSError:
                 pass
+            if EDITS is not None:
+                EDITS.device_lost(path)
         self.devs.clear()
         self.skipped.clear()
 
@@ -2925,6 +2967,11 @@ class LiveTyper:
             self.put(target[n:])
 
     def put(self, words):
+        # A modifier trigger stays down during live typing. Leave these words
+        # untyped and retry them later rather than send Ctrl/Alt/Meta+letter;
+        # with no live words, finish() inserts the full transcript on release.
+        if shortcut_mods():
+            return
         text = " ".join(words) + " "
         if self.dry:
             log(f"DRYRUN live would type: {text!r}")
@@ -2952,8 +2999,10 @@ class LiveTyper:
         rest = " ".join(rest) + " "
         if self.dry:
             log(f"DRYRUN live would finish with: {rest!r}")
-        elif self.broken or not type_text(rest, self.table):
+        elif self.broken:
             clipboard_only(rest)
+        elif not type_text(rest, self.table):
+            pass  # type_text leaves the exact uninserted suffix on the clipboard
         else:
             log("typed the rest:", rest[:80])
             self.out += rest
@@ -3765,6 +3814,7 @@ class Edits:
         self.wake_r, self.wake_w = os.pipe()
         os.set_blocking(self.wake_r, False)
         self.mods = set()
+        self.mod_codes = set()  # physical codes: left and right stay independent
         self.press = None      # (button, when) while one is down
         self.travel = 0        # pointer travel since that press
         self.touch_clicked = False
@@ -3839,14 +3889,22 @@ class Edits:
         if why:
             self.finish(why)
 
-    def on_key(self, code, value):
+    def device_lost(self, device):
+        """A disconnected keyboard no longer holds any modifier."""
+        self.mod_codes = {(dev, code) for dev, code in self.mod_codes
+                          if dev != device}
+        self.mods = {KEY_MODS[code] for _dev, code in self.mod_codes}
+
+    def on_key(self, code, value, device=None):
         """Every key event from the keyboards (main loop)."""
         mod = KEY_MODS.get(code)
         if mod:
+            key = (device, code)
             if value:
-                self.mods.add(mod)
+                self.mod_codes.add(key)
             else:
-                self.mods.discard(mod)
+                self.mod_codes.discard(key)
+            self.mods = {KEY_MODS[c] for _dev, c in self.mod_codes}
             return
         if self.keys is None:
             return
@@ -4518,8 +4576,10 @@ def main():
                     EDITS.on_motion(ev.value)  # a mouse that has keys too
                 if ev.type != evdev.ecodes.EV_KEY:
                     continue
-                if ev.code not in (F24, kbd.code):
-                    EDITS.on_key(ev.code, ev.value)
+                # Modifiers are tracked even when one is the trigger: live
+                # typing must not turn its held Ctrl/Alt/Meta into a shortcut.
+                if ev.code not in (F24, kbd.code) or ev.code in KEY_MODS:
+                    EDITS.on_key(ev.code, ev.value, path)
                 if ev.code == F23:
                     # A kanata tap: down and up together. Pressed again soon
                     # after a tap and held, kanata repeats the tap (F23

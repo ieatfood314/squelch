@@ -714,6 +714,16 @@ def _kanata_forms(text):
 TRIGGER_RE = re.compile(r"\(\s*tap-hold\s+\d+\s+\d+\s+f23\s+f24\s*\)")
 
 
+def trigger_aliases(forms):
+    aliases = set()
+    for name, items in forms:
+        if name == "defalias":
+            for k in range(0, len(items) - 1, 2):
+                if TRIGGER_RE.fullmatch(items[k + 1][0]):
+                    aliases.add("@" + items[k][0])
+    return aliases
+
+
 def find_trigger(text):
     """(defsrc key the Squelch tap-hold sits on, its (start, end) span in
     the text, all defsrc keys), or None."""
@@ -721,12 +731,7 @@ def find_trigger(text):
     src = next((items for name, items in forms if name == "defsrc"), None)
     if src is None:
         return None
-    aliases = set()
-    for name, items in forms:
-        if name == "defalias":
-            for k in range(0, len(items) - 1, 2):
-                if TRIGGER_RE.fullmatch(items[k + 1][0]):
-                    aliases.add("@" + items[k][0])
+    aliases = trigger_aliases(forms)
     for name, items in forms:
         if name != "deflayer" or not items:
             continue
@@ -750,6 +755,89 @@ def kanata_trigger():
     except OSError:
         return None, None
     return find_trigger(text), text
+
+
+MODIFIER_CODES = {evdev.ecodes.KEY_LEFTSHIFT, evdev.ecodes.KEY_RIGHTSHIFT,
+                  evdev.ecodes.KEY_LEFTCTRL, evdev.ecodes.KEY_RIGHTCTRL,
+                  evdev.ecodes.KEY_LEFTALT, evdev.ecodes.KEY_RIGHTALT,
+                  evdev.ecodes.KEY_LEFTMETA, evdev.ecodes.KEY_RIGHTMETA}
+SQUELCH_TAP_HOLD = "(tap-hold 200 250 f23 f24)"
+
+
+def bind_kanata_modifier(text, code):
+    """(new config, "") with a modifier as Squelch's dedicated trigger, or
+    (None, why not). Add it to defsrc when needed, keeping every layer's slots
+    aligned; never replace a custom action."""
+    forms = _kanata_forms(text)
+    src = next((items for name, items in forms if name == "defsrc"), None)
+    layers = [items for name, items in forms if name == "deflayer" and items]
+    base = next((items for items in layers if items[0][0] == "base"), None)
+    if not src or base is None:
+        return None, "kanata config has no defsrc/base layer"
+    aliases = {name for name, c in KANATA_CODES.items() if c == code}
+    indices = [i for i, (key, _s, _e) in enumerate(src) if key in aliases]
+    if len(indices) > 1:
+        return None, f"{key_label(code)} appears twice in kanata's defsrc"
+    edits = []
+    if indices:
+        idx = indices[0]
+        actions = base[1:]
+        if idx >= len(actions):
+            return None, "kanata's base layer is shorter than defsrc"
+        action, s, e = actions[idx]
+        if action not in aliases:
+            return None, f"{key_label(code)} already has a custom kanata action"
+        edits.append((s, e, SQUELCH_TAP_HOLD))
+    else:
+        if any(len(items[1:]) != len(src) for items in layers):
+            return None, "kanata's layers don't line up with defsrc"
+        key = KEYS[code][0]
+        edits.append((src[-1][2], src[-1][2], " " + key))
+        for items in layers:
+            actions = items[1:]
+            if not actions:
+                return None, "kanata has an empty layer"
+            action = SQUELCH_TAP_HOLD if items is base else key
+            edits.append((actions[-1][2], actions[-1][2], " " + action))
+    for s, e, value in sorted(edits, reverse=True):
+        text = text[:s] + value + text[e:]
+    return text, ""
+
+
+def move_kanata_modifier(text, found, code):
+    """Move an existing trigger to a modifier already listed in defsrc.
+    Only its pass-through action in the trigger's layer is replaced; the old
+    key becomes ordinary again and every other layer stays untouched."""
+    old, _span, _src_names = found
+    forms = _kanata_forms(text)
+    src = next((items for name, items in forms if name == "defsrc"), None)
+    if src is None:
+        return None, "kanata config has no defsrc"
+    old_aliases = {name for name, c in KANATA_CODES.items()
+                   if c == KANATA_CODES.get(old)}
+    new_aliases = {name for name, c in KANATA_CODES.items() if c == code}
+    old_idx = next((i for i, (key, _s, _e) in enumerate(src)
+                    if key in old_aliases), None)
+    new_idx = next((i for i, (key, _s, _e) in enumerate(src)
+                    if key in new_aliases), None)
+    if old_idx is None or new_idx is None:
+        return None, f"{key_label(code)} isn't in kanata's defsrc"
+    aliases = trigger_aliases(forms)
+    for name, items in forms:
+        actions = items[1:]
+        if (name != "deflayer" or max(old_idx, new_idx) >= len(actions)
+                or not (TRIGGER_RE.fullmatch(actions[old_idx][0])
+                        or actions[old_idx][0] in aliases)):
+            continue
+        new_action, ns, ne = actions[new_idx]
+        if new_action not in new_aliases:
+            return None, f"{key_label(code)} already has a custom kanata action"
+        old_action, os, oe = actions[old_idx]
+        edits = [(os, oe, old), (ns, ne, old_action)]
+        for s, e, value in sorted(edits, reverse=True):
+            text = text[:s] + value + text[e:]
+        return text, ""
+    return None, "couldn't find the current trigger's kanata layer"
 
 
 def read_hotkey_file():
@@ -791,34 +879,12 @@ def trigger_label():
     return key_label(read_hotkey())
 
 
-def apply_hotkey(code):
-    """Make `code` the trigger key. With kanata the Squelch tap-hold moves
-    to that key; without it squelch-ptt reads the key itself.
-    Returns (ok, short message)."""
-    if code in (F23, F24):  # pressed the current kanata trigger
-        return True, "Already set"
-    name = key_label(code)
-    found, text = kanata_trigger()
-    if found is None:
-        if read_hotkey_file() == code:
-            return True, "Already set"
-        try:
-            write_hotkey_file(code)
-        except OSError as ex:
-            return False, f"Write failed: {ex}"
-        return True, f"Trigger is now {name}"
-    old, (s, e), src = found
-    if KANATA_CODES.get(old) == code:
-        write_hotkey_file(code)
-        return True, "Already set"
-    if code not in KEYS:
-        return False, f"kanata can't use {name}"
-    if code in {KANATA_CODES.get(k) for k in src}:
-        return False, f"{name} is already mapped in kanata"
+def save_kanata_hotkey(code, text, name):
+    """Validate and install a new trigger mapping, then restart kanata."""
     backup = KANATA_CFG + ".bak-squelch"
     try:
         shutil.copy(KANATA_CFG, backup)
-        atomic_write(KANATA_CFG, text[:s] + KEYS[code][0] + text[e:])
+        atomic_write(KANATA_CFG, text)
     except OSError as ex:
         return False, f"Write failed: {ex}"
     chk = subprocess.run(["kanata", "--check", "--cfg", KANATA_CFG],
@@ -835,6 +901,44 @@ def apply_hotkey(code):
     if rst.returncode != 0:
         return True, "Saved. Restart kanata to apply"
     return True, f"Trigger is now {name}"
+
+
+def apply_hotkey(code):
+    """Make `code` the trigger key. Move an existing kanata binding, or bind
+    a Shift/Ctrl/Alt/Meta key so it can't modify the dictation it triggers. Without
+    kanata squelch-ptt reads the key itself. Returns (ok, short message)."""
+    if code in (F23, F24):  # pressed the current kanata trigger
+        return True, "Already set"
+    name = key_label(code)
+    found, text = kanata_trigger()
+    if found is None:
+        if text is not None and code in MODIFIER_CODES:
+            updated, why = bind_kanata_modifier(text, code)
+            if updated is None:
+                return False, why
+            return save_kanata_hotkey(code, updated, name)
+        if read_hotkey_file() == code:
+            return True, "Already set"
+        try:
+            write_hotkey_file(code)
+        except OSError as ex:
+            return False, f"Write failed: {ex}"
+        return True, f"Trigger is now {name}"
+    old, (s, e), src = found
+    if KANATA_CODES.get(old) == code:
+        write_hotkey_file(code)
+        return True, "Already set"
+    if code not in KEYS:
+        return False, f"kanata can't use {name}"
+    if code in {KANATA_CODES.get(k) for k in src}:
+        if code in MODIFIER_CODES:
+            updated, why = move_kanata_modifier(text, found, code)
+            if updated is None:
+                return False, why
+            return save_kanata_hotkey(code, updated, name)
+        return False, f"{name} is already mapped in kanata"
+    return save_kanata_hotkey(
+        code, text[:s] + KEYS[code][0] + text[e:], name)
 
 
 # ---------------- models + services ----------------
