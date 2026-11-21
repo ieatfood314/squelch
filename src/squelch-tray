@@ -280,7 +280,8 @@ def read_filters():
         d = {}
     return {"defiller": bool(d.get("defiller", True)),
             "numbers": bool(d.get("numbers", True)),
-            "numbers_all": bool(d.get("numbers_all", False))}
+            "numbers_all": bool(d.get("numbers_all", False)),
+            "tidy": bool(d.get("tidy", True))}
 
 
 def write_filters(flt):
@@ -1388,7 +1389,11 @@ class SettingsWindow(QWidget):
         self.cb_defill = QCheckBox("Remove filler words")
         self.cb_numbers = QCheckBox("Numbers over ten as digits")
         self.cb_all = QCheckBox("All numbers as digits")
-        for cb in (self.cb_defill, self.cb_numbers, self.cb_all):
+        self.cb_tidy = QCheckBox("Tidy repeats and false starts with AI")
+        self.cb_tidy.setToolTip(
+            "Uses your configured LLM; only the dictation's text is sent. "
+            "Guessing a cut-off start and tidying share a 1-second limit.")
+        for cb in (self.cb_defill, self.cb_numbers, self.cb_all, self.cb_tidy):
             cb.toggled.connect(lambda _c: self.filters_changed())
             lay.addWidget(cb)
         lay.addStretch(1)
@@ -1490,7 +1495,8 @@ class SettingsWindow(QWidget):
     def filters_changed(self):
         self.on_filters({"defiller": self.cb_defill.isChecked(),
                          "numbers": self.cb_numbers.isChecked(),
-                         "numbers_all": self.cb_all.isChecked()})
+                         "numbers_all": self.cb_all.isChecked(),
+                         "tidy": self.cb_tidy.isChecked()})
 
     def hotkey_toggle(self):
         if self.hk_capture.active:
@@ -2163,7 +2169,8 @@ class SettingsWindow(QWidget):
         flt = read_filters()
         for cb, name in ((self.cb_defill, "defiller"),
                          (self.cb_numbers, "numbers"),
-                         (self.cb_all, "numbers_all")):
+                         (self.cb_all, "numbers_all"),
+                         (self.cb_tidy, "tidy")):
             cb.blockSignals(True)
             cb.setChecked(flt[name])
             cb.blockSignals(False)

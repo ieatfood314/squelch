@@ -3,8 +3,8 @@
 Hold **Menu**, speak, release — the transcription appears at your cursor in
 well under a second. (With [Nullspace](#nullspace-on-the-desktop) the same
 key also captures the screen and takes voice notes.) Optionally the words are typed while you speak. Tap
-**Menu** for a settings popup. Fully on-device,
-no cloud, no accounts.
+**Menu** for a settings popup. Transcription is fully on-device, with no
+cloud account needed; optional AI polishing uses an endpoint you configure.
 
 - **Fast GPU inference**: Parakeet TDT 0.6B (default, ~0.2 s for 11 s of
   audio; v3 multilingual, or v2 if you only dictate English, which is a
@@ -31,7 +31,8 @@ no cloud, no accounts.
   (optionally all) written as digits, spoken part numbers joined
   ("seven four HCT two seven three" → 74HCT273), custom dictionary with AI-suggested
   mishearings via OpenRouter, and mishearings learned from your own
-  dictation
+  dictation. Optional AI tidying cuts repeated phrases, false starts and
+  self-corrections without summarizing or rewriting your words
 - **Game mode**: models unload once a game has been fullscreen for 10 s and
   reload after. Browsers, video players, the lock screen and Spectacle
   going fullscreen don't count
@@ -165,6 +166,7 @@ config, Change moves it to the new key for you.
 | Engine switch | settings popup, General tab, or right-click tray icon |
 | Trigger key (any key) | settings → General → Change, then press the key |
 | Insertion (paste/type/clipboard-only), type as you speak | settings → General |
+| Filler words, numbers, AI tidying of repeats and false starts | settings → General → Cleanup |
 | Accent color, background opacity, text size, font | settings → Appearance |
 | Speech models (picking one that isn't downloaded yet downloads it) | settings → Setup |
 | Microphone (default: PipeWire's default source) | settings → Setup |
@@ -219,8 +221,11 @@ twice, or fixing punctuation is a `fix`, and the edited text becomes the
 clip's `label`. Adding, dropping or rewording words is a `rewrite`, you
 changing your mind rather than Squelch mishearing, so that clip gets
 `"train": false` and no label, and a model trained on `label`s never learns
-words you didn't say. Clips whose start was cut off (below) aren't trained
-on either, nor are ones where it lost track of the text (`"unsure": true`).
+words you didn't say. An AI-tidied clip is marked `"tidied": true` and isn't
+a training label either: its audio still contains the repeats and false
+starts that were cut. Your later corrections are still recorded. Clips whose
+start was cut off (below) aren't trained on either, nor are ones where it
+lost track of the text (`"unsure": true`).
 
 It sees the text through accessibility (AT-SPI, which Squelch switches on),
 so it catches every edit, mouse ones included, in Qt, GTK and Firefox-based
@@ -250,6 +255,20 @@ It waits up to 0.6 s for that, and only for those clips; past that the
 text goes in as heard. `llm-fast.json` has the same format as
 `llm-fallback.json` and is for an endpoint that answers well inside that,
 such as Groq (`https://api.groq.com/openai/v1`) with `qwen/qwen3.8-27b`.
+
+With **Tidy repeats and false starts with AI** on in Settings → General →
+Cleanup, dictations of at least eight words also get the same tidy pass as
+Nullspace: repeated words and phrases, abandoned sentence starts and
+self-corrections ("on Tuesday, no, Wednesday") are cut, and punctuation and
+capitals are fixed. It uses `llm-fast.json`, `llm-fallback.json` or your
+OpenRouter key, in that order; with none configured, nothing changes. Only
+the dictation's text is sent, never its audio. A guard rejects an answer that
+adds or changes too many words, cuts too much or grows the text, so the
+transcript goes in as heard instead. Guessing a cut-off start and tidying
+share a 1-second limit (the guess gets at most 0.6 s of it); after that the
+text goes in as heard.
+Turn the checkbox off to skip this pass. Dictations whose words were already
+typed live are left alone, since live words are never taken back.
 
 Music (any MPRIS player) pauses while you hold the trigger and resumes on
 release, so it never bleeds into the mic.
