@@ -954,18 +954,80 @@ def current_engine():
         return "parakeet"
 
 
+# whisper.cpp's g_lang at the pinned commit. Regional tags (fr-CA) use their
+# base language; unsupported tags still work for custom words but get no hint.
+WHISPER_LANGUAGE_CODES = set("""
+en zh de es ru ko fr ja pt tr pl ca nl ar sv it id hi fi vi he uk el ms cs ro da hu
+ta no th ur hr bg lt la mi ml cy sk te fa lv bn sr az sl kn et mk br eu is hy ne mn
+bs kk sq sw gl mr pa si km sn yo so af oc ka be tg sd gu am yi lo uz fo ht ps tk nn mt
+sa lb my bo tl mg as tt haw ln ha ba jw su yue
+""".split())
+LANGUAGE_TAG_RE = re.compile(
+    r"^[A-Za-z]{2,3}(?:-[A-Za-z]{3}){0,3}(?:-[A-Za-z]{4})?"
+    r"(?:-(?:[A-Za-z]{2}|\d{3}))?"
+    r"(?:-(?:[A-Za-z0-9]{5,8}|\d[A-Za-z0-9]{3}))*"
+    r"(?:-[0-9A-WY-Za-wy-z](?:-[A-Za-z0-9]{2,8})+)*"
+    r"(?:-[Xx](?:-[A-Za-z0-9]{1,8})+)?$")
+
+
+def canonical_language(raw):
+    """Canonical case for a validated language tag, variants/extensions included."""
+    parts = raw.split("-")
+    out = [parts[0].lower()]
+    i = 1
+    while i < len(parts) and i < 4 and len(parts[i]) == 3 and parts[i].isalpha():
+        out.append(parts[i].lower())  # extlang
+        i += 1
+    if i < len(parts) and len(parts[i]) == 4 and parts[i].isalpha():
+        out.append(parts[i].title())  # script
+        i += 1
+    if i < len(parts) and ((len(parts[i]) == 2 and parts[i].isalpha()) or
+                           (len(parts[i]) == 3 and parts[i].isdigit())):
+        out.append(parts[i].upper())  # region
+        i += 1
+    out += [p.lower() for p in parts[i:]]  # variants, extensions, private use
+    return "-".join(out)
+
+
+def normalize_language(value):
+    """A stored BCP-47 tag, or auto for missing/invalid values."""
+    raw = str(value or "auto").strip().replace("_", "-")
+    if raw.lower() in ("auto", "automatic", "detect automatically"):
+        return "auto"
+    return canonical_language(raw) if LANGUAGE_TAG_RE.fullmatch(raw) else "auto"
+
+
+def whisper_language(value):
+    """The language code whisper.cpp accepts, or None for auto/unsupported."""
+    tag = normalize_language(value)
+    if tag == "auto":
+        return None
+    base = tag.split("-")[0]
+    return base if base in WHISPER_LANGUAGE_CODES else None
+
+
 def text_filters():
     """Which post-processing steps are enabled (toggled in Settings)."""
     try:
         with open(FILTERS_FILE) as f:
             d = json.load(f)
         return (bool(d.get("defiller", True)), bool(d.get("numbers", True)),
-                bool(d.get("numbers_all", False)), bool(d.get("tidy", True)))
+                bool(d.get("numbers_all", False)), bool(d.get("tidy", True)),
+                normalize_language(d.get("language", "auto")))
     except (OSError, ValueError):
-        return True, True, False, True
+        return True, True, False, True, "auto"
 
 
 _dict_cache = {"mtime": 0, "terms": [], "subs": []}
+
+
+def match_pattern(text):
+    pat = re.escape(text)
+    if text[0].isalnum():
+        pat = r"\b" + pat
+    if text[-1].isalnum():
+        pat += r"\b"
+    return pat
 
 
 def load_dictionary():
@@ -990,12 +1052,7 @@ def load_dictionary():
                 m = str(m).strip()
                 if not m:
                     continue
-                pat = re.escape(m)
-                if m[0].isalnum():
-                    pat = r"\b" + pat
-                if m[-1].isalnum():
-                    pat = pat + r"\b"
-                subs.append((re.compile(pat, re.IGNORECASE), term))
+                subs.append((re.compile(match_pattern(m), re.IGNORECASE), term))
     except (OSError, ValueError, AttributeError) as ex:
         log("dictionary load failed:", ex)
         return [], []
@@ -1005,6 +1062,105 @@ def load_dictionary():
 
 def apply_dictionary(text):
     terms, subs = load_dictionary()
+    for rx, term in subs:
+        text = rx.sub(term, text)
+    return text
+
+
+# Unambiguous US forms and their Canadian equivalents. Canadian English keeps
+# -ize/-yze spellings (organize, analyze), so those are deliberately untouched.
+_CANADIAN_SPELLING = dict(pair.split(":") for pair in """
+color:colour colors:colours colored:coloured coloring:colouring
+colorful:colourful colorfully:colourfully colorfulness:colourfulness
+colorless:colourless discolor:discolour discolors:discolours
+discolored:discoloured discoloring:discolouring discoloration:discolouration
+favor:favour favors:favours favored:favoured favoring:favouring
+favorable:favourable favorably:favourably favorite:favourite favorites:favourites
+favoritism:favouritism honor:honour honors:honours honored:honoured
+honoring:honouring honorable:honourable honorably:honourably
+dishonor:dishonour dishonors:dishonours dishonored:dishonoured
+dishonoring:dishonouring dishonorable:dishonourable
+labor:labour labors:labours labored:laboured laboring:labouring
+laborer:labourer laborers:labourers neighbor:neighbour neighbors:neighbours
+neighbored:neighboured neighboring:neighbouring neighborhood:neighbourhood
+neighborhoods:neighbourhoods harbor:harbour harbors:harbours harbored:harboured
+harboring:harbouring humor:humour humors:humours humored:humoured
+humoring:humouring rumor:rumour rumors:rumours rumored:rumoured
+rumoring:rumouring behavior:behaviour behaviors:behaviours
+behavioral:behavioural misbehavior:misbehaviour flavor:flavour flavors:flavours
+flavored:flavoured flavoring:flavouring flavorful:flavourful flavorless:flavourless
+armor:armour armors:armours armored:armoured armoring:armouring armory:armoury
+odor:odour odors:odours odorless:odourless vapor:vapour vapors:vapours
+valor:valour vigor:vigour ardor:ardour clamor:clamour clamors:clamours
+clamored:clamoured clamoring:clamouring candor:candour demeanor:demeanour
+demeanors:demeanours endeavor:endeavour endeavors:endeavours
+endeavored:endeavoured endeavoring:endeavouring fervor:fervour parlor:parlour
+parlors:parlours rancor:rancour savior:saviour saviors:saviours savor:savour
+savors:savours savored:savoured savoring:savouring savory:savoury
+smolder:smoulder smolders:smoulders smoldered:smouldered smoldering:smouldering
+splendor:splendour tumor:tumour tumors:tumours succor:succour succors:succours
+succored:succoured succoring:succouring center:centre centers:centres
+centered:centred centering:centring centerpiece:centrepiece
+centerpieces:centrepieces theater:theatre theaters:theatres
+theatergoer:theatregoer theatergoers:theatregoers fiber:fibre fibers:fibres
+liter:litre liters:litres caliber:calibre calibers:calibres saber:sabre sabers:sabres
+somber:sombre specter:spectre specters:spectres meager:meagre
+defense:defence defenses:defences defenseless:defenceless offense:offence
+offenses:offences pretense:pretence pretenses:pretences gray:grey grays:greys
+grayed:greyed graying:greying grayish:greyish traveling:travelling
+traveled:travelled traveler:traveller travelers:travellers canceling:cancelling
+canceled:cancelled labeling:labelling labeled:labelled modeling:modelling
+modeled:modelled modeler:modeller modelers:modellers marveling:marvelling
+marveled:marvelled fueling:fuelling fueled:fuelled crueler:crueller
+cruelest:cruellest jeweler:jeweller jewelers:jewellers jewelry:jewellery
+aluminum:aluminium enroll:enrol enrolls:enrols enrollment:enrolment
+enrollments:enrolments fulfill:fulfil fulfills:fulfils fulfillment:fulfilment
+instill:instil instills:instils distill:distil distills:distils
+installment:instalment installments:instalments skillful:skilful willful:wilful
+catalog:catalogue catalogs:catalogues cataloged:catalogued cataloging:cataloguing
+dialog:dialogue dialogs:dialogues monolog:monologue monologs:monologues
+analog:analogue analogs:analogues molt:moult molts:moults molted:moulted
+molting:moulting plow:plough plows:ploughs plowed:ploughed plowing:ploughing
+skeptic:sceptic skeptics:sceptics skeptical:sceptical skepticism:scepticism
+mustache:moustache mustaches:moustaches checkered:chequered
+maneuver:manoeuvre maneuvers:manoeuvres maneuvered:manoeuvred
+maneuvering:manoeuvring
+""".split())
+_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def apply_language(text, language, protect=()):
+    """Use Canadian spellings, preserving case and exact custom dictionary terms."""
+    if language != "en-CA":
+        return text
+
+    def convert(fragment):
+        def repl(m):
+            word = m.group(0)
+            fixed = _CANADIAN_SPELLING.get(word.lower())
+            if fixed is None:
+                return word
+            if word.isupper():
+                return fixed.upper()
+            return fixed.capitalize() if word[0].isupper() else fixed
+        return _WORD_RE.sub(repl, fragment)
+
+    if not protect:
+        return convert(text)
+    rx = re.compile("|".join(match_pattern(t) for t in sorted(protect, key=len, reverse=True)),
+                    re.IGNORECASE)
+    out, at = [], 0
+    for m in rx.finditer(text):
+        out += [convert(text[at:m.start()]), m.group(0)]
+        at = m.end()
+    out.append(convert(text[at:]))
+    return "".join(out)
+
+
+def apply_spelling(text):
+    """The selected regional spelling, then custom words so those win."""
+    terms, subs = load_dictionary()
+    text = apply_language(text, text_filters()[4], terms)
     for rx, term in subs:
         text = rx.sub(term, text)
     return text
@@ -1053,8 +1209,11 @@ def transcribe_whisper(wav_path, partial=False):
             seen.add(t_.lower())
             combo.append(t_)
     prompt = ", ".join(combo)[:800]
-    extra = {"prompt": prompt} if prompt else None
-    res = post_wav(SERVER_URL, wav_path, "verbose_json", extra)
+    extra = {"prompt": prompt} if prompt else {}
+    language = whisper_language(text_filters()[4])
+    if language:
+        extra["language"] = language
+    res = post_wav(SERVER_URL, wav_path, "verbose_json", extra or None)
     segs = res.get("segments") or []
     if segs:
         probs = [float(s.get("no_speech_prob", 0.0)) for s in segs]
@@ -1345,14 +1504,14 @@ def space_clipped_words(text):
 def tidy(text):
     """The local cleanup filters from Settings, then your dictionary."""
     text = space_clipped_words(text)
-    do_defill, do_numbers, do_all, _do_llm_tidy = text_filters()
+    do_defill, do_numbers, do_all, _do_llm_tidy, _language = text_filters()
     if do_defill:
         text = defiller(text)
     if do_numbers:
         text = part_numbers(text)
         text = numbers_to_digits(text, all_digits=do_all)
         text = part_numbers(text)  # 'seventy four HCT' is '74 HCT' by now
-    return apply_dictionary(text)
+    return apply_spelling(text)
 
 
 INSERTION_MODES = ("paste", "type", "clipboard")
@@ -4020,15 +4179,20 @@ def polish_dictation(text, cut=False, before="", first_p=None):
     """
     deadline = time.monotonic() + POLISH_WAIT_S
     guessed = None
+    changed = False
     if cut:
         guessed = guess_start(text, before, first_p,
                               min(GUESS_WAIT_S, deadline - time.monotonic()))
         if guessed and guessed != text:
             text = guessed
+            changed = True
     tidied = tidy_dictation(text, deadline - time.monotonic())
     if tidied:
         text = tidied
-    return text, guessed, tidied
+        changed = True
+    # The LLM may reintroduce US forms, but don't run dictionary chains twice
+    # when it changed nothing. Exact custom terms are protected either way.
+    return apply_spelling(text) if changed else text, guessed, tidied
 
 
 def utterance_worker(jobs):

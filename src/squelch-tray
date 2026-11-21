@@ -62,6 +62,68 @@ INSERTION_MODES = (
     ("paste", "Paste"),
     ("type", "Type keys"),
     ("clipboard", "Clipboard only"))
+LANGUAGES = (("auto", "Automatic"), ("en-US", "US English"),
+             ("en-CA", "Canadian English"))
+# whisper.cpp's language list at the pinned commit, for the editable combo.
+WHISPER_LANGUAGES = dict(pair.split(":") for pair in """
+en:English zh:Chinese de:German es:Spanish ru:Russian ko:Korean fr:French
+ja:Japanese pt:Portuguese tr:Turkish pl:Polish ca:Catalan nl:Dutch ar:Arabic
+sv:Swedish it:Italian id:Indonesian hi:Hindi fi:Finnish vi:Vietnamese he:Hebrew
+uk:Ukrainian el:Greek ms:Malay cs:Czech ro:Romanian da:Danish hu:Hungarian ta:Tamil
+no:Norwegian th:Thai ur:Urdu hr:Croatian bg:Bulgarian lt:Lithuanian la:Latin
+mi:Maori ml:Malayalam cy:Welsh sk:Slovak te:Telugu fa:Persian lv:Latvian
+bn:Bengali sr:Serbian az:Azerbaijani sl:Slovenian kn:Kannada et:Estonian
+mk:Macedonian br:Breton eu:Basque is:Icelandic hy:Armenian ne:Nepali mn:Mongolian
+bs:Bosnian kk:Kazakh sq:Albanian sw:Swahili gl:Galician mr:Marathi pa:Punjabi
+si:Sinhala km:Khmer sn:Shona yo:Yoruba so:Somali af:Afrikaans oc:Occitan
+ka:Georgian be:Belarusian tg:Tajik sd:Sindhi gu:Gujarati am:Amharic yi:Yiddish
+lo:Lao uz:Uzbek fo:Faroese ht:Haitian-Creole ps:Pashto tk:Turkmen nn:Nynorsk
+mt:Maltese sa:Sanskrit lb:Luxembourgish my:Burmese bo:Tibetan tl:Tagalog
+mg:Malagasy as:Assamese tt:Tatar haw:Hawaiian ln:Lingala ha:Hausa ba:Bashkir
+jw:Javanese su:Sundanese yue:Cantonese
+""".split())
+LANGUAGE_BY_NAME = {name.lower(): code for code, name in WHISPER_LANGUAGES.items()}
+LANGUAGE_BY_NAME.update({"burmese": "my", "haitian creole": "ht"})
+LANGUAGE_TAG_RE = re.compile(
+    r"^[A-Za-z]{2,3}(?:-[A-Za-z]{3}){0,3}(?:-[A-Za-z]{4})?"
+    r"(?:-(?:[A-Za-z]{2}|\d{3}))?"
+    r"(?:-(?:[A-Za-z0-9]{5,8}|\d[A-Za-z0-9]{3}))*"
+    r"(?:-[0-9A-WY-Za-wy-z](?:-[A-Za-z0-9]{2,8})+)*"
+    r"(?:-[Xx](?:-[A-Za-z0-9]{1,8})+)?$")
+
+
+def canonical_language(raw):
+    """Canonical case for a validated language tag, variants/extensions included."""
+    parts = raw.split("-")
+    out = [parts[0].lower()]
+    i = 1
+    while i < len(parts) and i < 4 and len(parts[i]) == 3 and parts[i].isalpha():
+        out.append(parts[i].lower())
+        i += 1
+    if i < len(parts) and len(parts[i]) == 4 and parts[i].isalpha():
+        out.append(parts[i].title())
+        i += 1
+    if i < len(parts) and ((len(parts[i]) == 2 and parts[i].isalpha()) or
+                           (len(parts[i]) == 3 and parts[i].isdigit())):
+        out.append(parts[i].upper())
+        i += 1
+    out += [p.lower() for p in parts[i:]]
+    return "-".join(out)
+
+
+def normalize_language(value):
+    """A BCP-47 tag from a name/tag in the combo, or auto if invalid."""
+    raw = str(value or "auto").strip().replace("_", "-")
+    low = raw.lower()
+    aliases = {"auto": "auto", "automatic": "auto",
+               "detect automatically": "auto", "us english": "en-US",
+               "american english": "en-US", "canadian english": "en-CA"}
+    if low in aliases:
+        return aliases[low]
+    raw = LANGUAGE_BY_NAME.get(low, raw)
+    return canonical_language(raw) if LANGUAGE_TAG_RE.fullmatch(raw) else "auto"
+
+
 PARAKEET_DIR = os.path.expanduser("~/.local/share/parakeet")
 WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp/models")
 DEFAULT_MODELS = {
@@ -281,10 +343,13 @@ def read_filters():
     return {"defiller": bool(d.get("defiller", True)),
             "numbers": bool(d.get("numbers", True)),
             "numbers_all": bool(d.get("numbers_all", False)),
-            "tidy": bool(d.get("tidy", True))}
+            "tidy": bool(d.get("tidy", True)),
+            "language": normalize_language(d.get("language", "auto"))}
 
 
 def write_filters(flt):
+    flt = dict(flt)
+    flt["language"] = normalize_language(flt.get("language", "auto"))
     atomic_write(FILTERS_FILE, json.dumps(flt))
 
 
@@ -1386,6 +1451,25 @@ class SettingsWindow(QWidget):
         lay.addWidget(self.cb_live)
 
         lay.addWidget(label("Cleanup", "heading"))
+        langrow = QHBoxLayout()
+        langrow.addWidget(label("Language"), 1)
+        self.g_language = QComboBox()
+        self.g_language.setEditable(True)
+        self.g_language.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for key, text in LANGUAGES:
+            self.g_language.addItem(text, key)
+        for key, text in WHISPER_LANGUAGES.items():
+            self.g_language.addItem(text, key)
+        self.g_language.setToolTip(
+            "Whisper uses this language; Parakeet detects it automatically. "
+            "Enter a language name or a tag like fr-CA. Canadian English "
+            "writes favour and colour. Custom words work in any language.")
+        self.g_language.currentIndexChanged.connect(
+            lambda _i: self.filters_changed())
+        self.g_language.lineEdit().editingFinished.connect(
+            self.filters_changed)
+        langrow.addWidget(self.g_language, 2)
+        lay.addLayout(langrow)
         self.cb_defill = QCheckBox("Remove filler words")
         self.cb_numbers = QCheckBox("Numbers over ten as digits")
         self.cb_all = QCheckBox("All numbers as digits")
@@ -1496,7 +1580,8 @@ class SettingsWindow(QWidget):
         self.on_filters({"defiller": self.cb_defill.isChecked(),
                          "numbers": self.cb_numbers.isChecked(),
                          "numbers_all": self.cb_all.isChecked(),
-                         "tidy": self.cb_tidy.isChecked()})
+                         "tidy": self.cb_tidy.isChecked(),
+                         "language": normalize_language(self.g_language.currentText())})
 
     def hotkey_toggle(self):
         if self.hk_capture.active:
@@ -2174,6 +2259,13 @@ class SettingsWindow(QWidget):
             cb.blockSignals(True)
             cb.setChecked(flt[name])
             cb.blockSignals(False)
+        self.g_language.blockSignals(True)
+        index = self.g_language.findData(flt["language"])
+        if index >= 0:
+            self.g_language.setCurrentIndex(index)
+        else:
+            self.g_language.setCurrentText(flt["language"])
+        self.g_language.blockSignals(False)
 
     def open(self, tab=0):
         """tab None: Setup until it's done, else General."""

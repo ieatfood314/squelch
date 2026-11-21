@@ -29,7 +29,8 @@ cloud account needed; optional AI polishing uses an endpoint you configure.
   correctly; characters it has no key for are pasted
 - **Text cleanup**: filler words (um/uh/ah…) removed, number words over ten
   (optionally all) written as digits, spoken part numbers joined
-  ("seven four HCT two seven three" → 74HCT273), custom dictionary with AI-suggested
+  ("seven four HCT two seven three" → 74HCT273), optional Canadian-English
+  spelling (colour, favour), custom dictionary with AI-suggested
   mishearings via OpenRouter, and mishearings learned from your own
   dictation. Optional AI tidying cuts repeated phrases, false starts and
   self-corrections without summarizing or rewriting your words
@@ -166,7 +167,7 @@ config, Change moves it to the new key for you.
 | Engine switch | settings popup, General tab, or right-click tray icon |
 | Trigger key (any key) | settings → General → Change, then press the key |
 | Insertion (paste/type/clipboard-only), type as you speak | settings → General |
-| Filler words, numbers, AI tidying of repeats and false starts | settings → General → Cleanup |
+| Dictation language (automatic or your own), regional spelling, filler words, numbers, AI tidying | settings → General → Cleanup |
 | Accent color, background opacity, text size, font | settings → Appearance |
 | Speech models (picking one that isn't downloaded yet downloads it) | settings → Setup |
 | Microphone (default: PipeWire's default source) | settings → Setup |
@@ -178,8 +179,10 @@ config, Change moves it to the new key for you.
 | Learned mishearings | settings → Dictionary tab, under Possible mishearings (Add/Ignore) |
 | Analytics dashboard | settings → Analytics tab, or glance line on the tap card |
 
-Other languages: switch to Whisper in the popup (auto language
-detect). Game fullscreen unloads models automatically; dictating then shows
+Other languages: Parakeet Multilingual detects 25 languages automatically;
+Whisper supports 100. Whisper auto-detects by default, or choose a language
+name or tag such as `fr-CA` under Settings → General → Cleanup → Language.
+Custom words can correct spelling in any language. Game fullscreen unloads models automatically; dictating then shows
 one notification instead of failing silently. So do failed pastes and
 transcriptions.
 
