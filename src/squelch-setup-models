@@ -32,12 +32,12 @@ _WHISPER_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
 # but several times slower than Turbo.
 CATALOG = [
     ("parakeet", "parakeet", "Multilingual",
-     _PARAKEET_URL + "ggml-parakeet-tdt-0.6b-v3-q8_0.bin", 668757119, True),
+     _PARAKEET_URL + "ggml-parakeet-tdt-0.6b-v3-q8_0.bin", 668757119, False),
     ("parakeet-small", "parakeet", "Multilingual small",
      _PARAKEET_URL + "ggml-parakeet-tdt-0.6b-v3-q4_k.bin", 415611879, False),
     ("parakeet-en", "parakeet", "English",
      _PARAKEET_V2_URL + "ggml-parakeet-tdt-0.6b-v2-q8_0.bin", 658909748,
-     False),
+     True),
     ("parakeet-en-small", "parakeet", "English small",
      _PARAKEET_V2_URL + "ggml-parakeet-tdt-0.6b-v2-q5_0.bin", 427494308,
      False),

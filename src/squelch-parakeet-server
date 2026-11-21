@@ -31,7 +31,7 @@ import numpy as np
 
 BINDIR = os.environ.get("SQUELCH_WSP_BIN", "/usr/bin")
 MODEL = os.environ.get("SQUELCH_PARAKEET_MODEL") or os.path.expanduser(
-    "~/.local/share/parakeet/ggml-parakeet-tdt-0.6b-v3-q8_0.bin")
+    "~/.local/share/parakeet/ggml-parakeet-tdt-0.6b-v2-q8_0.bin")
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SQUELCH_PARAKEET_PORT") or 1894)
 N_THREADS = 6

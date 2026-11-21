@@ -281,7 +281,7 @@ def read_filters():
     return {"defiller": bool(d.get("defiller", True)),
             "numbers": bool(d.get("numbers", True)),
             "numbers_all": bool(d.get("numbers_all", False)),
-            "tidy": bool(d.get("tidy", True))}
+            "tidy": bool(d.get("tidy", False))}
 
 
 def write_filters(flt):

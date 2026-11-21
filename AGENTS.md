@@ -44,6 +44,8 @@ The old Android release steps below are kept for reference.
 3. Obtainium on halley tracks the GitHub releases. Only Android gets GitHub releases; desktop is tags only, so Obtainium never sees an APK-less latest release.
 
 ## Testing dictation without a mic or an unlocked screen
+Run the local unit tests with `python3 tests/test_dictation.py`. They cover local cleanup, contextual correction learning and the default model catalog; use regolith for the evdev/numpy dependencies.
+
 `STT_DRY_RUN=1` makes squelch-ptt log what it would type. Never let it type for real while regolith's screen is locked: the keys go into the lock screen. Live typing's rule (`live_settled` in squelch-ptt) was tuned by replaying the archive in `/mnt/RAID1/Aidan/squelch/raw/` in 0.5 s steps through a second `squelch-parakeet-server` (`SQUELCH_PARAKEET_PORT=1895`) and comparing what it would type with the full-clip transcript; redo that before changing its numbers.
 
 ## Edit capture needs accessibility in Electron apps

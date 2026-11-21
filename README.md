@@ -7,9 +7,9 @@ key also captures the screen and takes voice notes.) Optionally the words are ty
 cloud account needed; optional AI polishing uses an endpoint you configure.
 
 - **Fast GPU inference**: Parakeet TDT 0.6B (default, ~0.2 s for 11 s of
-  audio; v3 multilingual, or v2 if you only dictate English, which is a
-  little more accurate) and Whisper large-v3-turbo (other-languages
-  fallback), via Vulkan — NVIDIA, AMD and Intel (integrated too) work. The selected engine
+  audio; v2 English, or v3 multilingual) and Whisper large-v3-turbo
+  (other-languages fallback), via Vulkan — NVIDIA, AMD and Intel
+  (integrated too) work. The selected engine
   stays resident in VRAM; the other one is unloaded
 - **Mic-array beamforming**: adaptive delay-and-sum across your mic's
   channels, high-pass, diffraction EQ, noise gate, normalization
@@ -30,9 +30,11 @@ cloud account needed; optional AI polishing uses an endpoint you configure.
 - **Text cleanup**: filler words (um/uh/ah…) removed, number words over ten
   (optionally all) written as digits, spoken part numbers joined
   ("seven four HCT two seven three" → 74HCT273), custom dictionary with AI-suggested
-  mishearings via OpenRouter, and mishearings learned from your own
-  dictation. Optional AI tidying cuts repeated phrases, false starts and
-  self-corrections without summarizing or rewriting your words
+  mishearings via OpenRouter, mishearings learned from your own
+  dictation, and contextual corrections learned from your edits. Local
+  rules remove clear stutters and self-corrections without a network call.
+  Optional AI tidying (off by default) cuts more complex repeats and false
+  starts without summarizing or rewriting your words
 - **Game mode**: models unload once a game has been fullscreen for 10 s and
   reload after. Browsers, video players, the lock screen and Spectacle
   going fullscreen don't count
@@ -133,9 +135,9 @@ Settings → Setup, or `squelch-setup-models --list`:
 
 | Engine | Model | Size | For |
 |---|---|---|---|
-| Parakeet | Multilingual (default) | 638 MB | English and 24 other European languages (v3) |
+| Parakeet | Multilingual | 638 MB | English and 24 other European languages (v3) |
 | Parakeet | Multilingual small | 396 MB | GPUs with little VRAM; same model, 4-bit |
-| Parakeet | English | 628 MB | English only, a little more accurate at it (v2) |
+| Parakeet | English (default) | 628 MB | English only, a little more accurate at it (v2) |
 | Parakeet | English small | 408 MB | GPUs with little VRAM; same model, 5-bit |
 | Whisper | Turbo (default) | 547 MB | any language |
 | Whisper | Small | 181 MB | weak GPUs |
@@ -257,7 +259,7 @@ text goes in as heard. `llm-fast.json` has the same format as
 such as Groq (`https://api.groq.com/openai/v1`) with `qwen/qwen3.8-27b`.
 
 With **Tidy repeats and false starts with AI** on in Settings → General →
-Cleanup, dictations of at least eight words also get the same tidy pass as
+Cleanup (off by default), dictations of at least eight words also get the same tidy pass as
 Nullspace: repeated words and phrases, abandoned sentence starts and
 self-corrections ("on Tuesday, no, Wednesday") are cut, and punctuation and
 capitals are fixed. It uses `llm-fast.json`, `llm-fallback.json` or your
