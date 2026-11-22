@@ -24,6 +24,7 @@ class DictationTests(unittest.TestCase):
         self.g["DICT_FILE"] = str(root / "dictionary.json")
         self.g["FILTERS_FILE"] = str(root / "filters.json")
         self.g["VOCAB_FILE"] = str(root / "vocab.json")
+        self.g["ENGINE_FILE"] = str(root / "engine")
         self.g["LEARNED_FILE"] = str(root / "learned.json")
         self.g["LLM_FAST_FILE"] = str(root / "no-fast.json")
         self.g["LLM_FALLBACK_FILE"] = str(root / "no-fallback.json")
@@ -46,6 +47,14 @@ class DictationTests(unittest.TestCase):
         self.assertEqual(defaults, ["parakeet-en", "whisper"])
         self.assertFalse(self.ptt["text_filters"]()[3])
 
+    def test_selective_turbo_routing(self):
+        self.assertEqual(self.ptt["current_engine"](6.99), "parakeet")
+        self.assertEqual(self.ptt["current_engine"](7.0), "whisper")
+        Path(self.g["ENGINE_FILE"]).write_text("whisper\n")
+        self.assertEqual(self.ptt["current_engine"](1.0), "whisper")
+        Path(self.g["ENGINE_FILE"]).write_text("parakeet\n")
+        self.assertEqual(self.ptt["current_engine"](30.0), "parakeet")
+
     def test_local_mixed_punctuation(self):
         self.assertEqual(self.ptt["tidy"]("the name., make sure"),
                          "the name. make sure")
@@ -63,6 +72,23 @@ class DictationTests(unittest.TestCase):
                          "iron three")
         self.assertEqual(self.ptt["tidy_disfluency"]("can you not notify me"),
                          "can you not notify me")
+
+    def test_sentence_restart_rule(self):
+        self.assertEqual(self.ptt["tidy_false_starts"](
+            "For example, that squelch, the newest squelch."),
+            "For example, the newest squelch.")
+        self.assertEqual(self.ptt["tidy_false_starts"](
+            "I was, I was going to the store."),
+            "I was going to the store.")
+        self.assertEqual(self.ptt["tidy_false_starts"](
+            "the quick brown, the quick red fox"),
+            "The quick red fox")
+        normal = "If it's easier for you, you could merge these apps."
+        self.assertEqual(self.ptt["tidy_false_starts"](normal), normal)
+        normal = "When I hold it, it should open. When I pause it, it should close."
+        self.assertEqual(self.ptt["tidy_false_starts"](normal), normal)
+        numeric = "The 1 hour 3 minutes, that says usually 11 minutes, is probably wrong."
+        self.assertEqual(self.ptt["tidy_false_starts"](numeric), numeric)
 
     def test_learned_disfluency_filter(self):
         self.assertEqual(self.ptt["tidy_disfluency_model"](

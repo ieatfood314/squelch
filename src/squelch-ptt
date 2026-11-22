@@ -1005,15 +1005,19 @@ def beamform_and_clean(path_in, path_out, sr=SR, max_s=None, source=None,
 
 # ---------------- transcribe + paste ----------------
 
-def current_engine():
-    """whisper (accuracy-first ultra default) or parakeet. Read per utterance
-    so the tray applet can switch engines live without signalling the daemon."""
+TURBO_MIN_SECONDS = 7.0
+
+
+def current_engine(seconds=None):
+    """Auto (Turbo for longer ramblers), or an explicit engine override."""
     try:
         with open(ENGINE_FILE) as f:
             e = f.read().strip().lower()
-        return "whisper" if e == "whisper" else "parakeet"
+        if e in ("whisper", "parakeet"):
+            return e
     except OSError:
-        return "whisper"
+        pass
+    return "whisper" if seconds is not None and seconds >= TURBO_MIN_SECONDS else "parakeet"
 
 
 def text_filters():
@@ -1198,6 +1202,94 @@ def tidy_disfluency(text):
     text = PARTIAL_REPEAT_RE.sub(partial, text)
     # "Tuesday, no, Wednesday" and "copper, sorry, iron" keep the correction.
     return SELF_CORRECT_RE.sub(r"\1", text)
+
+
+FUNCTION = set(
+    "a an and are as at be been but by can could did do does for from had has have he her "
+    "hers him his i if in into is it its me my of on or our she should so that the their them "
+    "there these they this those to was we were what when which who will with would you your "
+    "about after again against ago all almost also always among amount another anyone around away "
+    "because before behind being below between both down during each every first found further going "
+    "gonna gotta great however just little look make many more most much need never only other out off "
+    "over really right said same should since small still such take than then there these thing think "
+    "those through too under until up want well went were what when where which while within would yeah "
+    "yes gonna wanna stuff things okay ok word words say says tell told talk talking speak speaking".split())
+NP_START = {"a", "an", "the", "this", "that", "these", "those", "my", "your", "our", "his", "her", "their", "its"}
+VERBS = set(
+    "am are be been being can could did do does doing go going went have has had having is was were "
+    "hold held make makes made making take takes took taking get gets got getting use uses used using "
+    "say says said saying tell tells told telling think thinks thought thinking know knows knew knowing "
+    "want wants wanted wanting need needs needed needing like likes liked liking look looks looked looking "
+    "work works worked working try tries tried trying see sees saw seeing show shows showed showing "
+    "release releases released releasing update updates updated updating change changes changed changing "
+    "open opens opened opening close closes closed closing run runs ran running give gives gave giving "
+    "put puts putting set sets setting keep keeps kept keeping let lets letting start starts started starting "
+    "stop stops stopped stopping play plays played playing speak speaks spoke speaking talk talks talked talking "
+    "drive drives drove driving walk walks walked walking eat eats ate eating sit sits sat sitting "
+    "stand stands stood standing read reads reading write writes wrote writing learn learns learned learning "
+    "mean means meant meaning call calls called calling move moves moved moving happen happens happened happening "
+    "seem seems seemed seeming feel feels felt feeling become becomes became becoming".split())
+INCOMPLETE_END = {"am", "are", "be", "been", "being", "can", "could", "should", "would", "will", "do", "does", "did", "have", "has", "had", "is", "was", "were"}
+CUE = re.compile(r"^(?:(?:well|actually|sorry|wait|no|i mean)\b[\s,]*)+", re.I)
+WORD = re.compile(r"[^\W_]+(?:'[^\W_]+)*", re.UNICODE)
+
+
+def bare_words(text):
+    return [word.lower() for word in WORD.findall(text)]
+
+
+def repeated(left, right):
+    if left and len(left) <= 6 and right[:len(left)] == left:
+        return True
+    for size in (4, 3, 2):
+        if len(left) >= size and left[-size:] == right[:size]:
+            return True
+    return False
+
+
+def should_cut(left_text, right_text):
+    right_text = CUE.sub("", right_text.strip())
+    left, right = bare_words(left_text), bare_words(right_text)
+    if not left or not right or any(word in {"no", "not", "never"} for word in left):
+        return False
+    if re.search(r"\d", left_text):
+        return False
+    left_content = {word for word in left if word not in FUNCTION}
+    right_content = {word for word in right if word not in FUNCTION}
+    if not right_content - left_content:
+        return False
+    incomplete = left[-1] in INCOMPLETE_END or (left[0] in NP_START and not any(word in VERBS for word in left))
+    if incomplete and repeated(left, right):
+        return True
+    if left[0] not in NP_START or any(word in VERBS for word in left):
+        return False
+    return bool(left_content & right_content)
+
+
+def tidy_false_starts(text):
+    """Cut abandoned comma-delimited fragments with conservative overlap checks."""
+    for _ in range(4):
+        commas = list(re.finditer(r",", text))
+        changed = False
+        for match in reversed(commas):
+            comma = match.start()
+            previous = max(text.rfind(".", 0, comma), text.rfind("!", 0, comma), text.rfind("?", 0, comma), text.rfind(",", 0, comma))
+            start = previous + 1
+            end_candidates = [p for p in (text.find(".", comma + 1), text.find("!", comma + 1), text.find("?", comma + 1)) if p >= 0]
+            end = min(end_candidates) if end_candidates else len(text)
+            left = text[start:comma]
+            right = text[comma + 1:end]
+            if should_cut(left, right):
+                cleaned_right = CUE.sub("", right.strip())
+                if (previous < 0 or text[previous] in ".!?") and cleaned_right:
+                    cleaned_right = cleaned_right[0].upper() + cleaned_right[1:]
+                text = (text[:start] + " " + cleaned_right + text[end:]).strip()
+                changed = True
+                break
+        if not changed:
+            break
+    return re.sub(r"\s{2,}", " ", text).strip()
+
 
 
 # Apache-2.0 DisfluencySpeech, trained on its train split and thresholded on
@@ -1561,6 +1653,7 @@ def tidy(text):
     text = space_clipped_words(text)
     text = re.sub(r"(?<=[.!?]),(?=\s)", "", text)  # "name.," -> "name."
     text = tidy_disfluency(text)
+    text = tidy_false_starts(text)
     do_defill, do_numbers, do_all, _do_llm_tidy = text_filters()
     if do_defill:
         text = defiller(text)
@@ -2481,7 +2574,7 @@ def process_utterance(raw_path, record=True, max_s=None, source=None,
             return ""
         log(f"cleaned {info['seconds']:.2f}s in {time.time()-t0:.2f}s")
         t1 = time.time()
-        engine = current_engine()
+        engine = current_engine(info["seconds"])
         first_p = None
         try:
             if cut and engine == "parakeet":
