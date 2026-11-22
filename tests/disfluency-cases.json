@@ -1,0 +1,167 @@
+{
+  "source": "DisfluencySpeech validation transcript_a",
+  "license": "Apache-2.0",
+  "guard": "exact-stutter-or-earlier-content-phrase with sentence boundaries",
+  "cases": [
+    {
+      "before": "You know, it's someone who had, uh, killed two teenage boys here in San Diego as a matter of fact.",
+      "after": "You know, it's someone who had, uh, killed two teenage boys here in San Diego as a matter of fact."
+    },
+    {
+      "before": "You know. You should be able to accomplish as much. And I think the, uh, attitude is a lot better towards the parents raising the younger ones now.",
+      "after": "You know. You should be able to accomplish as much. And I think the, uh, attitude is a lot better towards the parents raising the younger ones now."
+    },
+    {
+      "before": "Did you see the, the C N N, the, the dog show, uh, we don't have C, we don't have cable.",
+      "after": "Did you see the, the C N N, the, the dog show, uh, we don't have C, we don't have cable."
+    },
+    {
+      "before": "Uh, they're, they're pretty good, too. Uh, I guess a year ago you're probably watching C N N a lot, right?",
+      "after": "Uh, they're, they're pretty good, too. Uh, I guess a year ago you're probably watching C N N a lot, right?"
+    },
+    {
+      "before": "Both my husband and I work and our children are sixth, fourth, and third grade. And the school years are wonderful, they're just wonderful.",
+      "after": "Both my husband and I work and our children are sixth, fourth, and third grade. And the school years are wonderful, they're just wonderful."
+    },
+    {
+      "before": "I think we should just abandon the, you know, the written word altogether, you know.",
+      "after": "I think we should just abandon the, the written word altogether, you know."
+    },
+    {
+      "before": "And I know at least in the medical field, it seems like they've come out with a lot further advances as far as female medications and things since women have gotten into the doctor field.",
+      "after": "And I know at least in the medical field, it seems like they've come out with a lot further advances as far as female medications and things since women have gotten into the doctor field."
+    },
+    {
+      "before": "Phew. Man, I'm, What time is it over the, are you, are you in Dallas?",
+      "after": "Phew. Man, I'm, What time is it over the, are you, are you in Dallas?"
+    },
+    {
+      "before": "Well, a lot of times it's, you know, a lot of times it's not the money that keeps pe-, that keeps people in.",
+      "after": "Well, a of times you know, a lot of times it's not the money that keeps pe-, that keeps people in."
+    },
+    {
+      "before": "Yeah. Both, both in terms in Ram as well as, uh, you know, standard memory or disk mem-, disk base,",
+      "after": "Yeah. Both, both in terms in Ram as well as, uh, you know, standard memory or disk mem-, disk base,"
+    },
+    {
+      "before": "And Lord knows what happened to him. He's probably been through all kinds of nightmares.",
+      "after": "And Lord knows what happened to him. He's probably been through all kinds of nightmares."
+    },
+    {
+      "before": "Well even if she knows that they're fixing to get ready to go over there. They're not even there yet you know.",
+      "after": "Well even if she knows that they're fixing to get ready to go over there. They're not even there yet you know."
+    },
+    {
+      "before": "Oh they are. I love it, it's so funny to get more than one cat together, because it brings out their personalities.",
+      "after": "Oh they are. I love it, it's so funny to get more than one cat together, because it brings out their personalities."
+    },
+    {
+      "before": "and if it's not mom then, then dad or somebody's got to move in there and do the job, because the kids really need it.",
+      "after": "and if it's not mom then, then dad or somebody's got to move in there and do the job, because the kids really need it."
+    },
+    {
+      "before": "Let me see. One movie I saw, I guess it was a while back, RED OCTOBER.",
+      "after": "Let me see. One movie I saw, I guess it was a while back, RED OCTOBER."
+    },
+    {
+      "before": "I think in this area or most all areas they use, you know, for ticks and fleas. And you know, they're, awful hard to do anything with.",
+      "after": "I think in this area or most all areas they use, for ticks and fleas. And you know, they're, awful hard to do anything with."
+    },
+    {
+      "before": "The, because stories look very different when you hear different parts of the, of the truth.",
+      "after": "The, because stories look very different when you hear different parts of the, of the truth."
+    },
+    {
+      "before": "See, I, when I went, I thought, the people drove me crazy first of all but then I just thought the food was over priced for what it was.",
+      "after": "See, I, when I went, I thought, the people drove me crazy first of all but then I just thought the food was over priced for what it was."
+    },
+    {
+      "before": "No, you go down I, uh, uh, you, uh, you go down, uh, yeah, thirty, thirty.",
+      "after": "No, you go down I, uh, you go down, uh, yeah, thirty, thirty."
+    },
+    {
+      "before": "You know, it doesn't have the Coup de Ville or the Sedan de Ville squareness. It never really has. It's always had it's own unique look.",
+      "after": "You know, it doesn't have the Coup de Ville or the Sedan de Ville squareness. It never really has. It's always had it's own unique look."
+    },
+    {
+      "before": "Okay, uh, I guess I'm supposed to be all for switching to the metric system, but, uh, I sense that it's not going to happen anytime soon.",
+      "after": "Okay, I guess I'm supposed to be all for switching to the metric system, but, uh, I sense that it's not going to happen anytime soon."
+    },
+    {
+      "before": "But I, you know, drove a tractor, helped them weed beets and that sort of thing.",
+      "after": "But I, you know, drove a tractor, helped them weed beets and that sort of thing."
+    },
+    {
+      "before": "Uh, right now I think this Memphis, they're, they're trying to get the teams.",
+      "after": "Uh, right now I think this Memphis, they're, they're trying to get the teams."
+    },
+    {
+      "before": "I mean, you've got like hot sauce and taco meat and barbecue and, you know, bacon and all that good stuff.",
+      "after": "I mean, you've got like hot sauce and taco meat and barbecue and, you know, bacon and all that good stuff."
+    },
+    {
+      "before": "How do people in Texas deal with Dallas, Houston and San Antonio. Do you, for example, like San Antonio in Dallas?",
+      "after": "How do people in Texas deal with Dallas, Houston and San Antonio. Do you, for example, like San Antonio in Dallas?"
+    },
+    {
+      "before": "But, no. I think exercise is extremely important and I I do exercise on a regular basis.",
+      "after": "But, no. I think exercise is extremely important and I do exercise on a regular basis."
+    },
+    {
+      "before": "But when it comes to what kind of sentence you're going to lay down, I think that, uh, that they should.",
+      "after": "But when it comes to what kind of sentence you're going to lay down, I think that, uh, that they should."
+    },
+    {
+      "before": "And just wind up having to kiss your ass good-bye, you know. And, uh, and so the object,",
+      "after": "And just wind up having to kiss your ass good-bye, you know. And, uh, and so the object,"
+    },
+    {
+      "before": "I, I don't think I have a philosophical problem with that. In fact, I think it sort of raises nurturing and being a mother to what it ought to be which is a respected profession.",
+      "after": "I, I don't think I have a philosophical problem with that. In fact, I think it sort of raises nurturing and being a mother to what it ought to be which is a respected profession."
+    },
+    {
+      "before": "Well, we used to, I guess the weirdest thing I've ever caught is, uh, in some of the inlets and the rivers around Delaware.",
+      "after": "Well, we used to, I guess the weirdest thing I've ever caught is, uh, in some of the inlets and the rivers around Delaware."
+    },
+    {
+      "before": "Yeah. I think we talked for a good eight minutes about the subject, so, I think you get ten, so I think we're okay.",
+      "after": "Yeah. I think we talked for a good eight minutes about the subject, so, I think you get ten, so I think we're okay."
+    },
+    {
+      "before": "I guess the two teams that you can't count out are the Celtics because of Bird, and the Lakers because of Magic Johnson.",
+      "after": "I guess the two teams that you can't count out are the Celtics because of Bird, and the Lakers because of Magic Johnson."
+    },
+    {
+      "before": "I, I see that as being a, a, a change, uh, for the positive. Kind of along the same line as, as, as the mandatory thing. It's just, thing, a part of everyone's consciousness.",
+      "after": "I, I see that as being a, a change, uh, for the positive. Kind of along the same line as, as the mandatory thing. It's just, thing, a part of everyone's consciousness."
+    },
+    {
+      "before": "Well, uh, it's similar to that, but it's DOW JONES, which is, uh, the WALL STREET JOURNALS news wire.",
+      "after": "Well, uh, it's similar to that, but it's DOW JONES, which is, uh, the WALL STREET JOURNALS news wire."
+    },
+    {
+      "before": "Yeah, it, it depends on, um, there's, there's always a reason why they're on sale.",
+      "after": "Yeah, it, it depends on, um, there's, there's always a reason why they're on sale."
+    },
+    {
+      "before": "She finally admitted, you know, she finally told me it's okay if you don't, but it took every nerve in her body to say that because she's from a very, very old fashioned family.",
+      "after": "She finally admitted, you know, she finally told me it's okay if you don't, but it took every nerve in her body to say that because she's from a very, very old fashioned family."
+    },
+    {
+      "before": "And here it's, uh, well it's right by the ocean, but, um, it's not the same as Corpus. Corpus, you get that humid salty feeling in the air.",
+      "after": "And here it's, uh, well it's right by the ocean, but, um, it's not the same as Corpus. Corpus, you get that humid salty feeling in the air."
+    },
+    {
+      "before": "I don't think too many of them are anymore. It's, it's a shame, but, uh, we've watched WEEKEND AT BERNIE'S any number of times.",
+      "after": "I don't think too many of them are anymore. It's, it's a shame, but, uh, we've watched WEEKEND AT BERNIE'S any number of times."
+    },
+    {
+      "before": "And it, it, it goes and it's filling because of the rice.",
+      "after": "And it, it goes and it's filling because of the rice."
+    },
+    {
+      "before": " Gosh, I guess just in Plano, I, Plano I like to go to Souper Salads.",
+      "after": "Gosh, I guess just in Plano, Plano I like to go to Souper Salads."
+    }
+  ]
+}

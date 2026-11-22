@@ -23,6 +23,8 @@ install -Dm755 src/squelch src/squelch-ptt src/squelch-parakeet-server \
   src/squelch-tray src/squelch-vram src/squelch-setup-models \
   src/squelch-mic-reset src/squelch-sync src/squelch-sync-server \
   -t "$pkgdir/usr/bin/"
+install -Dm644 src/disfluency-filter.json src/disfluency-filter.LICENSE \
+  -t "$pkgdir/usr/share/squelch/"
 install -Dm644 systemd/*.service systemd/*.timer systemd/*.path \
   -t "$pkgdir/usr/lib/systemd/user/"
 install -Dm644 systemd/system/squelch-mic-reset@.service \

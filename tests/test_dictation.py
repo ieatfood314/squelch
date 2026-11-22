@@ -64,6 +64,24 @@ class DictationTests(unittest.TestCase):
         self.assertEqual(self.ptt["tidy_disfluency"]("can you not notify me"),
                          "can you not notify me")
 
+    def test_learned_disfluency_filter(self):
+        self.assertEqual(self.ptt["tidy_disfluency_model"](
+            "i want to talk about the the new plan for tomorrow"),
+            "i want to talk about the new plan for tomorrow")
+        normal = "this is a normal sentence that should stay completely unchanged"
+        self.assertEqual(self.ptt["tidy_disfluency_model"](normal), normal)
+        # Short commands bypass the rambler model, including negation.
+        self.assertEqual(self.ptt["tidy_disfluency_model"]("can you not notify me"),
+                         "can you not notify me")
+
+    def test_learned_disfluency_matches_validation_fixtures(self):
+        path = Path(__file__).with_name("disfluency-cases.json")
+        cases = json.loads(path.read_text())["cases"]
+        for case in cases:
+            with self.subTest(before=case["before"]):
+                self.assertEqual(self.ptt["tidy_disfluency_model"](case["before"]),
+                                 case["after"])
+
     def test_contextual_replacement_does_not_rewrite_root_globally(self):
         text = "Anything to know after root other than banking?"
         self.assertEqual(self.ptt["correction_replacement"](text, "root", "rot"),
@@ -101,9 +119,9 @@ class DictationTests(unittest.TestCase):
 
     def test_prompt_is_conservative_and_has_context_slots(self):
         prompt = self.g["TIDY_PROMPT"]
-        self.assertIn("don't turn prose into a list", prompt)
-        self.assertIn("don't delete discourse words", prompt)
-        self.assertIn("If a correction is uncertain, keep the heard words", prompt)
+        self.assertIn("Do not summarize", prompt)
+        self.assertIn("Preserve intentional repetition", prompt)
+        self.assertIn("If a change would be a guess, keep the heard words", prompt)
         formatted = prompt.format(text="test", vocabulary="Squelch", before="")
         self.assertIn("<<<Squelch>>>", formatted)
         self.assertIn("<<<test>>>", formatted)
